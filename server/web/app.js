@@ -1,0 +1,2454 @@
+"use strict";
+
+const listElement = document.querySelector("#conversation-list");
+const serverListElement = document.querySelector("#server-list");
+const countElement = document.querySelector("#conversation-count");
+const connectionDot = document.querySelector("#connection-dot");
+const connectionText = document.querySelector("#connection-text");
+const transcript = document.querySelector("#transcript");
+const titleElement = document.querySelector("#conversation-title");
+const metaElement = document.querySelector("#conversation-meta");
+const statusBadge = document.querySelector("#status-badge");
+const menuButton = document.querySelector("#menu-button");
+const sidebarShade = document.querySelector("#sidebar-shade");
+const conversationsViewButton = document.querySelector("#conversations-view");
+const serversViewButton = document.querySelector("#servers-view");
+const memoriesViewButton = document.querySelector("#memories-view");
+const serversElement = document.querySelector("#servers");
+const memoriesElement = document.querySelector("#memories");
+const memoryRunnerListElement = document.querySelector("#memory-runner-list");
+const filterElement = document.querySelector("#conversation-filter");
+const filterLabel = filterElement.closest("label");
+const actionsElement = document.querySelector("#conversation-actions");
+const archiveButton = document.querySelector("#archive-button");
+const deleteButton = document.querySelector("#delete-button");
+const runnerPicker = document.querySelector("#runner-picker");
+const runnerPickerSummary = document.querySelector("#runner-picker-summary");
+const runnerMenu = document.querySelector("#runner-menu");
+const newConversationButton = document.querySelector("#new-conversation");
+const addServerButton = document.querySelector("#add-server");
+const newMemoryButton = document.querySelector("#new-memory");
+const addServerDialog = document.querySelector("#add-server-dialog");
+const addServerClose = document.querySelector("#add-server-close");
+const addServerDone = document.querySelector("#add-server-done");
+const addServerCommand = document.querySelector("#add-server-command");
+const addServerCopy = document.querySelector("#add-server-copy");
+const addServerFeedback = document.querySelector("#add-server-feedback");
+const newConversationDialog = document.querySelector("#new-conversation-dialog");
+const newConversationForm = document.querySelector("#new-conversation-form");
+const newConversationCancel = document.querySelector("#new-conversation-cancel");
+const newConversationBack = document.querySelector("#new-conversation-back");
+const newRunnerSelect = document.querySelector("#new-runner-select");
+const newRunnerOptions = document.querySelector("#new-runner-options");
+const newConversationSelection = document.querySelector("#new-conversation-selection");
+const createConversationButton = document.querySelector("#create-conversation");
+const manageRunnersButton = document.querySelector("#manage-runners");
+const messageForm = document.querySelector("#message-form");
+const messageInput = document.querySelector("#message-input");
+const messageSend = document.querySelector("#message-send");
+const messageHint = document.querySelector("#message-hint");
+const contextAdd = document.querySelector("#context-add");
+const contextDialog = document.querySelector("#context-dialog");
+const contextClose = document.querySelector("#context-close");
+const contextFile = document.querySelector("#context-file");
+const contextUploadButton = document.querySelector("#context-upload-button");
+const contextServerPath = document.querySelector("#context-server-path");
+const contextServerAdd = document.querySelector("#context-server-add");
+const contextMemory = document.querySelector("#context-memory");
+const contextFeedback = document.querySelector("#context-feedback");
+const memoryDialog = document.querySelector("#memory-dialog");
+const memoryForm = document.querySelector("#memory-form");
+const memoryKeyInput = document.querySelector("#memory-key");
+const memoryValueInput = document.querySelector("#memory-value");
+const memoryScopeInput = document.querySelector("#memory-scope");
+const memoryFeedback = document.querySelector("#memory-feedback");
+const memorySaveButton = document.querySelector("#memory-save");
+
+let conversations = [];
+let servers = [];
+let runners = [];
+let memories = [];
+let currentView = location.hash.startsWith("#servers") ? "servers"
+  : location.hash.startsWith("#memories") ? "memories" : "conversations";
+let selectedId = validSessionId(location.hash.slice(1)) ? location.hash.slice(1) : null;
+let selectedServerIp = serverIpFromHash();
+let selectedMemoryRunnerId = memoryRunnerIdFromHash();
+let conversationStream = null;
+let streamedSessionId = null;
+let currentDetail = null;
+let conversationFilter = filterElement.value;
+const sessionStates = new Map();
+let draftSessionId = null;
+let connected = false;
+const queries = { conversations: "", servers: "", memories: "" };
+const searchInput = document.querySelector("#sidebar-search");
+const feedbackElement = document.querySelector("#page-feedback");
+const approvalBanner = document.querySelector("#approval-banner");
+const jumpLatest = document.querySelector("#jump-latest");
+const conversationMenu = document.querySelector("#conversation-menu");
+const themePicker = document.querySelector("#theme-picker");
+const themePickerSummary = document.querySelector("#theme-picker-summary");
+const themeMenu = document.querySelector("#theme-menu");
+const editDialog = document.querySelector("#edit-dialog");
+let editAction = null;
+let editingMemoryId = null;
+let newConversationBusy = false;
+let newRunnerLoading = false;
+const disclosureState = new Map();
+const trustEditors = new Map();
+const enrollmentEditors = new Map();
+
+function sessionState(id = selectedId) {
+  if (!sessionStates.has(id)) sessionStates.set(id, {
+    messageBusy: false, branchBusy: false, commandBusy: false, actionBusy: false,
+    failure: "", feedback: "", nextCommandId: "", editingMessageIndex: null,
+    editingMessageDraft: "", references: [],
+  });
+  return sessionStates.get(id);
+}
+
+function storageRead(storage, key, fallback = "") {
+  try { return window[storage].getItem(key) ?? fallback; } catch (_) { return fallback; }
+}
+
+function storageWrite(storage, key, value) {
+  try {
+    if (value) window[storage].setItem(key, value);
+    else window[storage].removeItem(key);
+  } catch (_) { /* In-memory drafts still work when browser storage is unavailable. */ }
+}
+
+function saveDraft() {
+  if (!draftSessionId) return;
+  const state = sessionState(draftSessionId);
+  state.draft = messageInput.value;
+  storageWrite("sessionStorage", `brain.draft.${draftSessionId}`, messageInput.value);
+  storageWrite("sessionStorage", `brain.refs.${draftSessionId}`, JSON.stringify(state.references || []));
+}
+
+function loadDraft(id) {
+  if (draftSessionId === id) return;
+  saveDraft();
+  draftSessionId = id;
+  const state = sessionState(id);
+  messageInput.value = state.draft ?? storageRead("sessionStorage", `brain.draft.${id}`);
+  try { state.references = JSON.parse(storageRead("sessionStorage", `brain.refs.${id}`, "[]")) || []; } catch (_) { state.references = []; }
+  resizeComposer();
+}
+
+function resizeComposer() {
+  messageInput.style.height = "auto";
+  messageInput.style.height = `${Math.min(messageInput.scrollHeight, 180)}px`;
+}
+
+function serverIpFromHash() {
+  try { return location.hash.startsWith("#servers/") ? decodeURIComponent(location.hash.slice(9)) : null; }
+  catch (_) { return null; }
+}
+
+function memoryRunnerIdFromHash() {
+  if (!location.hash.startsWith("#memories/")) return null;
+  try {
+    const value = decodeURIComponent(location.hash.slice(10));
+    if (value === "global") return "global";
+    return /^[A-Za-z0-9_-]{32}$/.test(value) ? value : null;
+  } catch (_) { return null; }
+}
+
+function showFeedback(message, retry = null, scope = feedbackElement) {
+  scope.replaceChildren();
+  scope.classList.toggle("hidden", !message);
+  if (!message) return;
+  scope.append(element("span", "", message));
+  if (retry) {
+    const button = element("button", "", "Retry");
+    button.type = "button";
+    button.addEventListener("click", retry);
+    scope.append(button);
+  }
+}
+
+function showSessionError(id, message) {
+  sessionState(id).feedback = message;
+  if (selectedId === id && currentView === "conversations") showFeedback(message);
+}
+
+function restoreFocus(scope, focus) {
+  if (!focus) return;
+  const match = [...scope.querySelectorAll("button, input, textarea, summary, select")]
+    .find(node => node.dataset.focus === focus);
+  match?.focus({ preventScroll: true });
+}
+
+function replaceList(list, fragment) {
+  const key = list.contains(document.activeElement) ? document.activeElement?.dataset.focus : null;
+  list.replaceChildren(fragment);
+  restoreFocus(list, key);
+}
+
+function setSidebar(open, returnFocus = true) {
+  const sidebar = document.querySelector("#sidebar");
+  const mobile = matchMedia("(max-width: 899px)").matches;
+  document.body.classList.toggle("sidebar-open", open && mobile);
+  menuButton.setAttribute("aria-expanded", String(open && mobile));
+  sidebar.inert = mobile && !open;
+  document.querySelector(".main").inert = mobile && open;
+  if (open && mobile) document.querySelector("#sidebar-close").focus();
+  else if (mobile && returnFocus) menuButton.focus();
+}
+
+async function copyText(text, button) {
+  const iconName = button.dataset.icon;
+  const label = button.dataset.label || button.getAttribute("aria-label");
+  try {
+    if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+    else {
+      const active = document.activeElement;
+      const field = element("textarea", "clipboard-buffer");
+      field.value = text;
+      (document.querySelector("dialog[open]") || document.body).append(field);
+      field.select();
+      const copied = document.execCommand("copy");
+      field.remove();
+      active?.focus({ preventScroll: true });
+      if (!copied) throw new Error("Select text and copy manually.");
+    }
+    if (iconName) {
+      button.replaceChildren(actionIcon("check"));
+      button.setAttribute("aria-label", "Copied");
+      button.title = "Copied";
+    } else button.textContent = "Copied";
+    document.querySelector("#copy-status").textContent = "Copied to clipboard.";
+    setTimeout(() => {
+      if (iconName) {
+        button.replaceChildren(actionIcon(iconName));
+        button.setAttribute("aria-label", label);
+        button.title = label;
+      } else button.textContent = "Copy";
+    }, 1500);
+  } catch (_) {
+    if (iconName) button.title = "Clipboard unavailable";
+    else button.textContent = "Select to copy";
+    document.querySelector("#copy-status").textContent = "Clipboard unavailable. Select text and copy manually.";
+  }
+}
+
+function actionIcon(name) {
+  const paths = {
+    check: '<path d="m5 12 4 4L19 6"/>',
+    copy: '<rect width="13" height="13" x="9" y="9" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+    edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z"/>',
+    resend: '<path d="M20 11a8.1 8.1 0 1 0 1 4"/><path d="M20 4v7h-7"/>',
+  };
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.innerHTML = paths[name];
+  return svg;
+}
+
+function actionButton(name, label) {
+  const button = element("button", "message-action");
+  button.type = "button";
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  button.dataset.icon = name;
+  button.dataset.label = label;
+  button.append(actionIcon(name));
+  return button;
+}
+
+function copyButton(text, label = "Copy", iconOnly = false) {
+  const button = iconOnly ? actionButton("copy", label) : element("button", "copy-button", "Copy");
+  button.type = "button";
+  if (!iconOnly) button.setAttribute("aria-label", label);
+  button.addEventListener("click", () => void copyText(text, button));
+  return button;
+}
+
+function markdownContent(text) {
+  const node = element("div", "message-content markdown");
+  if (!window.marked || !window.DOMPurify) { node.textContent = text; return node; }
+  const renderer = new marked.Renderer();
+  renderer.html = () => "";
+  renderer.image = () => "";
+  const html = marked.parse(text, { renderer });
+  node.append(DOMPurify.sanitize(html, {
+    RETURN_DOM_FRAGMENT: true,
+    ALLOWED_TAGS: ["p", "br", "strong", "em", "del", "blockquote", "ul", "ol", "li", "pre", "code", "a", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "table", "thead", "tbody", "tr", "th", "td"],
+    ALLOWED_ATTR: ["href", "title", "start"],
+    ALLOW_DATA_ATTR: false,
+  }));
+  for (const link of node.querySelectorAll("a")) {
+    const href = link.getAttribute("href") || "";
+    if (!/^(https?:|mailto:)/i.test(href)) link.replaceWith(document.createTextNode(link.textContent));
+    else { link.target = "_blank"; link.rel = "noopener noreferrer"; }
+  }
+  for (const block of node.querySelectorAll("pre")) {
+    const wrapper = element("div", "code-block");
+    block.replaceWith(wrapper);
+    wrapper.append(copyButton(block.textContent, "Copy code"), block);
+  }
+  for (const table of node.querySelectorAll("table")) {
+    const wrapper = element("div", "table-scroll");
+    table.replaceWith(wrapper);
+    wrapper.append(table);
+  }
+  return node;
+}
+
+function updateJump() {
+  jumpLatest.classList.toggle("hidden", currentView !== "conversations" || !currentDetail
+    || transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80);
+}
+
+async function updateMetadata(id, changes) {
+  const state = sessionState(id);
+  if (state.actionBusy) return false;
+  state.actionBusy = true;
+  try {
+    const response = await fetch(`/v1/conversations/${encodeURIComponent(id)}/metadata`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify(changes),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not save conversation.");
+    if (currentDetail?.session_id === id) { currentDetail = result; renderDetail(result); }
+    await refreshList();
+    return true;
+  } catch (error) {
+    if (editDialog.open) document.querySelector("#edit-feedback").textContent = error.message;
+    else showSessionError(id, error.message);
+    return false;
+  } finally {
+    state.actionBusy = false;
+    if (currentDetail?.session_id === id) renderDetail(currentDetail);
+  }
+}
+
+function openEdit(action) {
+  if (!currentDetail) return;
+  conversationMenu.open = false;
+  const id = currentDetail.session_id;
+  const deleting = action === "delete";
+  editAction = { action, id };
+  document.querySelector("#edit-title").textContent = deleting ? "Delete conversation?" : "Rename conversation";
+  document.querySelector("#edit-description").textContent = deleting
+    ? `“${currentDetail.title || shortId(id)}” will be permanently deleted. This cannot be undone.`
+    : "Choose a title you can find later.";
+  const input = document.querySelector("#edit-input");
+  input.value = currentDetail.title || "";
+  input.hidden = deleting;
+  input.required = !deleting;
+  document.querySelector("#edit-label").hidden = deleting;
+  const submit = document.querySelector("#edit-submit");
+  submit.textContent = deleting ? "Delete conversation" : "Save title";
+  submit.classList.toggle("danger", deleting);
+  document.querySelector("#edit-feedback").textContent = "";
+  editDialog.showModal();
+  if (deleting) document.querySelector("#edit-cancel").focus();
+  else { input.focus(); input.select(); }
+}
+
+function validSessionId(value) {
+  return /^[A-Za-z0-9_-]{32}$/.test(value || "");
+}
+
+function element(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function shortId(id) {
+  return id ? id.slice(0, 8) : "unknown";
+}
+
+function timeAgo(timestamp) {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+  if (seconds < 10) return "now";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+function fullTime(timestamp) {
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? timestamp : date.toLocaleString();
+}
+
+function statusText(status) {
+  const values = {
+    ready: "Idle",
+    awaiting_tool_results: "Awaiting terminal",
+    continuation_pending: "Needs resume",
+  };
+  return values[status] || status;
+}
+
+function runnerLabel(runner) {
+  return `${runner.client_name} · ${runner.server_ip}:${runner.port}`;
+}
+
+function activeRunners() {
+  return runners.filter((runner) => ["online", "busy"].includes(runner.status));
+}
+
+function conversationRunnerOption(runner, selected, busy) {
+  const runnerId = runner?.runner_id || "";
+  const active = !runner || ["online", "busy"].includes(runner.status);
+  const button = element("button", `runner-menu-option${runnerId === selected ? " selected" : ""}`);
+  button.type = "button";
+  button.dataset.runnerId = runnerId;
+  button.setAttribute("aria-pressed", String(runnerId === selected));
+  button.disabled = busy || !active;
+
+  const status = element("span", `runner-menu-status ${runner?.status || "local"}`);
+  status.setAttribute("aria-hidden", "true");
+  const copy = element("span", "runner-menu-copy");
+  copy.append(
+    element("strong", "", runner ? runner.client_name : "Chat only"),
+    element("span", "", runner ? `${runner.server_ip}:${runner.port}` : "No command execution"),
+  );
+  const state = element("span", `runner-menu-state ${runner?.status || "local"}`,
+    runner ? runnerStatusText(runner) : "No commands");
+  button.append(status, copy, state);
+  button.addEventListener("click", () => void changeConversationRunner(runnerId));
+  return button;
+}
+
+function renderConversationRunnerPicker(detail, state) {
+  const selected = (detail.runner_change_pending ? detail.pending_runner_id : detail.runner_id) || "";
+  const runner = runners.find((item) => item.runner_id === selected)
+    || (detail.runner?.runner_id === selected ? detail.runner : null);
+  const queued = detail.runner_change_pending;
+  document.querySelector("#runner-picker-label").textContent = queued ? "Target · queued" : "Target";
+  document.querySelector("#runner-picker-value").textContent = runner ? runner.client_name : "Chat only";
+  document.querySelector("#runner-picker-icon").textContent = runner ? ">_" : "◇";
+  runnerPicker.classList.toggle("queued", queued);
+  runnerPickerSummary.setAttribute("aria-label",
+    `Change execution target. Current: ${runner ? runnerLabel(runner) : "Chat only"}${queued ? ". Change queued" : ""}`);
+
+  const fragment = document.createDocumentFragment();
+  const heading = element("div", "runner-menu-heading");
+  heading.append(element("strong", "", "Execution target"),
+    element("span", "", queued ? "Change applies after current reply" : "Choose where commands run"));
+  fragment.append(heading, conversationRunnerOption(null, selected, state.actionBusy));
+  const choices = activeRunners();
+  if (runner && !choices.some((item) => item.runner_id === runner.runner_id)) choices.push(runner);
+  for (const choice of choices) fragment.append(conversationRunnerOption(choice, selected, state.actionBusy));
+  const manage = element("button", "runner-menu-manage", "Manage runners");
+  manage.type = "button";
+  manage.disabled = state.actionBusy;
+  manage.addEventListener("click", () => {
+    runnerPicker.open = false;
+    showServers(runner?.server_ip || detail.runner?.server_ip || null);
+  });
+  if (runner) {
+    const manageMemory = element("button", "runner-menu-manage", "Manage this runner’s memories");
+    manageMemory.type = "button";
+    manageMemory.disabled = state.actionBusy;
+    manageMemory.addEventListener("click", () => {
+      runnerPicker.open = false;
+      showMemories(runner.runner_id);
+    });
+    fragment.append(manageMemory);
+  }
+  fragment.append(manage);
+  runnerMenu.replaceChildren(fragment);
+}
+
+function selectNewRunner(runnerId) {
+  newRunnerSelect.value = runnerId;
+  for (const option of newRunnerOptions.querySelectorAll(".target-option")) {
+    const selected = option.dataset.runnerId === runnerId;
+    option.classList.toggle("selected", selected);
+    option.setAttribute("aria-checked", String(selected));
+    option.tabIndex = selected ? 0 : -1;
+  }
+  const runner = runners.find((item) => item.runner_id === runnerId);
+  newConversationSelection.textContent = runner
+    ? `${runner.client_name} selected`
+    : "Chat only selected";
+}
+
+function newRunnerOption(runner = null) {
+  const runnerId = runner?.runner_id || "";
+  const button = element("button", "target-option");
+  button.type = "button";
+  button.dataset.runnerId = runnerId;
+  button.disabled = Boolean(runner && !["online", "busy"].includes(runner.status));
+  button.setAttribute("role", "radio");
+
+  const icon = element("span", "target-option-icon", runner ? ">_" : "◇");
+  icon.setAttribute("aria-hidden", "true");
+  const copy = element("span", "target-option-copy");
+  copy.append(
+    element("strong", "", runner ? runner.client_name : "Chat only"),
+    element("span", "", runner
+      ? `${runner.server_ip}:${runner.port}`
+      : "No command execution"),
+  );
+  const status = element("span", `target-option-status ${runner?.status || "local"}`,
+    runner ? runnerStatusText(runner) : "No commands");
+  button.append(icon, copy, status);
+  button.addEventListener("click", () => selectNewRunner(runnerId));
+  return button;
+}
+
+function renderNewRunnerOptions() {
+  const fragment = document.createDocumentFragment();
+  fragment.append(newRunnerOption());
+  for (const runner of runners) fragment.append(newRunnerOption(runner));
+  newRunnerOptions.replaceChildren(fragment);
+  selectNewRunner("");
+}
+
+async function getJson(path) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+function setConnection(online) {
+  connected = online;
+  connectionDot.classList.toggle("online", online);
+  connectionDot.classList.toggle("offline", !online);
+  connectionText.textContent = online ? "Connected" : "Reconnecting";
+  document.querySelector("#connection-retry").classList.toggle("hidden", online);
+  if (currentDetail && currentView === "conversations") renderComposer(currentDetail);
+}
+
+function renderConversationList() {
+  const fragment = document.createDocumentFragment();
+  const query = queries.conversations.trim().toLowerCase();
+  const visible = visibleConversations().filter(item => `${item.title || ""} ${item.preview || ""}`.toLowerCase().includes(query));
+  visible.sort((a, b) => Number(b.pinned) - Number(a.pinned) || Number(b.active) - Number(a.active));
+  let group = null;
+  for (const conversation of visible) {
+    const nextGroup = conversation.pinned ? "Pinned" : "Conversations";
+    if (nextGroup !== group) { fragment.append(element("p", "list-heading", nextGroup)); group = nextGroup; }
+    const button = element("button", "conversation-item");
+    button.type = "button";
+    button.dataset.focus = conversation.session_id;
+    button.classList.toggle("selected", conversation.session_id === selectedId);
+    if (conversation.session_id === selectedId) button.setAttribute("aria-current", "page");
+    button.addEventListener("click", () => selectConversation(conversation.session_id));
+    const top = element("div", "item-top");
+    if (conversation.active) top.append(element("span", "live-dot"));
+    top.append(element("span", "item-id", conversation.title || shortId(conversation.session_id)));
+    top.append(element("span", "item-time", timeAgo(conversation.updated_at)));
+    button.append(top, element("div", "item-preview", conversation.preview));
+    if (["continuation_pending", "awaiting_tool_results"].includes(conversation.status)) {
+      button.append(element("span", "item-state", conversation.status === "continuation_pending" ? "Needs resume" : "Command pending"));
+    }
+    fragment.append(button);
+  }
+  if (!visible.length) fragment.append(element("p", "list-empty", query ? "No matching conversations. Try another search." : "No conversations in this view."));
+  replaceList(listElement, fragment);
+  if (currentView === "conversations") countElement.textContent = String(visible.length);
+}
+
+function renderServerList() {
+  const fragment = document.createDocumentFragment();
+  for (const server of servers.filter(item => `${item.name} ${item.server_ip}`.toLowerCase().includes(queries.servers.trim().toLowerCase()))) {
+    const button = element("button", "conversation-item server-item");
+    button.type = "button";
+    button.dataset.focus = server.server_ip;
+    if (server.server_ip === selectedServerIp) button.setAttribute("aria-current", "page");
+    button.classList.toggle("selected", server.server_ip === selectedServerIp);
+    button.addEventListener("click", () => selectServer(server.server_ip));
+    const top = element("div", "item-top");
+    top.append(element("span", "item-id", server.name || server.server_ip));
+    top.append(element("span", "item-time", timeAgo(server.last_seen_at)));
+    const details = server.name ? server.server_ip : "Unnamed server";
+    button.append(top, element("div", "item-preview", details));
+    fragment.append(button);
+  }
+  if (!fragment.childNodes.length) fragment.append(element("p", "list-empty", "No matching servers. Connect a client to get started."));
+  replaceList(serverListElement, fragment);
+  if (currentView === "servers") countElement.textContent = String(servers.length);
+}
+
+function memoryCountForRunner(runnerId) {
+  return memories.filter((memory) => memory.runner_id === runnerId).length;
+}
+
+function renderMemoryRunnerList() {
+  const fragment = document.createDocumentFragment();
+  const query = queries.memories.trim().toLowerCase();
+  const visible = runners.filter((runner) => {
+    const related = memories.filter((memory) => memory.runner_id === runner.runner_id);
+    return `${runner.client_name} ${runner.server_ip} ${related.map((item) => `${item.key} ${item.value}`).join(" ")}`
+      .toLowerCase().includes(query);
+  });
+  const globalMemories = memories.filter((memory) => memory.runner_id == null);
+  if (!query || `global ${globalMemories.map((m) => `${m.key} ${m.value}`).join(" ")}`.toLowerCase().includes(query)) {
+    const button = element("button", "conversation-item server-item");
+    button.type = "button"; button.dataset.focus = "global"; button.classList.toggle("selected", selectedMemoryRunnerId === "global");
+    button.addEventListener("click", () => selectMemoryRunner("global"));
+    const top = element("div", "item-top"); top.append(element("span", "item-id", "Global"), element("span", "item-time", String(globalMemories.length)));
+    button.append(top, element("div", "item-preview", "Available in every chat"));
+    fragment.append(button);
+  }
+  for (const runner of visible) {
+    const button = element("button", "conversation-item server-item");
+    button.type = "button";
+    button.dataset.focus = runner.runner_id;
+    button.classList.toggle("selected", runner.runner_id === selectedMemoryRunnerId);
+    if (runner.runner_id === selectedMemoryRunnerId) button.setAttribute("aria-current", "page");
+    button.addEventListener("click", () => selectMemoryRunner(runner.runner_id));
+    const top = element("div", "item-top");
+    top.append(
+      element("span", "item-id", runner.client_name),
+      element("span", "item-time", String(memoryCountForRunner(runner.runner_id))),
+    );
+    button.append(top, element("div", "item-preview", `${runner.server_ip}:${runner.port}`));
+    fragment.append(button);
+  }
+  if (!visible.length) {
+    fragment.append(element("p", "list-empty", query
+      ? "No runner or memory matches this search."
+      : "No runners are installed yet."));
+  }
+  replaceList(memoryRunnerListElement, fragment);
+  if (currentView === "memories") countElement.textContent = String(memories.length);
+}
+
+function visibleConversations() {
+  if (conversationFilter === "resume") {
+    return conversations.filter((item) => !item.archived
+      && item.status === "continuation_pending");
+  }
+  if (conversationFilter === "archived") {
+    return conversations.filter((item) => item.archived);
+  }
+  if (conversationFilter === "all") return conversations;
+  return conversations.filter((item) => !item.archived);
+}
+
+function selectConversation(sessionId) {
+  saveDraft();
+  currentView = "conversations";
+  selectedId = sessionId;
+  location.hash = sessionId;
+  setSidebar(false);
+  renderView();
+  renderConversationList();
+  refreshDetail();
+}
+
+function selectServer(serverIp) {
+  selectedServerIp = serverIp;
+  location.hash = `servers/${encodeURIComponent(serverIp)}`;
+  setSidebar(false);
+  renderServerList();
+  renderServers();
+}
+
+function selectMemoryRunner(runnerId) {
+  selectedMemoryRunnerId = runnerId;
+  location.hash = `memories/${encodeURIComponent(runnerId)}`;
+  setSidebar(false);
+  renderMemoryRunnerList();
+  renderMemories();
+}
+
+function showServers(serverIp = null) {
+  saveDraft();
+  currentView = "servers";
+  if (typeof serverIp === "string") selectedServerIp = serverIp;
+  location.hash = selectedServerIp ? `servers/${encodeURIComponent(selectedServerIp)}` : "servers";
+  closeConversationStream();
+  setSidebar(false);
+  renderView();
+  void refreshServers();
+}
+
+function showMemories(runnerId = null) {
+  saveDraft();
+  currentView = "memories";
+  if (typeof runnerId === "string") selectedMemoryRunnerId = runnerId;
+  location.hash = selectedMemoryRunnerId
+    ? `memories/${encodeURIComponent(selectedMemoryRunnerId)}`
+    : "memories";
+  closeConversationStream();
+  setSidebar(false);
+  renderView();
+  void refreshMemories();
+}
+
+async function openAddServer() {
+  addServerCommand.textContent = "Preparing command…";
+  addServerCopy.disabled = true;
+  addServerCopy.textContent = "Copy";
+
+  addServerFeedback.classList.remove("error");
+  addServerFeedback.textContent = "Generating setup command…";
+
+  addServerDialog.showModal();
+
+  try {
+    const response = await fetch("/v1/server-setup", {
+      cache: "no-store",
+    });
+
+    const result = await response.json();
+
+    if (!response.ok) {
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+
+    addServerCommand.textContent = result.command;
+    addServerCopy.disabled = false;
+
+    const copied = await copyText(result.command, addServerCopy);
+
+    addServerFeedback.textContent = copied
+      ? "Command copied automatically. Paste it into Bash on the new server."
+      : "Command ready. Use Copy, or select the command manually.";
+  } catch (error) {
+    addServerCommand.textContent = "Could not generate setup command.";
+
+    addServerFeedback.classList.add("error");
+    addServerFeedback.textContent =
+      error.message || "Could not generate setup command.";
+  }
+}
+
+function renderView() {
+  const showServerPolicies = currentView === "servers";
+  const showMemories = currentView === "memories";
+  const showConversations = currentView === "conversations";
+  searchInput.value = queries[currentView];
+  searchInput.placeholder = showServerPolicies ? "Search servers…"
+    : showMemories ? "Search memories…" : "Search conversations…";
+  conversationsViewButton.setAttribute("aria-pressed", String(showConversations));
+  serversViewButton.setAttribute("aria-pressed", String(showServerPolicies));
+  memoriesViewButton.setAttribute("aria-pressed", String(showMemories));
+  showFeedback(showConversations ? sessionState().feedback : "");
+  approvalBanner.classList.toggle("hidden", !showConversations || !currentDetail?.pending_tool_calls?.some(call => call.ui?.remote));
+  updateJump();
+  conversationsViewButton.classList.toggle("selected", showConversations);
+  serversViewButton.classList.toggle("selected", showServerPolicies);
+  memoriesViewButton.classList.toggle("selected", showMemories);
+  listElement.classList.toggle("hidden", !showConversations);
+  serverListElement.classList.toggle("hidden", !showServerPolicies);
+  memoryRunnerListElement.classList.toggle("hidden", !showMemories);
+  filterLabel.classList.toggle("hidden", !showConversations);
+  newConversationButton.classList.toggle("hidden", !showConversations);
+  addServerButton.classList.toggle("hidden", !showServerPolicies);
+  newMemoryButton.classList.toggle("hidden", !showMemories);
+  transcript.classList.toggle("hidden", !showConversations);
+  messageForm.classList.toggle("hidden", !showConversations || !currentDetail);
+  serversElement.classList.toggle("hidden", !showServerPolicies);
+  memoriesElement.classList.toggle("hidden", !showMemories);
+  if (showServerPolicies) {
+    titleElement.textContent = "Servers";
+    metaElement.textContent = "Trusted command prefixes shared by source IP.";
+    statusBadge.classList.add("hidden");
+    actionsElement.classList.add("hidden");
+    renderServerList();
+    renderServers();
+  } else if (showMemories) {
+    statusBadge.classList.add("hidden");
+    actionsElement.classList.add("hidden");
+    renderMemoryRunnerList();
+    renderMemories();
+  }
+}
+
+function emptyState(title, text) {
+  const wrapper = element("div", "empty-state");
+  wrapper.append(
+    element("div", "empty-icon", "⌁"),
+    element("h3", "", title),
+    element("p", "", text),
+  );
+  if (currentView === "conversations" && !title.startsWith("Loading")) {
+    const start = element("button", "primary", "New conversation");
+    start.type = "button";
+    start.addEventListener("click", () => void openNewConversation());
+    wrapper.append(start);
+  }
+  return wrapper;
+}
+
+function rememberDisclosures(scope) {
+  for (const details of scope.querySelectorAll("details[data-key]")) {
+    disclosureState.set(details.dataset.key, details.open);
+  }
+}
+
+function disclosure(className, key, initiallyOpen = false) {
+  const details = element("details", className);
+  details.dataset.key = `${selectedId}:${key}`;
+  details.open = disclosureState.get(details.dataset.key) ?? initiallyOpen;
+  details.addEventListener("toggle", () => {
+    if (details.isConnected) disclosureState.set(details.dataset.key, details.open);
+  });
+  return details;
+}
+
+function formatCommand(tokens) {
+  return tokens.map((token) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(token)
+    ? token : `'${token.replaceAll("'", "'\\''")}'`).join(" ");
+}
+
+function commandArguments(call) {
+  try {
+    const args = JSON.parse(call.function.arguments);
+    if (typeof args?.program !== "string" || !Array.isArray(args.arguments)
+        || !args.arguments.every((token) => typeof token === "string")) return null;
+    return args;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function memoryToolArguments(call) {
+  if (!["save_memory", "recall_memory", "delete_memory"].includes(call.function?.name)) return null;
+  try {
+    const args = JSON.parse(call.function.arguments);
+    return args && typeof args === "object" ? args : null;
+  } catch (_error) { return null; }
+}
+
+function renderMemoryTool(call, result, key) {
+  const args = memoryToolArguments(call) || {};
+  const labels = {
+    save_memory: "Save memory",
+    recall_memory: "Recall memory",
+    delete_memory: "Delete memory",
+  };
+  const card = disclosure("tool-card memory-tool-call", key, false);
+  const summary = element("summary", "tool-summary");
+  const target = typeof args.key === "string" ? args.key
+    : typeof args.query === "string" && args.query ? `“${args.query}”` : "runner memory";
+  summary.append(
+    element("code", "command-line", `${labels[call.function?.name] || "Memory"} · ${target}`),
+    element("span", "command-badge success", result ? "Completed" : "Working"),
+  );
+  card.append(summary);
+  const body = element("div", "tool-details");
+  if (call.function?.name === "save_memory" && typeof args.value === "string") {
+    body.append(element("p", "command-note", args.value));
+  }
+  if (result?.content) {
+    let text = result.content;
+    try {
+      const payload = JSON.parse(result.content);
+      if (payload.ok === false) text = payload.error || "Memory operation failed.";
+      else if (Array.isArray(payload.memories)) {
+        text = payload.memories.length
+          ? payload.memories.map((item) => `${item.key}: ${item.value}`).join("\n")
+          : "No matching memories.";
+      } else if (payload.action) text = `${payload.action}${payload.key ? `: ${payload.key}` : ""}`;
+    } catch (_error) {}
+    body.append(element("pre", "tool-body", text));
+  }
+  card.append(body);
+  return card;
+}
+
+function approvalBadge(approval) {
+  const labels = {
+    trusted: "Trusted", trusted_now: "Trust saved", allowed_once: "Allowed once",
+    denied: "Denied", cancelled: "Cancelled", invalid: "Rejected",
+  };
+  return element("span", `command-badge ${approval?.decision || ""}`,
+    labels[approval?.decision] || "Approval not recorded");
+}
+
+function resultStatus(result) {
+  if (!result) return ["pending", "Awaiting client"];
+  const decision = result.ui?.approval?.decision;
+  if (["denied", "cancelled", "invalid"].includes(decision)) return ["muted", "Not run"];
+  const match = /^exit_code=(\d+)(?:\n|$)/.exec(result.content || "");
+  if (!match) return ["muted", "Result received"];
+  if (match[1] === "0") return ["success", "Completed"];
+  if (match[1] === "124") return ["failed", "Timed out"];
+  return ["failed", `Exit ${match[1]}`];
+}
+
+async function remoteCommandAction(callId, decision) {
+  if (!currentDetail || currentDetail.active) return;
+  const sessionId = currentDetail.session_id;
+  const state = sessionState(sessionId);
+  if (state.commandBusy || state.messageBusy) return;
+  state.commandBusy = true;
+  state.feedback = "";
+  const resolvedCard = [...transcript.querySelectorAll("[data-call-id]")]
+    .find((node) => node.dataset.callId === callId);
+  const resolvedKey = resolvedCard?.dataset.key;
+  renderDetail(currentDetail);
+  try {
+    const response = await fetch(`/v1/conversations/${encodeURIComponent(sessionId)}/commands/${encodeURIComponent(callId)}`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify({ decision }),
+    });
+    const body = await response.text();
+    if (!response.ok || !/(^|\r?\n)event: (done|tool_calls)\r?$/m.test(body)) throw new Error(turnError(body));
+    const detail = await getJson(`/v1/conversations/${encodeURIComponent(sessionId)}`);
+    if (currentDetail?.session_id === sessionId) {
+      if (resolvedKey) disclosureState.set(resolvedKey, false);
+      state.nextCommandId = detail.pending_tool_calls?.find(call => call.ui?.remote)?.id || "";
+      currentDetail = detail;
+      renderDetail(detail);
+    }
+  } catch (error) { showSessionError(sessionId, error.message || "Command action failed. Try again from the command card."); }
+  finally {
+    state.commandBusy = false;
+    if (currentDetail?.session_id === sessionId) renderDetail(currentDetail);
+  }
+}
+
+function renderTool(call, result, key) {
+  if (memoryToolArguments(call)) return renderMemoryTool(call, result, key);
+  const uiState = sessionState();
+  const args = commandArguments(call);
+  const command = args ? formatCommand([args.program, ...args.arguments]) : "Command unavailable";
+  const pending = currentDetail?.pending_tool_calls?.find((item) => item.id === call.id);
+  const remotePending = currentDetail?.pending_tool_calls?.filter(item => item.ui?.remote) || [];
+  const pendingIndex = remotePending.findIndex(item => item.id === call.id);
+  const isNext = pendingIndex === 0;
+  const card = disclosure("tool-card", key, Boolean(!result && pending?.ui?.remote && isNext));
+  if (uiState.nextCommandId === call.id) {
+    card.open = true;
+    disclosureState.set(card.dataset.key, true);
+  }
+  const summary = element("summary", "tool-summary");
+  const commandLabel = element("code", "command-line", command);
+  commandLabel.title = command;
+  let [statusState, label] = resultStatus(result);
+  if (!result && pending?.ui?.remote) {
+    label = pending.ui.state === "failed" ? "Runner unavailable" : "Awaiting approval";
+    statusState = pending.ui.state === "failed" ? "failed" : "pending";
+  }
+  const badges = element("span", "command-badges");
+  if (result) badges.append(approvalBadge(result.ui?.approval));
+  if (!result && pending?.ui?.remote && remotePending.length > 1) {
+    badges.append(element("span", "command-badge queue-position",
+      `${pendingIndex + 1} of ${remotePending.length}`));
+  }
+  badges.append(element("span", `command-badge ${statusState}`, label));
+  summary.append(commandLabel, badges);
+  card.append(summary);
+
+  const body = element("div", "tool-details");
+  card.dataset.callId = call.id;
+  body.append(copyButton(command, "Copy command"), element("pre", "command-full", command));
+  if (typeof args?.reason === "string" && args.reason) {
+    body.append(element("p", "command-reason", args.reason));
+  }
+  const approval = result?.ui?.approval;
+  const prefix = approval?.prefix?.length ? approval.prefix : args?.trust_prefix;
+  if (Array.isArray(prefix) && prefix.length && prefix.every((token) => typeof token === "string")) {
+    const prefixRow = element("div", "prefix-row");
+    prefixRow.append(
+      element("span", "", approval?.prefix?.length ? "Trusted prefix" : "Suggested prefix"),
+      element("code", "", formatCommand(prefix)),
+    );
+    body.append(prefixRow);
+    if (!result && pending?.ui?.remote) body.append(element("p", "command-note",
+      `Trust saves this exact prefix for ${currentDetail.runner?.server_ip || currentDetail.client?.server_ip || "the selected server"}. Matching commands can run without asking.`));
+  }
+  if (result) {
+    const output = disclosure("tool-output", `${key}:output`, true);
+    output.append(element("summary", "", "Output"), element("pre", "tool-body",
+      (result.content || "").replace(/^exit_code=\d+\n?/, "") || "No output."));
+    output.append(copyButton((result.content || "").replace(/^exit_code=\d+\n?/, ""), "Copy output"));
+    body.append(output);
+  } else if (pending?.ui?.remote) {
+    if (pending.ui.error) body.append(element("p", "command-note error", pending.ui.error));
+    const controls = element("div", "command-actions");
+    controls.classList.toggle("approval-actions", pending.ui.state !== "failed");
+    const actions = pending.ui.state === "failed"
+      ? [["retry", "Retry"], ["cancel", "Cancel"]]
+      : [["allow_once", "Allow once"], ["trust", "Trust"], ["deny", "Deny"]];
+    for (const [decision, text] of actions) {
+      const button = element("button", decision === "deny" || decision === "cancel" ? "danger" : "", text);
+      button.type = "button";
+      button.disabled = sessionState().commandBusy || sessionState().messageBusy || Boolean(currentDetail?.active || currentDetail?.archived);
+      button.dataset.focus = `${call.id}:${decision}`;
+      button.addEventListener("click", () => void remoteCommandAction(call.id, decision));
+      controls.append(button);
+    }
+    body.append(controls);
+  } else {
+    body.append(element("p", "command-note", "Approval and execution happen in the client terminal."));
+  }
+  card.append(body);
+  return card;
+}
+
+function renderReasoning(text, key, live = false) {
+  const details = disclosure("reasoning", key, true);
+  const summary = element("summary", "", "Thinking");
+  summary.append(element("span", "reasoning-state", live ? "Live" : "Saved"));
+  details.append(summary, element("pre", "", text));
+  return details;
+}
+
+function renderMessage(message, index, results = []) {
+  const role = message.role;
+  const row = element("article", `message-row ${role}`);
+  const stack = element("div", "message-stack");
+  const labels = { user: "You", assistant: "Brain", tool: "Tool result", system: "Target" };
+  stack.append(element("div", "message-label", labels[role] || role));
+  if (message.ui?.reasoning) {
+    stack.append(renderReasoning(message.ui.reasoning, `message:${index}:thinking`));
+  }
+
+  const content = role === "user" && typeof message.ui?.display_content === "string"
+    ? message.ui.display_content : message.content;
+  if (typeof content === "string" && content.length) {
+    if (role === "tool") {
+      const output = disclosure("tool-output standalone", `message:${index}:output`);
+      output.append(element("summary", "", "Output"), element("pre", "tool-body", content), copyButton(content, "Copy output"));
+      stack.append(output);
+    } else {
+      const bubble = element("div", "bubble");
+      const state = sessionState();
+      const editing = role === "user" && state.editingMessageIndex === index;
+      if (editing) {
+        const editor = element("form", "message-editor");
+        const textarea = element("textarea", "message-editor-input");
+        textarea.value = state.editingMessageDraft;
+        textarea.rows = 3;
+        textarea.maxLength = 100000;
+        textarea.setAttribute("aria-label", "Edit message");
+        textarea.dataset.focus = `message:${index}:edit`;
+        textarea.addEventListener("input", () => {
+          state.editingMessageDraft = textarea.value;
+          submit.disabled = !textarea.value.trim();
+        });
+        textarea.addEventListener("keydown", event => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            cancelMessageEdit(index);
+          }
+        });
+        const controls = element("div", "message-editor-actions");
+        const cancel = element("button", "", "Cancel");
+        cancel.type = "button";
+        cancel.addEventListener("click", () => cancelMessageEdit(index));
+        const submit = element("button", "primary", "Send");
+        submit.type = "submit";
+        submit.disabled = !textarea.value.trim();
+        editor.addEventListener("submit", event => {
+          event.preventDefault();
+          if (!submit.disabled) void branchFromMessage(index, textarea.value);
+        });
+        controls.append(cancel, submit);
+        editor.append(textarea, controls);
+        bubble.append(editor);
+      } else {
+        bubble.append(role === "assistant" ? markdownContent(content) : element("pre", "message-content", content));
+        if (role !== "user") bubble.append(copyButton(content, "Copy message", true));
+      }
+      stack.append(bubble);
+      if (role === "user" && !editing) {
+        const controls = element("div", "message-actions");
+        const branch = message.ui?.branch;
+        if (branch?.choices?.length > 1) {
+          const navigation = element("div", "branch-navigation");
+          const previous = element("button", "branch-arrow", "‹");
+          previous.type = "button";
+          previous.setAttribute("aria-label", "Previous response branch");
+          previous.disabled = branch.current === 0 || !canChangeBranch();
+          previous.dataset.focus = `message:${index}:previous`;
+          previous.addEventListener("click", () => void switchMessageBranch(
+            branch.choices[branch.current - 1]?.branch_id
+          ));
+          const count = element("span", "branch-count", `${branch.current + 1} / ${branch.choices.length}`);
+          count.setAttribute("aria-live", "polite");
+          const next = element("button", "branch-arrow", "›");
+          next.type = "button";
+          next.setAttribute("aria-label", "Next response branch");
+          next.disabled = branch.current >= branch.choices.length - 1 || !canChangeBranch();
+          next.dataset.focus = `message:${index}:next`;
+          next.addEventListener("click", () => void switchMessageBranch(
+            branch.choices[branch.current + 1]?.branch_id
+          ));
+          navigation.append(previous, count, next);
+          controls.append(navigation);
+        }
+        const copy = copyButton(content, "Copy message", true);
+        const edit = actionButton("edit", "Edit message and create new response branch");
+        edit.disabled = !canChangeBranch();
+        edit.dataset.focus = `message:${index}:edit-button`;
+        edit.addEventListener("click", () => startMessageEdit(index, content));
+        const resend = actionButton("resend", "Resend message and create new response branch");
+        resend.disabled = !canChangeBranch();
+        resend.dataset.focus = `message:${index}:resend`;
+        resend.addEventListener("click", () => void branchFromMessage(index, content));
+        controls.append(copy, edit, resend);
+        stack.append(controls);
+      }
+    }
+  }
+
+  if (Array.isArray(message.tool_calls)) {
+    const commandGroup = element("div", message.tool_calls.length > 1 ? "command-group" : "");
+    if (message.tool_calls.length > 1) {
+      const ids = new Set(message.tool_calls.map(call => call.id));
+      const hasMemoryCalls = message.tool_calls.some(call => memoryToolArguments(call));
+      const reviewCount = currentDetail?.pending_tool_calls?.filter(
+        call => ids.has(call.id) && call.ui?.remote
+      ).length || 0;
+      const groupHeader = element("div", "command-group-header");
+      groupHeader.append(
+        element("strong", "", `${message.tool_calls.length} ${hasMemoryCalls ? "actions" : "commands"}`),
+        element("span", "", reviewCount
+          ? `${reviewCount} ${reviewCount === 1 ? "needs" : "need"} review`
+          : `${results.length} finished`),
+      );
+      commandGroup.append(groupHeader);
+    }
+    for (const [callIndex, call] of message.tool_calls.entries()) {
+      commandGroup.append(renderTool(
+        call,
+        results.find((result) => result.tool_call_id === call.id),
+        `message:${index}:command:${callIndex}`,
+      ));
+    }
+    stack.append(commandGroup);
+  }
+
+  row.append(stack);
+  return row;
+}
+
+function canChangeBranch() {
+  if (!currentDetail || !connected) return false;
+  const state = sessionState();
+  return !currentDetail.active && !currentDetail.archived && !state.messageBusy
+    && !state.branchBusy && !state.commandBusy && !state.actionBusy;
+}
+
+function startMessageEdit(index, content) {
+  if (!canChangeBranch()) return;
+  const state = sessionState();
+  state.editingMessageIndex = index;
+  state.editingMessageDraft = content;
+  renderDetail(currentDetail);
+  transcript.querySelector(`[data-focus="message:${index}:edit"]`)?.focus({ preventScroll: true });
+}
+
+function cancelMessageEdit(index) {
+  const state = sessionState();
+  state.editingMessageIndex = null;
+  state.editingMessageDraft = "";
+  renderDetail(currentDetail);
+  transcript.querySelector(`[data-focus="message:${index}:edit-button"]`)?.focus({ preventScroll: true });
+}
+
+async function switchMessageBranch(branchId) {
+  if (!branchId || !canChangeBranch() || !currentDetail) return;
+  const sessionId = currentDetail.session_id;
+  const state = sessionState(sessionId);
+  state.branchBusy = true;
+  state.failure = "";
+  renderDetail(currentDetail);
+  try {
+    const response = await fetch(
+      `/v1/conversations/${encodeURIComponent(sessionId)}/branches/${encodeURIComponent(branchId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+        body: "{}",
+      },
+    );
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    if (currentDetail?.session_id === sessionId) {
+      currentDetail = result;
+      state.editingMessageIndex = null;
+      renderDetail(result);
+    }
+  } catch (error) {
+    state.failure = error.message || "Could not open response branch.";
+  } finally {
+    state.branchBusy = false;
+    if (currentDetail?.session_id === sessionId) renderDetail(currentDetail);
+  }
+}
+
+async function branchFromMessage(index, content) {
+  if (!canChangeBranch() || !currentDetail || !content.trim()) return;
+  const sessionId = currentDetail.session_id;
+  const state = sessionState(sessionId);
+  state.failure = "";
+  state.branchBusy = true;
+  let accepted = false;
+  renderDetail(currentDetail);
+  try {
+    const response = await fetch(`/v1/conversations/${encodeURIComponent(sessionId)}/turns`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify({ content, branch_from: index }),
+    });
+    if (!response.ok) {
+      const result = await response.json();
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    accepted = true;
+    state.editingMessageIndex = null;
+    state.editingMessageDraft = "";
+    const body = await response.text();
+    if (!/(^|\r?\n)event: (done|tool_calls)\r?$/m.test(body)) throw new Error(turnError(body));
+  } catch (error) {
+    state.failure = accepted
+      ? `${error.message} Branch was created; check transcript before continuing.`
+      : error.message || "Could not create response branch.";
+  } finally {
+    state.branchBusy = false;
+    if (currentDetail?.session_id === sessionId) renderDetail(currentDetail);
+  }
+}
+
+function renderLive(live, index) {
+  const row = element("article", "message-row assistant");
+  row.dataset.live = "true";
+  const stack = element("div", "message-stack");
+  stack.append(element("div", "message-label", "Brain · live"));
+
+  if (live.reasoning) {
+    stack.append(renderReasoning(live.reasoning, `message:${index}:thinking`, true));
+  }
+
+  const bubble = element("div", "bubble");
+  if (live.content) {
+    bubble.append(element("pre", "message-content", live.content));
+  } else {
+    const typing = element("div", "typing");
+    typing.append(element("span"), element("span"), element("span"));
+    bubble.append(typing);
+  }
+  stack.append(bubble);
+  row.append(stack);
+  return row;
+}
+
+function trustEditor(serverIp) {
+  if (!trustEditors.has(serverIp)) {
+    trustEditors.set(serverIp, {
+      draft: "", busy: false, message: "", error: false,
+      nameDraft: "", nameDirty: false, nameMessage: "", nameError: false,
+    });
+  }
+  return trustEditors.get(serverIp);
+}
+
+function enrollmentEditor(clientId) {
+  if (!enrollmentEditors.has(clientId)) {
+    enrollmentEditors.set(clientId, {
+      busy: false, action: "", command: "", message: "", error: false,
+    });
+  }
+  return enrollmentEditors.get(clientId);
+}
+
+function runnerStatusText(runner) {
+  if (!runner) return "Not installed";
+  const labels = {
+    online: "Ready",
+    busy: "Running command",
+    offline: "Unreachable",
+    error: "Check failed",
+    upgrade_required: "Update required",
+  };
+  return labels[runner.status] || runner.status;
+}
+
+function runnerVersionText(runner) {
+  if (!runner || runner.version_status === "unknown") return "Version unknown · Update available";
+  if (runner.runner_version === 0) return `Legacy · Update available (v${runner.latest_runner_version})`;
+  const version = `v${runner.runner_version}`;
+  if (runner.version_status === "latest") return `${version} · Latest`;
+  if (runner.version_status === "newer") return `${version} · Newer than Brain`;
+  return `${version} · Update available (v${runner.latest_runner_version})`;
+}
+
+function replaceRunner(runner) {
+  const index = runners.findIndex((item) => item.runner_id === runner.runner_id);
+  if (index >= 0) runners[index] = runner;
+  else runners.push(runner);
+}
+
+async function checkRunner(runnerId, clientId) {
+  const editor = enrollmentEditor(clientId);
+  if (editor.busy) return;
+  editor.busy = true;
+  editor.action = "check";
+  editor.message = "Checking connection, credentials, and protocol…";
+  editor.error = false;
+  renderServers();
+  try {
+    const response = await fetch(`/v1/runners/${encodeURIComponent(runnerId)}/check`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: "{}",
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    replaceRunner(result.runner);
+    const working = result.runner.status === "online";
+    editor.message = working
+      ? "Check passed. Runner ready."
+      : result.runner.last_error || "Runner check failed.";
+    editor.error = !working;
+  } catch (error) {
+    editor.message = error.message || "Could not check runner.";
+    editor.error = true;
+  } finally {
+    editor.busy = false;
+    editor.action = "";
+    renderServers();
+  }
+}
+
+async function generateEnrollment(clientId) {
+  const editor = enrollmentEditor(clientId);
+  if (editor.busy) return;
+  editor.busy = true;
+  editor.action = "install";
+  editor.command = "";
+  editor.message = "Generating fresh repair command…";
+  editor.error = false;
+  renderServers();
+  try {
+    const response = await fetch("/v1/runner-enrollments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify({ client_id: clientId }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    editor.command = result.command;
+    editor.message = `Run on target server. Command expires ${fullTime(result.expires_at)}.`;
+  } catch (error) {
+    editor.message = error.message || "Could not generate setup command.";
+    editor.error = true;
+  } finally {
+    editor.busy = false;
+    editor.action = "";
+    renderServers();
+  }
+}
+
+function replaceServer(server) {
+  const index = servers.findIndex((item) => item.server_ip === server.server_ip);
+  if (index >= 0) servers[index] = server;
+  renderServerList();
+}
+
+async function changeTrust(serverIp, edit) {
+  const editor = trustEditor(serverIp);
+  if (editor.busy) return;
+  editor.busy = true;
+  editor.message = "Saving…";
+  editor.error = false;
+  renderServers();
+  try {
+    const response = await fetch(`/v1/servers/${encodeURIComponent(serverIp)}/trust`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify(edit),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    if (edit.action === "add") editor.draft = "";
+    editor.message = edit.action === "add" ? "Prefix saved." : "Prefix removed.";
+    replaceServer(result);
+  } catch (error) {
+    editor.message = error.message || "Could not save. Try again.";
+    editor.error = true;
+  } finally {
+    editor.busy = false;
+    renderServers();
+    if (edit.action === "add") {
+      document.querySelector("#trust-prefix")?.focus({ preventScroll: true });
+    }
+  }
+}
+
+async function changeServerName(serverIp) {
+  const editor = trustEditor(serverIp);
+  if (editor.busy) return;
+  editor.busy = true;
+  editor.nameMessage = "Saving…";
+  editor.nameError = false;
+  renderServers();
+  try {
+    const response = await fetch(`/v1/servers/${encodeURIComponent(serverIp)}/name`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify({ name: editor.nameDraft }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    editor.nameDraft = result.name;
+    editor.nameDirty = false;
+    editor.nameMessage = result.name ? "Name saved." : "Name removed.";
+    replaceServer(result);
+  } catch (error) {
+    editor.nameMessage = error.message || "Could not save. Try again.";
+    editor.nameError = true;
+  } finally {
+    editor.busy = false;
+    renderServers();
+    document.querySelector("#server-name")?.focus({ preventScroll: true });
+  }
+}
+
+function renderServers() {
+  if (currentView !== "servers") return;
+  rememberDisclosures(serversElement);
+  const oldFocus = serversElement.contains(document.activeElement) ? document.activeElement?.dataset.focus : null;
+  const oldInput = document.activeElement?.tagName === "INPUT" ? document.activeElement : null;
+  const focusedId = oldInput?.id;
+  const selection = oldInput?.tagName === "INPUT" ? [oldInput.selectionStart, oldInput.selectionEnd] : null;
+  const fragment = document.createDocumentFragment();
+  const server = servers.find((item) => item.server_ip === selectedServerIp);
+  if (server) {
+    const serverIp = server.server_ip;
+    const editor = trustEditor(serverIp);
+    const panel = element("article", "server-card");
+    panel.dataset.serverIp = serverIp;
+    const heading = element("div", "server-heading");
+    heading.append(element("h3", "", "Trusted commands"),
+      element("span", "count", `${server.trusted_prefixes.length} trusted`));
+    titleElement.textContent = server.name || serverIp;
+    metaElement.textContent = `${serverIp} · ${server.client_names.join(", ") || "No named clients"} · Last seen ${fullTime(server.last_seen_at)}`;
+
+    const nameForm = element("form", "trust-form server-name-form");
+    const nameLabel = element("label", "trust-input-label", "Server name");
+    nameLabel.htmlFor = "server-name";
+    const nameInput = element("input", "trust-input");
+    nameInput.id = "server-name";
+    nameInput.type = "text";
+    nameInput.placeholder = "e.g. Build server";
+    nameInput.autocomplete = "off";
+    nameInput.maxLength = 128;
+    nameInput.disabled = editor.busy;
+    if (!editor.nameDirty) editor.nameDraft = server.name;
+    nameInput.value = editor.nameDraft;
+    nameInput.addEventListener("input", () => {
+      editor.nameDraft = nameInput.value;
+      editor.nameDirty = true;
+    });
+    const saveName = element("button", "trust-add", editor.busy ? "Saving…" : "Save name");
+    saveName.type = "submit";
+    saveName.disabled = editor.busy;
+    const nameControls = element("div", "trust-controls");
+    nameControls.append(nameInput, saveName);
+    nameForm.append(nameLabel, nameControls);
+    nameForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void changeServerName(serverIp);
+    });
+    const nameFeedback = element("p", `trust-feedback${editor.nameError ? " error" : ""}`, editor.nameMessage);
+    nameFeedback.setAttribute("role", editor.nameError ? "alert" : "status");
+    panel.append(nameForm, nameFeedback);
+
+    const runnerHeading = element("div", "server-heading");
+    runnerHeading.append(element("h3", "", "Runner health"));
+    panel.append(runnerHeading);
+    const runnerList = element("div", "runner-list");
+    for (const client of server.clients || []) {
+      const runner = runners.find((item) => item.client_id === client.client_id);
+      const editor = enrollmentEditor(client.client_id);
+      const item = element("section", `runner-row ${runner?.status || "missing"}`);
+      const info = element("div", "runner-info");
+      const runnerStatus = element("span", `runner-status ${runner?.status || "missing"}`,
+        runnerStatusText(runner));
+      const identity = element("strong", "", client.name);
+      const endpoint = element("span", "runner-endpoint",
+        runner ? `${runner.server_ip}:${runner.port}` : client.client_id.slice(0, 8));
+      info.append(identity, endpoint, runnerStatus);
+      if (runner) {
+        info.append(element("span", `runner-version ${runner.version_status}`,
+          runnerVersionText(runner)));
+      }
+      if (runner?.last_seen_at) {
+        const age = timeAgo(runner.last_seen_at);
+        info.append(element("span", "runner-last-seen",
+          age === "now" ? "Last passed just now" : `Last passed ${age} ago`));
+      }
+      const actions = element("div", "runner-actions");
+      if (runner) {
+        const check = element("button", "trust-add",
+          editor.action === "check" ? "Checking…" : "Check now");
+        check.type = "button";
+        check.disabled = editor.busy;
+        check.addEventListener("click", () => void checkRunner(runner.runner_id, client.client_id));
+        actions.append(check);
+      }
+      const setup = element("button", "trust-add",
+        editor.action === "install" ? "Preparing…" : "Install / repair");
+      setup.type = "button";
+      setup.disabled = editor.busy;
+      setup.addEventListener("click", () => void generateEnrollment(client.client_id));
+      actions.append(setup);
+      item.append(info, actions);
+      if (runner?.last_error) {
+        const diagnostic = disclosure("runner-diagnostic", `runner:${runner.runner_id}:diagnostic`);
+        diagnostic.append(element("summary", "", "Connection details"), element("p", "", runner.last_error));
+        item.append(diagnostic);
+      }
+      if (editor.command) {
+        item.append(element("p", "runner-instruction",
+          `Run as ${client.name.split("@")[0] || "target user"}, then press Check now.`));
+        const command = element("code", "setup-command", editor.command);
+        const copy = element("button", "trust-add", "Copy");
+        copy.type = "button";
+        copy.addEventListener("click", () => void copyText(editor.command, copy));
+        const setupLine = element("div", "setup-line");
+        setupLine.append(command, copy);
+        item.append(setupLine);
+      }
+      if (editor.message) {
+        const feedback = element("p", `trust-feedback${editor.error ? " error" : ""}`, editor.message);
+        feedback.setAttribute("role", editor.error ? "alert" : "status");
+        item.append(feedback);
+      }
+      runnerList.append(item);
+    }
+    panel.append(runnerList, heading);
+
+    const owner = element("p", "trust-owner");
+    owner.append(document.createTextNode(
+      `${server.client_names.join(", ") || "No named clients"} · Last seen ${fullTime(server.last_seen_at)}`));
+    panel.append(owner);
+    const list = element("ul", "trust-list");
+    for (const prefix of server.trusted_prefixes) {
+      const item = element("li");
+      const command = formatCommand(prefix);
+      const remove = element("button", "trust-remove", "×");
+      remove.type = "button";
+      remove.disabled = editor.busy;
+      remove.setAttribute("aria-label", `Remove trust for ${command}`);
+      remove.title = `Remove ${command}`;
+      remove.addEventListener("click", () => void changeTrust(serverIp, { action: "remove", prefix }));
+      item.append(element("code", "", command), remove);
+      list.append(item);
+    }
+    panel.append(list);
+    if (!server.trusted_prefixes.length) panel.append(element("p", "command-note", "No trusted prefixes. Commands require approval."));
+    const form = element("form", "trust-form");
+    const label = element("label", "trust-input-label", "Add a command prefix");
+    const input = element("input", "trust-input");
+    const inputId = "trust-prefix";
+    const helpId = "trust-help";
+    const feedbackId = "trust-feedback";
+    label.htmlFor = inputId;
+    input.id = inputId;
+    input.type = "text";
+    input.placeholder = "e.g. docker ps";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.maxLength = 1024;
+    input.required = true;
+    input.disabled = editor.busy;
+    input.value = editor.draft;
+    input.setAttribute("aria-describedby", `${helpId} ${feedbackId}`);
+    input.addEventListener("input", () => { editor.draft = input.value; });
+    const add = element("button", "trust-add", editor.busy ? "Saving…" : "Add prefix");
+    add.type = "submit";
+    add.disabled = editor.busy;
+    const controls = element("div", "trust-controls");
+    controls.append(input, add);
+    form.append(label, controls);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void changeTrust(serverIp, { action: "add", command: input.value });
+    });
+    panel.append(form);
+    const help = element("p", "command-note",
+      'Matching commands run without asking. Use specific prefixes, such as docker ps. Quote arguments containing spaces. Changes apply before the next command; running commands continue.');
+    help.id = helpId;
+    const feedback = element("p", `trust-feedback${editor.error ? " error" : ""}`, editor.message);
+    feedback.id = feedbackId;
+    feedback.setAttribute("role", editor.error ? "alert" : "status");
+    panel.append(help, feedback);
+    fragment.append(panel);
+  }
+  if (!server) fragment.append(emptyState("No server selected", servers.length
+    ? "Select server from list." : "Servers appear after client connects."));
+  for (const [index, control] of [...fragment.querySelectorAll("button, summary, select")].entries()) {
+    control.dataset.focus = `${selectedServerIp}:${index}`;
+  }
+  serversElement.replaceChildren(fragment);
+  restoreFocus(serversElement, oldFocus);
+  if (focusedId && selection) {
+    const input = document.querySelector(`#${CSS.escape(focusedId)}`);
+    input?.focus({ preventScroll: true });
+    input?.setSelectionRange(...selection);
+  }
+}
+
+function renderMemories() {
+  if (currentView !== "memories") return;
+  const runner = runners.find((item) => item.runner_id === selectedMemoryRunnerId);
+  const query = queries.memories.trim().toLowerCase();
+  const items = memories.filter((memory) => (selectedMemoryRunnerId === "global" ? memory.runner_id == null : memory.runner_id === selectedMemoryRunnerId)
+    && `${memory.key} ${memory.value}`.toLowerCase().includes(query));
+
+  if (!runner && selectedMemoryRunnerId !== "global") {
+    titleElement.textContent = "Memories";
+    metaElement.textContent = runners.length
+      ? "Choose a runner to inspect its durable memory."
+      : "Install a runner before using durable memory.";
+    memoriesElement.replaceChildren(emptyState(
+      runners.length ? "Choose a runner" : "No runners available",
+      runners.length
+        ? "Memory is isolated by execution target. Select a runner from the sidebar."
+        : "Runner-scoped memory becomes available after a runner is installed.",
+    ));
+    newMemoryButton.disabled = true;
+    return;
+  }
+
+  titleElement.textContent = runner ? `${runner.client_name} memories` : "Global memories";
+  metaElement.textContent = runner ? `${runner.server_ip}:${runner.port} · ${items.length} shown` : `${items.length} shown across every conversation`;
+  newMemoryButton.disabled = false;
+  const fragment = document.createDocumentFragment();
+  const intro = element("div", "memory-intro");
+  intro.append(
+    element("strong", "", runner ? "Runner-scoped durable memory" : "Global durable memory"),
+    element("span", "", runner ? "Available in chats targeting this runner." : "Available in every chat."),
+  );
+  fragment.append(intro);
+  if (!items.length) {
+    const empty = emptyState(
+      query ? "No matching memories" : "No memories yet",
+      query ? "Try another search." : "The LLM can save durable facts during a conversation, or you can add one here.",
+    );
+    if (!query) {
+      const add = element("button", "primary", "New memory");
+      add.type = "button";
+      add.addEventListener("click", () => openMemoryDialog());
+      empty.append(add);
+    }
+    fragment.append(empty);
+  } else {
+    const grid = element("div", "memory-grid");
+    for (const memory of items) {
+      const card = element("article", "memory-card");
+      const head = element("div", "memory-card-heading");
+      const key = element("code", "memory-key", memory.key);
+      const actions = element("div", "memory-actions");
+      const edit = element("button", "memory-action", "Edit");
+      edit.type = "button";
+      edit.addEventListener("click", () => openMemoryDialog(memory));
+      const remove = element("button", "memory-action danger", "Delete");
+      remove.type = "button";
+      remove.addEventListener("click", () => void deleteMemoryItem(memory));
+      actions.append(edit, remove);
+      head.append(key, actions);
+      const value = element("div", "memory-value", memory.value);
+      const footer = element("div", "memory-meta", `Updated ${fullTime(memory.updated_at)}`);
+      if (memory.source_session_id) {
+        const source = element("button", "memory-source", "Open source conversation");
+        source.type = "button";
+        source.addEventListener("click", () => selectConversation(memory.source_session_id));
+        footer.append(" · ", source);
+      }
+      card.append(head, value, footer);
+      grid.append(card);
+    }
+    fragment.append(grid);
+  }
+  memoriesElement.replaceChildren(fragment);
+}
+
+function openMemoryDialog(memory = null) {
+  const runner = runners.find((item) => item.runner_id === selectedMemoryRunnerId);
+  if (!runner && selectedMemoryRunnerId !== "global") return;
+  editingMemoryId = memory?.memory_id || null;
+  document.querySelector("#memory-dialog-title").textContent = memory ? "Edit memory" : "New memory";
+  document.querySelector("#memory-dialog-description").textContent =
+    runner ? `Stored only for ${runner.client_name} (${runner.server_ip}:${runner.port}).` : "Stored globally for every conversation.";
+  memoryKeyInput.value = memory?.key || "";
+  memoryValueInput.value = memory?.value || "";
+  memoryScopeInput.value = memory?.runner_id == null ? "global" : "runner";
+  memoryScopeInput.querySelector('option[value="runner"]').disabled = selectedMemoryRunnerId === "global";
+  memoryScopeInput.disabled = Boolean(memory);
+  memoryFeedback.textContent = "";
+  memorySaveButton.disabled = false;
+  memoryDialog.showModal();
+  memoryKeyInput.focus();
+}
+
+async function saveMemoryFromDialog() {
+  if ((!selectedMemoryRunnerId && selectedMemoryRunnerId !== "global") || memorySaveButton.disabled) return;
+  memorySaveButton.disabled = true;
+  memoryFeedback.textContent = "";
+  try {
+    const body = {
+      runner_id: memoryScopeInput.value === "global" ? null : selectedMemoryRunnerId,
+      key: memoryKeyInput.value,
+      value: memoryValueInput.value,
+    };
+    if (editingMemoryId) body.memory_id = editingMemoryId;
+    const response = await fetch("/v1/memories", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify(body),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    memoryDialog.close();
+    await refreshMemories();
+  } catch (error) {
+    memoryFeedback.textContent = error.message || "Could not save memory.";
+  } finally {
+    memorySaveButton.disabled = false;
+  }
+}
+
+async function deleteMemoryItem(memory) {
+  if (!window.confirm(`Delete memory “${memory.key}” from this runner?`)) return;
+  try {
+    const response = await fetch(`/v1/memories/${encodeURIComponent(memory.memory_id)}`, {
+      method: "DELETE",
+      headers: { "X-Brain-UI": "1" },
+    });
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try { message = (await response.json()).error || message; } catch (_) {}
+      throw new Error(message);
+    }
+    await refreshMemories();
+  } catch (error) {
+    showFeedback(error.message || "Could not delete memory.");
+  }
+}
+
+function renderDetail(detail) {
+  const state = sessionState(detail.session_id);
+  rememberDisclosures(transcript);
+  const focusedButton = transcript.contains(document.activeElement) ? document.activeElement?.dataset.focus : null;
+  const focusedKey = document.activeElement?.tagName === "SUMMARY"
+    ? document.activeElement.closest("details[data-key]")?.dataset.key : null;
+  const wasNearBottom = state.restoreScroll ? (state.follow ?? true)
+    : transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 24;
+  const previousScrollTop = state.restoreScroll ? (state.scrollTop || 0) : transcript.scrollTop;
+  state.restoreScroll = false;
+  const fragment = document.createDocumentFragment();
+  const messages = [...detail.messages];
+  if (detail.live) messages.push(...detail.live.transient_messages);
+  const groupedResults = new Set();
+  for (const [index, message] of messages.entries()) {
+    if (groupedResults.has(index)) continue;
+    const results = [];
+    if (message.tool_calls?.length) {
+      for (let next = index + 1; next < messages.length && messages[next].role === "tool"; next++) {
+        if (message.tool_calls.some((call) => call.id === messages[next].tool_call_id)) {
+          results.push(messages[next]);
+          groupedResults.add(next);
+        }
+      }
+    }
+    fragment.append(renderMessage(message, index, results));
+  }
+  if (detail.live) fragment.append(renderLive(detail.live, messages.length));
+  if (!messages.length && !detail.live) {
+    fragment.append(emptyState("Empty conversation", "No client messages yet."));
+  }
+  transcript.replaceChildren(fragment);
+  if (focusedKey) {
+    const restored = [...document.querySelectorAll("details[data-key]")]
+      .find((details) => details.dataset.key === focusedKey);
+    restored?.querySelector("summary")?.focus({ preventScroll: true });
+  }
+  restoreFocus(transcript, focusedButton);
+  transcript.scrollTop = wasNearBottom ? transcript.scrollHeight : previousScrollTop;
+  updateJump();
+
+  titleElement.textContent = detail.title || `Conversation ${shortId(detail.session_id)}`;
+  metaElement.replaceChildren(document.createTextNode(
+    `Started ${fullTime(detail.created_at)} · ${detail.message_count} messages`));
+  if (detail.client?.server_ip) {
+    const link = element("button", "server-link", `Server ${detail.client.server_ip}`);
+    link.type = "button";
+    link.addEventListener("click", () => showServers(detail.client.server_ip));
+    metaElement.append(document.createTextNode(" · "), link);
+  }
+  statusBadge.classList.remove("hidden", "live");
+  statusBadge.classList.toggle("live", detail.active);
+  const remoteCalls = detail.pending_tool_calls?.filter(call => call.ui?.remote) || [];
+  const remote = remoteCalls[0];
+  const remoteCount = remoteCalls.length;
+  statusBadge.textContent = detail.archived ? "Archived" : detail.active ? "Generating"
+    : remote ? (remoteCount > 1 ? `${remoteCount} commands pending`
+      : remote.ui.state === "failed" ? "Runner unavailable" : "Approval needed")
+      : statusText(detail.status);
+  approvalBanner.classList.toggle("hidden", !remote || currentView !== "conversations");
+  approvalBanner.textContent = remoteCount > 1
+    ? `${remoteCount} commands need review · Open next`
+    : remote?.ui.state === "failed" ? "Runner unavailable · View command"
+      : "Command needs approval · Review command";
+  actionsElement.classList.remove("hidden");
+  archiveButton.textContent = detail.archived ? "Unarchive" : "Archive";
+  archiveButton.disabled = state.actionBusy || detail.active;
+  deleteButton.disabled = state.actionBusy || detail.active;
+  document.querySelector("#pin-button").textContent = detail.pinned ? "Unpin conversation" : "Pin conversation";
+  document.querySelector("#pin-button").disabled = state.actionBusy;
+  document.querySelector("#rename-button").disabled = state.actionBusy;
+  showFeedback(state.feedback);
+  renderConversationRunnerPicker(detail, state);
+  renderComposer(detail);
+  state.nextCommandId = "";
+  // Header/composer height may change after rendering a snapshot.
+  if (wasNearBottom) transcript.scrollTop = transcript.scrollHeight;
+  updateJump();
+}
+
+function renderComposer(detail) {
+  const state = sessionState(detail.session_id);
+  loadDraft(detail.session_id);
+  const unavailable = detail.archived || detail.active || state.messageBusy
+    || state.branchBusy || state.commandBusy || !connected;
+  messageForm.classList.toggle("hidden", currentView !== "conversations");
+  messageInput.disabled = detail.archived;
+  messageSend.disabled = unavailable || !messageInput.value.trim();
+  messageSend.textContent = state.messageBusy ? "Sending…"
+    : state.branchBusy ? "Switching…" : state.commandBusy ? "Working…" : "Send";
+  messageHint.classList.toggle("error", Boolean(state.failure));
+  if (state.failure) messageHint.textContent = state.failure;
+  else if (detail.archived) messageHint.textContent = "Restore conversation before replying.";
+  else if (!connected) messageHint.textContent = "Reconnecting. Your draft is kept here.";
+  else if (detail.active) messageHint.textContent = "Brain is replying. You can draft your next message.";
+  else if (detail.status === "awaiting_tool_results") messageHint.textContent = detail.pending_tool_calls?.some(call => call.ui?.remote)
+    ? "Review command above, or send a new instruction to cancel it." : "Sending cancels pending terminal commands.";
+  else if (detail.status === "continuation_pending") messageHint.textContent = "Send an instruction to resume this interrupted conversation.";
+  else messageHint.textContent = detail.runner
+    ? `Commands run on ${detail.runner.client_name} after approval or a trusted-prefix match.`
+    : "Chat only · Select a target to enable commands.";
+}
+
+async function changeConversationRunner(value) {
+  if (!currentDetail) return;
+  const id = currentDetail.session_id;
+  const state = sessionState(id);
+  if (state.actionBusy) return;
+  const oldValue = (currentDetail.runner_change_pending ? currentDetail.pending_runner_id : currentDetail.runner_id) || "";
+  if (value === oldValue) { runnerPicker.open = false; runnerPickerSummary.focus(); return; }
+  const runnerId = value || null;
+  state.actionBusy = true;
+  try {
+    const response = await fetch(`/v1/conversations/${encodeURIComponent(id)}/runner`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify({ runner_id: runnerId }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    if (currentDetail?.session_id === id) {
+      currentDetail = result;
+      runnerPicker.open = false;
+      renderDetail(result);
+      runnerPickerSummary.focus();
+    }
+  } catch (error) {
+    showSessionError(id, error.message || "Could not change target. Select a target to retry.");
+  } finally {
+    state.actionBusy = false;
+    if (currentDetail?.session_id === id) renderDetail(currentDetail);
+  }
+}
+
+async function openNewConversation() {
+  if (newRunnerLoading || newConversationBusy) return;
+  setSidebar(false, false);
+  if (!newConversationDialog.open) newConversationDialog.showModal();
+  const feedback = document.querySelector("#new-conversation-feedback");
+  newRunnerLoading = true;
+  createConversationButton.disabled = true;
+  newRunnerOptions.replaceChildren();
+  showFeedback("Loading execution targets…", null, feedback);
+  try {
+    const result = await getJson("/v1/runners");
+    runners = Array.isArray(result.runners) ? result.runners : [];
+    showFeedback(activeRunners().length ? "" : "No available runners. Continue with chat only, or open Manage runners to set one up.", null, feedback);
+  } catch (_) {
+    runners = [];
+    showFeedback("Could not load runners. Chat only is available.", () => void openNewConversation(), feedback);
+  } finally {
+    renderNewRunnerOptions();
+    createConversationButton.disabled = false;
+    newRunnerLoading = false;
+  }
+}
+
+async function createConversation() {
+  if (newConversationBusy || newRunnerLoading) return;
+  newConversationBusy = true;
+  const runnerId = newRunnerSelect.value || null;
+  createConversationButton.disabled = true;
+  createConversationButton.textContent = "Starting…";
+  try {
+    const response = await fetch("/v1/conversations", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify({ runner_id: runnerId }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    newConversationDialog.close();
+    selectConversation(result.session_id);
+    await refreshList();
+    messageInput.focus({ preventScroll: true });
+  } catch (error) {
+    showFeedback(error.message || "Could not create conversation. Try again.", null, document.querySelector("#new-conversation-feedback"));
+  } finally {
+    newConversationBusy = false;
+    createConversationButton.disabled = false;
+    createConversationButton.textContent = "Start conversation";
+  }
+}
+
+function turnError(body) {
+  try { const parsed = JSON.parse(body); if (parsed.error) return parsed.error; } catch (_) {}
+  for (const block of body.split(/\r?\n\r?\n/)) {
+    const lines = block.split(/\r?\n/);
+    if (!lines.includes("event: error")) continue;
+    const data = lines.find((line) => line.startsWith("data: "))?.slice(6);
+    try {
+      const parsed = JSON.parse(data || "{}");
+      if (typeof parsed.message === "string") return parsed.message;
+    } catch (_error) {
+      return "Invalid Brain response.";
+    }
+  }
+  return "Brain turn ended without completion.";
+}
+
+async function sendWebMessage() {
+  if (!currentDetail || messageSend.disabled) return;
+  const sessionId = currentDetail.session_id;
+  const state = sessionState(sessionId);
+  if (state.messageBusy || state.branchBusy || state.commandBusy
+    || currentDetail.active || currentDetail.archived || !connected) return;
+  const content = messageInput.value;
+  if (!content.trim()) return;
+  let references = state.references || [];
+  if (!references.length) {
+    try { references = JSON.parse(storageRead("sessionStorage", `brain.refs.${sessionId}`, "[]")) || []; }
+    catch (_) { references = []; }
+  }
+  saveDraft();
+  state.failure = "";
+  state.messageBusy = true;
+  let accepted = false;
+  renderComposer(currentDetail);
+  try {
+    const response = await fetch(`/v1/conversations/${encodeURIComponent(sessionId)}/turns`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify({ content, references }),
+    });
+    if (!response.ok) {
+      const result = await response.json();
+      throw new Error(result.error || `HTTP ${response.status}`);
+    }
+    accepted = true;
+    // Clear only the submitted draft, never edits made while the request was starting.
+    if (state.draft === content) {
+      state.draft = "";
+      state.references = [];
+      storageWrite("sessionStorage", `brain.draft.${sessionId}`, "");
+      storageWrite("sessionStorage", `brain.refs.${sessionId}`, "");
+      if (draftSessionId === sessionId) { messageInput.value = ""; resizeComposer(); }
+    }
+    const body = await response.text();
+    if (!/(^|\r?\n)event: (done|tool_calls)\r?$/m.test(body)) throw new Error(turnError(body));
+  } catch (error) {
+    state.failure = accepted
+      ? `${error.message} Your message was accepted; check the transcript before continuing.`
+      : `${error.message || "Could not send message."} Draft kept. Check the transcript before retrying.`;
+  } finally {
+    state.messageBusy = false;
+    if (currentDetail?.session_id === sessionId) renderComposer(currentDetail);
+  }
+}
+
+async function refreshList() {
+  try {
+    const [result, runnerResult] = await Promise.all([
+      getJson("/v1/conversations"), getJson("/v1/runners"),
+    ]);
+    runners = Array.isArray(runnerResult.runners) ? runnerResult.runners : [];
+    conversations = Array.isArray(result.conversations) ? result.conversations : [];
+    if (currentView !== "conversations") return;
+    setConnection(!selectedId || conversationStream?.readyState === EventSource.OPEN);
+    const visible = visibleConversations();
+    if (selectedId && !conversations.some((item) => item.session_id === selectedId)) {
+      selectedId = null;
+      closeConversationStream();
+      history.replaceState(null, "", location.pathname);
+    }
+    if (!selectedId && visible.length && currentView === "conversations") {
+      selectedId = visible[0].session_id;
+      history.replaceState(null, "", `#${selectedId}`);
+    }
+    renderConversationList();
+    if (selectedId && currentView === "conversations") await refreshDetail();
+    if (!selectedId && currentView === "conversations") {
+      closeConversationStream();
+      titleElement.textContent = "Conversations";
+      metaElement.textContent = "Client sessions appear here automatically.";
+      statusBadge.classList.add("hidden");
+      actionsElement.classList.add("hidden");
+      messageForm.classList.add("hidden");
+      transcript.replaceChildren(emptyState("No conversations", "Client sessions appear here automatically."));
+    }
+    renderView();
+  } catch (_error) {
+    if (currentView === "conversations") setConnection(false);
+  }
+}
+
+function closeConversationStream() {
+  saveDraft();
+  if (currentDetail) {
+    rememberDisclosures(transcript);
+    const state = sessionState(currentDetail.session_id);
+    state.scrollTop = transcript.scrollTop;
+    state.follow = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 24;
+  }
+  if (conversationStream) conversationStream.close();
+  conversationStream = null;
+  streamedSessionId = null;
+  currentDetail = null;
+}
+
+function refreshDetail() {
+  if (currentView !== "conversations" || !selectedId || streamedSessionId === selectedId) return;
+  closeConversationStream();
+  sessionState().restoreScroll = true;
+  actionsElement.classList.add("hidden");
+  messageForm.classList.add("hidden");
+  approvalBanner.classList.add("hidden");
+  titleElement.textContent = `Conversation ${shortId(selectedId)}`;
+  metaElement.textContent = "Connecting to conversation…";
+  statusBadge.classList.add("hidden");
+  transcript.replaceChildren(emptyState("Loading conversation", "Connecting to live updates…"));
+  streamedSessionId = selectedId;
+  const stream = new EventSource(`/v1/conversations/${encodeURIComponent(selectedId)}/events`);
+  conversationStream = stream;
+  stream.addEventListener("snapshot", (event) => {
+    if (conversationStream !== stream) return;
+    currentDetail = JSON.parse(event.data);
+    renderDetail(currentDetail);
+  });
+  for (const kind of ["reasoning", "content"]) {
+    stream.addEventListener(kind, (event) => {
+      if (conversationStream !== stream || !currentDetail?.live) return;
+      const delta = JSON.parse(event.data).delta;
+      currentDetail.live[kind] += delta;
+      const follow = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 24;
+      const row = transcript.querySelector('[data-live="true"]');
+      const target = row?.querySelector(kind === "reasoning" ? ".reasoning pre" : ".message-content");
+      if (target) {
+        target.append(document.createTextNode(delta));
+      } else if (row) {
+        rememberDisclosures(row);
+        row.replaceWith(renderLive(currentDetail.live,
+          currentDetail.messages.length + currentDetail.live.transient_messages.length));
+      }
+      if (follow) transcript.scrollTop = transcript.scrollHeight;
+      updateJump();
+    });
+  }
+  stream.addEventListener("deleted", () => {
+    if (conversationStream !== stream) return;
+    closeConversationStream();
+    selectedId = null;
+    history.replaceState(null, "", location.pathname);
+    void refreshList();
+  });
+  stream.onopen = () => {
+    if (conversationStream === stream) setConnection(true);
+  };
+  stream.onerror = () => {
+    if (conversationStream !== stream) return;
+    setConnection(false);
+    metaElement.textContent = "Reconnecting to conversation…";
+  };
+}
+
+async function changeConversationArchive() {
+  if (!currentDetail || currentDetail.active) return;
+  const id = currentDetail.session_id;
+  const state = sessionState(id);
+  if (state.actionBusy) return;
+  const archived = !currentDetail.archived;
+  state.actionBusy = true;
+  conversationMenu.open = false;
+  renderDetail(currentDetail);
+  try {
+    const response = await fetch(`/v1/conversations/${encodeURIComponent(id)}/archive`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: JSON.stringify({ archived }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    if (currentDetail?.session_id === id) { currentDetail = result; renderDetail(result); }
+    await refreshList();
+  } catch (error) { showSessionError(id, error.message || "Could not change archive state. Try again from conversation actions."); }
+  finally {
+    state.actionBusy = false;
+    if (currentDetail?.session_id === id) renderDetail(currentDetail);
+  }
+}
+
+async function deleteConversation(id) {
+  const state = sessionState(id);
+  if (state.actionBusy) return false;
+  state.actionBusy = true;
+  try {
+    const response = await fetch(`/v1/conversations/${encodeURIComponent(id)}`, {
+      method: "DELETE", headers: { "X-Brain-UI": "1" },
+    });
+    if (!response.ok) { const result = await response.json(); throw new Error(result.error || `HTTP ${response.status}`); }
+    if (selectedId === id) {
+      closeConversationStream(); selectedId = null;
+      history.replaceState(null, "", location.pathname);
+    }
+    storageWrite("sessionStorage", `brain.draft.${id}`, "");
+    sessionStates.delete(id);
+    if (draftSessionId === id) { draftSessionId = null; messageInput.value = ""; }
+    await refreshList();
+    return true;
+  } catch (error) {
+    document.querySelector("#edit-feedback").textContent = error.message || "Could not delete conversation. Try again.";
+    return false;
+  } finally { state.actionBusy = false; }
+}
+
+menuButton.addEventListener("click", () => setSidebar(true));
+sidebarShade.addEventListener("click", () => setSidebar(false));
+document.querySelector("#sidebar-close").addEventListener("click", () => setSidebar(false));
+window.addEventListener("hashchange", () => {
+  saveDraft();
+  const value = location.hash.slice(1);
+  if (value === "servers" || value.startsWith("servers/")) {
+    currentView = "servers";
+    selectedServerIp = serverIpFromHash();
+    closeConversationStream();
+    renderView();
+    void refreshServers();
+  } else if (value === "memories" || value.startsWith("memories/")) {
+    currentView = "memories";
+    selectedMemoryRunnerId = memoryRunnerIdFromHash();
+    closeConversationStream();
+    renderView();
+    void refreshMemories();
+  } else {
+    currentView = "conversations";
+    selectedId = validSessionId(value) ? value : null;
+    closeConversationStream();
+    renderView();
+    renderConversationList();
+    refreshDetail();
+    void refreshList();
+  }
+  setSidebar(false, false);
+});
+
+async function refreshServers() {
+  try {
+    const [serverResult, runnerResult] = await Promise.all([
+      getJson("/v1/servers"), getJson("/v1/runners"),
+    ]);
+    servers = Array.isArray(serverResult.servers) ? serverResult.servers : [];
+    runners = Array.isArray(runnerResult.runners) ? runnerResult.runners : [];
+    if (currentView !== "servers") return;
+    if (!servers.some((server) => server.server_ip === selectedServerIp)) {
+      selectedServerIp = servers[0]?.server_ip || null;
+      history.replaceState(null, "", selectedServerIp ? `#servers/${encodeURIComponent(selectedServerIp)}` : "#servers");
+    }
+    if (currentView === "servers") setConnection(true);
+    renderServerList();
+    renderServers();
+  } catch (_error) {
+    if (currentView === "servers") setConnection(false);
+  }
+}
+
+async function refreshMemories() {
+  try {
+    const result = await getJson("/v1/memories");
+    memories = Array.isArray(result.memories) ? result.memories : [];
+    runners = Array.isArray(result.runners) ? result.runners : [];
+    if (currentView !== "memories") return;
+    if (selectedMemoryRunnerId !== "global" && !runners.some((runner) => runner.runner_id === selectedMemoryRunnerId)) {
+      selectedMemoryRunnerId = runners.find((runner) => memoryCountForRunner(runner.runner_id))?.runner_id
+        || runners[0]?.runner_id || (memories.some((memory) => memory.runner_id == null) ? "global" : null);
+      history.replaceState(null, "", selectedMemoryRunnerId
+        ? `#memories/${encodeURIComponent(selectedMemoryRunnerId)}` : "#memories");
+    }
+    setConnection(true);
+    renderMemoryRunnerList();
+    renderMemories();
+  } catch (_error) {
+    if (currentView === "memories") setConnection(false);
+  }
+}
+
+async function refreshDashboard() {
+  if (currentView === "servers") await refreshServers();
+  else if (currentView === "memories") await refreshMemories();
+  else await refreshList();
+  window.setTimeout(refreshDashboard, 3000);
+}
+
+conversationsViewButton.addEventListener("click", () => {
+  currentView = "conversations";
+  if (selectedId) location.hash = selectedId;
+  else history.replaceState(null, "", location.pathname);
+  renderView();
+  if (selectedId) void refreshDetail();
+  void refreshList();
+});
+serversViewButton.addEventListener("click", () => showServers());
+memoriesViewButton.addEventListener("click", () => showMemories());
+filterElement.addEventListener("change", () => {
+  conversationFilter = filterElement.value;
+  const visible = visibleConversations();
+  if (selectedId && !visible.some((item) => item.session_id === selectedId)) {
+    selectedId = null;
+    closeConversationStream();
+    history.replaceState(null, "", location.pathname);
+  }
+  renderConversationList();
+  void refreshList();
+});
+archiveButton.addEventListener("click", () => void changeConversationArchive());
+deleteButton.addEventListener("click", () => openEdit("delete"));
+newConversationButton.addEventListener("click", () => void openNewConversation());
+addServerButton.addEventListener("click", () => void openAddServer());
+newMemoryButton.addEventListener("click", () => openMemoryDialog());
+addServerClose.addEventListener("click", () => addServerDialog.close());
+addServerDone.addEventListener("click", () => addServerDialog.close());
+addServerCopy.addEventListener("click", () => void copyText(addServerCommand.textContent, addServerCopy));
+newConversationCancel.addEventListener("click", () => newConversationDialog.close());
+newConversationBack.addEventListener("click", () => newConversationDialog.close());
+manageRunnersButton.addEventListener("click", () => {
+  newConversationDialog.close();
+  showServers();
+});
+newRunnerOptions.addEventListener("keydown", (event) => {
+  if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) {
+    return;
+  }
+  const options = [...newRunnerOptions.querySelectorAll(".target-option:not(:disabled)")];
+  const current = event.target.closest(".target-option");
+  const currentIndex = options.indexOf(current);
+  if (currentIndex < 0) return;
+  event.preventDefault();
+  let nextIndex = event.key === "Home" ? 0 : options.length - 1;
+  if (event.key.startsWith("Arrow")) {
+    const direction = ["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1;
+    nextIndex = (currentIndex + direction + options.length) % options.length;
+  }
+  const next = options[nextIndex];
+  selectNewRunner(next.dataset.runnerId);
+  next.focus();
+});
+newConversationForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void createConversation();
+});
+messageForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void sendWebMessage();
+});
+memoryForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void saveMemoryFromDialog();
+});
+document.querySelector("#memory-cancel").addEventListener("click", () => memoryDialog.close());
+memoryDialog.addEventListener("close", () => {
+  editingMemoryId = null;
+  memoryFeedback.textContent = "";
+});
+messageInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && !matchMedia("(pointer: coarse)").matches) {
+    event.preventDefault();
+    messageForm.requestSubmit();
+  }
+});
+
+const themeChoices = {
+  system: { label: "System", icon: "◐", description: "Follow device setting" },
+  light: { label: "Light", icon: "☀", description: "Always use light theme" },
+  dark: { label: "Dark", icon: "☾", description: "Always use dark theme" },
+};
+let selectedTheme = storageRead("localStorage", "brain.theme", "system");
+if (!themeChoices[selectedTheme]) selectedTheme = "system";
+
+function renderThemePicker() {
+  const selected = themeChoices[selectedTheme];
+  document.querySelector("#theme-picker-icon").textContent = selected.icon;
+  document.querySelector("#theme-picker-value").textContent = selected.label;
+  themePickerSummary.setAttribute("aria-label", `Change appearance. Current: ${selected.label}`);
+  const fragment = document.createDocumentFragment();
+  const heading = element("div", "theme-menu-heading");
+  heading.append(element("strong", "", "Appearance"), element("span", "", "Choose interface theme"));
+  fragment.append(heading);
+  for (const [value, choice] of Object.entries(themeChoices)) {
+    const button = element("button", `theme-menu-option${value === selectedTheme ? " selected" : ""}`);
+    button.type = "button";
+    button.dataset.theme = value;
+    button.setAttribute("aria-pressed", String(value === selectedTheme));
+    const icon = element("span", "theme-menu-icon", choice.icon);
+    icon.setAttribute("aria-hidden", "true");
+    const copy = element("span", "theme-menu-copy");
+    copy.append(element("strong", "", choice.label), element("span", "", choice.description));
+    button.append(icon, copy);
+    button.addEventListener("click", () => setTheme(value));
+    fragment.append(button);
+  }
+  themeMenu.replaceChildren(fragment);
+}
+
+function setTheme(value) {
+  selectedTheme = themeChoices[value] ? value : "system";
+  document.documentElement.dataset.theme = selectedTheme;
+  storageWrite("localStorage", "brain.theme", selectedTheme);
+  themePicker.open = false;
+  renderThemePicker();
+  themePickerSummary.focus();
+}
+
+document.documentElement.dataset.theme = selectedTheme;
+renderThemePicker();
+searchInput.addEventListener("input", () => {
+  queries[currentView] = searchInput.value;
+  if (currentView === "servers") renderServerList();
+  else if (currentView === "memories") { renderMemoryRunnerList(); renderMemories(); }
+  else renderConversationList();
+});
+messageInput.addEventListener("input", () => {
+  saveDraft(); resizeComposer();
+  if (currentDetail) renderComposer(currentDetail);
+});
+function addContextReference(ref) {
+  if (!currentDetail) return;
+  const sessionId = currentDetail.session_id;
+  const state = sessionState(sessionId);
+  state.references = [...(state.references || []), ref];
+  const label = `[${ref.label}]`;
+  const start = messageInput.selectionStart ?? messageInput.value.length;
+  messageInput.value = `${messageInput.value.slice(0, start)}${label}${messageInput.value.slice(messageInput.selectionEnd ?? start)}`;
+  messageInput.focus(); messageInput.selectionStart = messageInput.selectionEnd = start + label.length;
+  state.draft = messageInput.value;
+  draftSessionId = sessionId;
+  storageWrite("sessionStorage", `brain.draft.${sessionId}`, messageInput.value);
+  storageWrite("sessionStorage", `brain.refs.${sessionId}`, JSON.stringify(state.references));
+  resizeComposer(); renderComposer(currentDetail); contextDialog.close();
+}
+contextAdd.addEventListener("click", () => {
+  if (!currentDetail) return;
+  contextFeedback.textContent = ""; contextFile.value = "";
+  contextMemory.replaceChildren();
+  for (const memory of memories) {
+    const button = element("button", "context-memory-item", `${memory.key} · ${memory.runner_id ? (memory.server_name || memory.server_ip || "runner") : "Global"}`);
+    button.type = "button"; button.addEventListener("click", () => addContextReference({type:"memory", id:memory.memory_id, label:memory.key, snapshot: memory.value})); contextMemory.append(button);
+  }
+  contextDialog.showModal();
+});
+contextClose.addEventListener("click", () => contextDialog.close());
+document.querySelectorAll("[data-context-tab]").forEach(button => button.addEventListener("click", () => {
+  document.querySelectorAll(".context-panel").forEach(panel => panel.classList.toggle("hidden", panel.id !== `context-${button.dataset.contextTab}`));
+}));
+contextServerAdd.addEventListener("click", () => {
+  const path = contextServerPath.value.trim(); if (!path) return;
+  addContextReference({type:"server_file", label:path, path, runner_id:currentDetail?.runner?.runner_id || null});
+});
+contextUploadButton.addEventListener("click", async () => {
+  const file = contextFile.files?.[0]; if (!file || !currentDetail) return;
+  contextUploadButton.disabled = true; contextFeedback.textContent = "Uploading…";
+  try {
+    const data = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(",")[1]); reader.onerror = reject; reader.readAsDataURL(file); });
+    const response = await fetch(`/v1/conversations/${encodeURIComponent(currentDetail.session_id)}/attachments`, {method:"POST", headers:{"Content-Type":"application/json", "X-Brain-UI":"1"}, body:JSON.stringify({filename:file.name,mime_type:file.type,data})});
+    const result = await response.json(); if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    const a = result.attachment; addContextReference({type:"attachment", id:a.id, label:a.filename});
+  } catch (error) { contextFeedback.textContent = error.message || "Upload failed."; }
+  finally { contextUploadButton.disabled = false; }
+});
+transcript.addEventListener("scroll", updateJump, { passive: true });
+jumpLatest.addEventListener("click", () => { transcript.scrollTop = transcript.scrollHeight; updateJump(); });
+approvalBanner.addEventListener("click", () => {
+  const pending = currentDetail?.pending_tool_calls?.find(call => call.ui?.remote);
+  const card = [...transcript.querySelectorAll("[data-call-id]")].find(node => node.dataset.callId === pending?.id);
+  if (card) { card.open = true; card.scrollIntoView({ block: "center" }); card.querySelector("summary").focus({ preventScroll: true }); }
+});
+document.querySelector("#connection-retry").addEventListener("click", () => {
+  if (currentView === "servers") void refreshServers();
+  else if (currentView === "memories") void refreshMemories();
+  else { closeConversationStream(); refreshDetail(); void refreshList(); }
+});
+document.querySelector("#rename-button").addEventListener("click", () => openEdit("rename"));
+document.querySelector("#pin-button").addEventListener("click", () => {
+  conversationMenu.open = false;
+  if (currentDetail) void updateMetadata(currentDetail.session_id, { pinned: !currentDetail.pinned });
+});
+document.querySelector("#edit-cancel").addEventListener("click", () => editDialog.close());
+document.querySelector("#edit-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!editAction) return;
+  const action = editAction;
+  const button = document.querySelector("#edit-submit");
+  if (button.disabled) return;
+  button.disabled = true;
+  const ok = action.action === "delete" ? await deleteConversation(action.id)
+    : await updateMetadata(action.id, { title: document.querySelector("#edit-input").value });
+  button.disabled = false;
+  if (ok) editDialog.close();
+});
+editDialog.addEventListener("close", () => { editAction = null; conversationMenu.querySelector("summary").focus(); });
+newConversationDialog.addEventListener("close", () => {
+  if (!newConversationBusy) {
+    if (matchMedia("(max-width: 899px)").matches) menuButton.focus(); else newConversationButton.focus();
+  }
+});
+addServerDialog.addEventListener("close", () => {
+  if (currentView === "servers") {
+    addServerButton.focus();
+  }
+});
+document.addEventListener("click", event => {
+  if (!conversationMenu.contains(event.target)) conversationMenu.open = false;
+  if (!runnerPicker.contains(event.target)) runnerPicker.open = false;
+  if (!themePicker.contains(event.target)) themePicker.open = false;
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    const popupOpen = conversationMenu.open || runnerPicker.open || themePicker.open;
+    conversationMenu.open = false;
+    runnerPicker.open = false;
+    themePicker.open = false;
+    if (document.body.classList.contains("sidebar-open") && !popupOpen) setSidebar(false);
+  }
+  if (event.key === "Tab" && document.body.classList.contains("sidebar-open")) {
+    const nodes = [...document.querySelector("#sidebar").querySelectorAll("button, input, select, summary")]
+      .filter(node => !node.disabled && node.getClientRects().length
+        && (node.tagName === "SUMMARY" || !node.closest("details:not([open])")));
+    const first = nodes[0], last = nodes.at(-1);
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  }
+});
+matchMedia("(max-width: 899px)").addEventListener("change", () => setSidebar(false, false));
+setSidebar(false, false);
+renderView();
+void refreshDashboard();
+window.addEventListener("pagehide", closeConversationStream);
+window.addEventListener("pageshow", refreshDetail);

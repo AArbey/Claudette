@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Brain workspace</title>
+  <script>
+    try { document.documentElement.dataset.theme = localStorage.getItem("brain.theme") || "system"; } catch (_) {}
+  </script>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside id="sidebar" class="sidebar" aria-label="Dashboard navigation" tabindex="-1">
+      <header class="brand">
+        <div class="brain-mark" aria-hidden="true">B</div>
+        <div>
+          <h1>Brain</h1>
+          <p>Your server workspace</p>
+        </div>
+      </header>
+
+      <div class="view-nav" aria-label="Views">
+        <button id="conversations-view" class="view-button selected" type="button">Conversations</button>
+        <button id="servers-view" class="view-button" type="button">Servers</button>
+        <button id="memories-view" class="view-button" type="button">Memories</button>
+      </div>
+
+      <button id="sidebar-close" class="sidebar-close" type="button" aria-label="Close navigation">×</button>
+      <button id="new-conversation" class="new-conversation" type="button">+ New conversation</button>
+      <button id="add-server" class="new-conversation hidden" type="button">+ Add new server</button>
+      <button id="new-memory" class="new-conversation hidden" type="button">+ New memory</button>
+      <label class="search-label" for="sidebar-search"><span class="sr-only">Search conversations, servers, or memories</span>
+        <input id="sidebar-search" type="search" placeholder="Search conversations…" autocomplete="off">
+      </label>
+      <div class="sidebar-meta" role="status">
+        <span id="connection-dot" class="connection-dot"></span>
+        <span id="connection-text">Connecting</span>
+        <span id="conversation-count" class="count">0</span>
+      </div>
+
+      <label class="conversation-filter-label" for="conversation-filter">
+        Show
+        <select id="conversation-filter" class="conversation-filter">
+          <option value="current">Current</option>
+          <option value="resume">Needs resume</option>
+          <option value="archived">Archived</option>
+          <option value="all">All</option>
+        </select>
+      </label>
+      <nav id="conversation-list" class="conversation-list" aria-label="Conversations"></nav>
+      <nav id="server-list" class="conversation-list hidden" aria-label="Servers"></nav>
+      <nav id="memory-runner-list" class="conversation-list hidden" aria-label="Memory runners"></nav>
+      <footer class="sidebar-footer">
+        <details id="theme-picker" class="theme-picker">
+          <summary id="theme-picker-summary" aria-label="Change appearance. Current: System">
+            <span id="theme-picker-icon" class="theme-picker-icon" aria-hidden="true">◐</span>
+            <span class="theme-picker-copy">
+              <span>Appearance</span>
+              <strong id="theme-picker-value">System</strong>
+            </span>
+            <span class="theme-picker-chevron" aria-hidden="true">⌃</span>
+          </summary>
+          <div id="theme-menu" class="theme-menu" aria-label="Appearance options"></div>
+        </details>
+      </footer>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button id="menu-button" class="menu-button" type="button" aria-label="Show navigation" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <div class="conversation-heading">
+          <div class="heading-line">
+            <h2 id="conversation-title">Conversations</h2>
+            <span id="status-badge" class="status-badge hidden"></span>
+          </div>
+          <p id="conversation-meta">Select conversation to inspect it.</p>
+        </div>
+        <div id="conversation-actions" class="conversation-actions hidden">
+          <details id="runner-picker" class="runner-picker">
+            <summary id="runner-picker-summary" aria-label="Change execution target">
+              <span id="runner-picker-icon" class="runner-picker-icon" aria-hidden="true">◇</span>
+              <span class="runner-picker-copy">
+                <span id="runner-picker-label">Target</span>
+                <strong id="runner-picker-value">Chat only</strong>
+              </span>
+              <span class="runner-picker-chevron" aria-hidden="true">⌄</span>
+            </summary>
+            <div id="runner-menu" class="runner-menu" aria-label="Execution target"></div>
+          </details>
+          <details id="conversation-menu" class="action-menu"><summary aria-label="Conversation actions">•••</summary>
+            <div class="action-menu-items">
+              <button id="rename-button" type="button">Rename</button>
+              <button id="pin-button" type="button">Pin conversation</button>
+              <button id="archive-button" type="button">Archive</button>
+              <button id="delete-button" class="danger" type="button">Delete</button>
+            </div>
+          </details>
+        </div>
+      </header>
+      <div id="page-feedback" class="feedback hidden" role="alert"></div>
+      <button id="connection-retry" class="connection-retry hidden" type="button">Connection lost · Retry</button>
+      <button id="approval-banner" class="approval-banner hidden" type="button"></button>
+
+      <section id="servers" class="servers hidden" aria-label="Server command policies"></section>
+      <section id="memories" class="memories hidden" aria-label="Runner memories"></section>
+
+      <section id="transcript" class="transcript" aria-label="Conversation transcript">
+        <div class="empty-state">
+          <div class="empty-icon">⌁</div>
+          <h3>No conversation selected</h3>
+          <p>Start a conversation or connect a client.</p>
+        </div>
+      </section>
+
+      <button id="jump-latest" class="jump-latest hidden" type="button">↓ Jump to latest</button>
+      <form id="message-form" class="composer hidden">
+        <label class="sr-only" for="message-input">Continue conversation</label>
+        <button id="context-add" class="context-add" type="button" aria-label="Add context">+</button>
+        <textarea id="message-input" rows="1" maxlength="100000"
+          placeholder="Continue conversation…"></textarea>
+        <button id="message-send" type="submit">Send</button>
+        <p id="message-hint" class="composer-hint" role="status"></p>
+      </form>
+    </main>
+  </div>
+  <div id="sidebar-shade" class="sidebar-shade"></div>
+  <dialog id="new-conversation-dialog" class="dialog new-conversation-dialog" aria-labelledby="new-conversation-title">
+    <form id="new-conversation-form" method="dialog">
+      <header class="new-conversation-header">
+        <div class="new-conversation-mark" aria-hidden="true">+</div>
+        <div>
+          <h2 id="new-conversation-title">Start new conversation</h2>
+          <p>Choose where approved commands can run.</p>
+        </div>
+        <button id="new-conversation-cancel" class="dialog-close" type="button"
+          aria-label="Close">&times;</button>
+      </header>
+
+      <section class="target-section" aria-labelledby="target-heading">
+        <div class="target-heading-row">
+          <div>
+            <h3 id="target-heading">Execution target</h3>
+            <p>Switch target later from conversation header.</p>
+          </div>
+          <button id="manage-runners" class="manage-runners" type="button">Manage runners</button>
+        </div>
+        <input id="new-runner-select" type="hidden" value="">
+        <div id="new-runner-options" class="target-options" role="radiogroup"
+          aria-labelledby="target-heading"></div>
+        <div id="new-conversation-feedback" class="dialog-feedback" role="status"></div>
+      </section>
+
+      <div class="dialog-actions">
+        <span id="new-conversation-selection" class="target-selection">Chat only selected</span>
+        <button value="cancel" type="button" id="new-conversation-back">Cancel</button>
+        <button value="default" type="submit" id="create-conversation">Start conversation</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="context-dialog" class="dialog context-dialog" aria-labelledby="context-dialog-title">
+    <form method="dialog">
+      <header class="new-conversation-header"><div><h2 id="context-dialog-title">Add context</h2><p>Attach file, server path, or memory.</p></div><button id="context-close" class="dialog-close" type="button" aria-label="Close">&times;</button></header>
+      <div class="context-tabs"><button type="button" data-context-tab="upload">Upload</button><button type="button" data-context-tab="server">Server files</button><button type="button" data-context-tab="memory">Memories</button></div>
+      <section id="context-upload" class="context-panel"><input id="context-file" type="file" accept=".txt,.md,.csv,.json,.py,.js,.ts,.sh,.log,.yaml,.yml,.xml,.html,.css,.pdf,.docx"><button id="context-upload-button" type="button">Add file</button></section>
+      <section id="context-server" class="context-panel hidden"><input id="context-server-path" placeholder="/path/to/file"><button id="context-server-add" type="button">Reference path</button></section>
+      <section id="context-memory" class="context-panel hidden"></section>
+      <p id="context-feedback" class="dialog-feedback" role="status"></p>
+    </form>
+  </dialog>
+  <dialog id="add-server-dialog" class="dialog new-conversation-dialog" aria-labelledby="add-server-title">
+    <div class="add-server-dialog-body">
+      <header class="new-conversation-header">
+        <div class="new-conversation-mark" aria-hidden="true">+</div>
+        <div>
+          <h2 id="add-server-title">Add new server</h2>
+          <p>Run this command in Bash on the server you want to connect.</p>
+        </div>
+        <button id="add-server-close" class="dialog-close" type="button" aria-label="Close">&times;</button>
+      </header>
+      <section class="add-server-section">
+        <p class="command-note">The command installs the <code>ai-helper</code> launcher in <code>~/.bashrc</code> and starts it. The server will appear here after the client connects.</p>
+        <div class="add-server-command-wrap">
+          <pre><code id="add-server-command">Preparing command…</code></pre>
+          <button id="add-server-copy" class="trust-add" type="button" disabled>Copy</button>
+        </div>
+        <p id="add-server-feedback" class="dialog-feedback" role="status"></p>
+      </section>
+      <div class="dialog-actions">
+        <button id="add-server-done" type="button">Done</button>
+      </div>
+    </div>
+  </dialog>
+  <dialog id="edit-dialog" class="dialog edit-dialog" aria-labelledby="edit-title">
+    <form id="edit-form">
+      <h2 id="edit-title">Rename conversation</h2>
+      <p id="edit-description"></p>
+      <label id="edit-label" for="edit-input">Conversation title</label>
+      <input id="edit-input" maxlength="120" required autocomplete="off">
+      <p id="edit-feedback" class="error" role="alert"></p>
+      <div class="dialog-actions"><button id="edit-cancel" type="button">Cancel</button><button id="edit-submit" type="submit">Save</button></div>
+    </form>
+  </dialog>
+  <dialog id="memory-dialog" class="dialog edit-dialog" aria-labelledby="memory-dialog-title">
+    <form id="memory-form">
+      <h2 id="memory-dialog-title">New memory</h2>
+      <p id="memory-dialog-description">Store a durable fact for this runner.</p>
+      <label for="memory-scope">Scope</label>
+      <select id="memory-scope"><option value="runner">Runner</option><option value="global">Global</option></select>
+      <label for="memory-key">Key</label>
+      <input id="memory-key" maxlength="120" required autocomplete="off" placeholder="project.root">
+      <label for="memory-value">Value</label>
+      <textarea id="memory-value" maxlength="4000" required placeholder="A concise fact the LLM should remember on this runner."></textarea>
+      <p id="memory-feedback" class="error" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="memory-cancel" type="button">Cancel</button>
+        <button id="memory-save" type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+  <div id="copy-status" class="sr-only" role="status"></div>
+  <script src="/vendor/marked.js" defer></script>
+  <script src="/vendor/purify.js" defer></script>
+  <script src="/app.js" defer></script>
+</body>
+</html>

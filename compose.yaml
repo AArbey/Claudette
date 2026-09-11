@@ -1,0 +1,30 @@
+services:
+  brain:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - brain-data:/data
+      - ./server/config:/config:ro
+      - ./server/knowledge:/knowledge:ro
+      - ./client:/client:ro
+      - ./server/web:/web:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  brain-data:
