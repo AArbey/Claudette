@@ -23,7 +23,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -202,8 +202,12 @@ RUNNER_ENROLL_RE = re.compile(
     r"^/v1/runner-enrollments/([A-Za-z0-9_-]{32,128})$"
 )
 MEMORY_PATH_RE = re.compile(r"^/v1/memories/([A-Za-z0-9_-]{32})$")
+AI_SERVER_PATH_RE = re.compile(r"^/v1/ai/servers/([A-Za-z0-9_-]{32})$")
+AI_SERVER_MODELS_RE = re.compile(
+    r"^/v1/ai/servers/([A-Za-z0-9_-]{32})/models$"
+)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 RUNNER_VERSION = 2
 
 WEB_ASSETS = {
@@ -268,12 +272,13 @@ class Config:
             return value
 
         config = cls(
-            llm_endpoint_url=required("LLM_ENDPOINT_URL"),
-            llm_api_key=os.environ.get("LLM_API_KEY", ""),
-            model_name=required("MODEL_NAME"),
+            # Model providers live in SQLite and are managed from Web UI.
+            llm_endpoint_url="",
+            llm_api_key="",
+            model_name="",
             brain_url=required("BRAIN_URL"),
-            support_model_name=os.environ.get("SUPPORT_MODEL_NAME", "").strip(),
-            model_context_tokens=int(os.environ.get("MODEL_CONTEXT_TOKENS", "32768")),
+            support_model_name="",
+            model_context_tokens=32768,
             bind_host=os.environ.get("BRAIN_BIND_HOST", "0.0.0.0"),
             port=int(os.environ.get("BRAIN_PORT", "8080")),
             web_port=int(os.environ.get("WEB_PORT", "8081")),
@@ -315,7 +320,7 @@ class Config:
         if config.runner_port_start > config.runner_port_end:
             raise BrainError("RUNNER_PORT_START must not exceed RUNNER_PORT_END")
         if config.model_context_tokens < 1024:
-            raise BrainError("MODEL_CONTEXT_TOKENS must be at least 1024")
+            raise BrainError("model context fallback must be at least 1024 tokens")
         return config
 
 
@@ -777,6 +782,73 @@ def llm_metadata_urls(endpoint_url: str, model_name: str) -> tuple[str, str, str
     return running, props, models
 
 
+def normalize_llm_endpoint(endpoint_url: Any) -> str:
+    if not isinstance(endpoint_url, str):
+        raise BrainError("AI endpoint URL required")
+    value = endpoint_url.strip()
+    if len(value) > 2048:
+        raise BrainError("AI endpoint URL is too long")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise BrainError("AI endpoint must be an HTTP(S) URL without credentials, query, or fragment")
+    path = parsed.path.rstrip("/")
+    if path.endswith("/chat/completions"):
+        completion_path = path
+    elif path.endswith("/v1"):
+        completion_path = path + "/chat/completions"
+    else:
+        completion_path = path + "/v1/chat/completions"
+    return urlunsplit((parsed.scheme, parsed.netloc, completion_path, "", ""))
+
+
+def discover_llm_models(
+    endpoint_url: str, api_key: str, timeout_seconds: int
+) -> list[str]:
+    endpoint_url = normalize_llm_endpoint(endpoint_url)
+    models_url = llm_metadata_urls(endpoint_url, "")[2]
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = Request(models_url, headers=headers)
+    try:
+        with urlopen(request, timeout=min(15, timeout_seconds)) as response:
+            body = response.read(1024 * 1024 + 1)
+    except HTTPError as error:
+        raise BrainError(f"model discovery returned HTTP {error.code}") from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise BrainError(f"cannot query models: {error}") from error
+    if len(body) > 1024 * 1024:
+        raise BrainError("model discovery response is too large")
+    try:
+        payload = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise BrainError("model discovery returned invalid JSON") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise BrainError("model discovery response has no data list")
+    models: list[str] = []
+    for item in payload["data"]:
+        model_id = item.get("id") if isinstance(item, dict) else None
+        if (
+            isinstance(model_id, str)
+            and model_id.strip()
+            and len(model_id) <= 300
+            and model_id not in models
+        ):
+            models.append(model_id)
+        if len(models) >= 500:
+            break
+    if not models:
+        raise BrainError("AI server returned no models")
+    return models
+
+
 def valid_context_window(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1024:
         return None
@@ -1143,6 +1215,13 @@ class SessionStore:
                 filename TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
                 content BLOB NOT NULL, extracted_text TEXT NOT NULL, created_at TEXT NOT NULL)""",
             "CREATE INDEX IF NOT EXISTS attachments_session_idx ON attachments(session_id, created_at)",
+            """CREATE TABLE IF NOT EXISTS ai_servers (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, endpoint_url TEXT NOT NULL,
+                api_key TEXT NOT NULL, models_json TEXT NOT NULL,
+                selected_model TEXT, active INTEGER NOT NULL DEFAULT 0
+                    CHECK(active IN (0, 1)),
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ai_servers_active_idx ON ai_servers(active) WHERE active = 1",
         ):
             connection.execute(statement)
 
@@ -1186,6 +1265,7 @@ class SessionStore:
             5: cls.migrate_5_to_6,
             6: cls.migrate_6_to_7,
             7: cls.migrate_7_to_8,
+            8: cls.migrate_8_to_9,
         }
         while version < SCHEMA_VERSION:
             migration = migrations.get(version)
@@ -1281,7 +1361,7 @@ class SessionStore:
     @staticmethod
     def migrate_6_to_7(connection: sqlite3.Connection) -> None:
         connection.execute(
-            """CREATE TABLE memories (
+            """CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
                 runner_id TEXT NOT NULL REFERENCES runners(id) ON DELETE CASCADE,
                 key TEXT NOT NULL COLLATE NOCASE,
@@ -1292,7 +1372,7 @@ class SessionStore:
                 UNIQUE (runner_id, key))"""
         )
         connection.execute(
-            "CREATE INDEX memories_runner_updated_idx ON memories (runner_id, updated_at DESC)"
+            "CREATE INDEX IF NOT EXISTS memories_runner_updated_idx ON memories (runner_id, updated_at DESC)"
         )
 
     @staticmethod
@@ -1320,6 +1400,18 @@ class SessionStore:
             filename TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
             content BLOB NOT NULL, extracted_text TEXT NOT NULL, created_at TEXT NOT NULL)""")
         connection.execute("CREATE INDEX IF NOT EXISTS attachments_session_idx ON attachments(session_id, created_at)")
+
+    @staticmethod
+    def migrate_8_to_9(connection: sqlite3.Connection) -> None:
+        connection.execute("""CREATE TABLE IF NOT EXISTS ai_servers (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, endpoint_url TEXT NOT NULL,
+            api_key TEXT NOT NULL, models_json TEXT NOT NULL,
+            selected_model TEXT, active INTEGER NOT NULL DEFAULT 0
+                CHECK(active IN (0, 1)),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ai_servers_active_idx ON ai_servers(active) WHERE active = 1"
+        )
 
     def create(self, runner_id: str | None = None) -> dict[str, Any]:
         session_id = secrets.token_urlsafe(24)
@@ -2462,6 +2554,147 @@ class SessionStore:
                     (session_id,),
                 )
 
+    @staticmethod
+    def ai_server_from_row(row: sqlite3.Row, *, public: bool = False) -> dict[str, Any]:
+        result = {
+            "server_id": row["id"],
+            "name": row["name"],
+            "endpoint_url": row["endpoint_url"],
+            "models": json.loads(row["models_json"]),
+            "selected_model": row["selected_model"],
+            "active": bool(row["active"]),
+            "has_api_key": bool(row["api_key"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        if not public:
+            result["api_key"] = row["api_key"]
+        return result
+
+    def list_ai_servers(self) -> list[dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM ai_servers ORDER BY active DESC, name COLLATE NOCASE, created_at"
+            ).fetchall()
+        return [self.ai_server_from_row(row, public=True) for row in rows]
+
+    def get_ai_server(self, server_id: str) -> dict[str, Any]:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_servers WHERE id = ?", (server_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(server_id)
+        return self.ai_server_from_row(row)
+
+    def active_ai_model(self) -> dict[str, Any] | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM ai_servers WHERE active = 1"
+            ).fetchone()
+        return self.ai_server_from_row(row) if row is not None else None
+
+    def save_ai_server(
+        self,
+        server_id: str | None,
+        name: str,
+        endpoint_url: str,
+        api_key: str | None,
+        models: list[str],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with closing(self.connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if server_id is None:
+                server_id = secrets.token_urlsafe(24)
+                active = connection.execute(
+                    "SELECT 1 FROM ai_servers WHERE active = 1"
+                ).fetchone() is None
+                connection.execute(
+                    """INSERT INTO ai_servers
+                       (id, name, endpoint_url, api_key, models_json,
+                        selected_model, active, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        server_id, name, endpoint_url, api_key or "",
+                        json.dumps(models, separators=(",", ":")),
+                        models[0] if active else None, int(active), now, now,
+                    ),
+                )
+            else:
+                current = connection.execute(
+                    "SELECT api_key, selected_model FROM ai_servers WHERE id = ?",
+                    (server_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(server_id)
+                selected = (
+                    current["selected_model"]
+                    if current["selected_model"] in models else None
+                )
+                connection.execute(
+                    """UPDATE ai_servers SET name = ?, endpoint_url = ?, api_key = ?,
+                       models_json = ?, selected_model = ?, updated_at = ? WHERE id = ?""",
+                    (
+                        name, endpoint_url,
+                        current["api_key"] if api_key is None else api_key,
+                        json.dumps(models, separators=(",", ":")),
+                        selected, now, server_id,
+                    ),
+                )
+        return self.get_ai_server(server_id)
+
+    def refresh_ai_models(self, server_id: str, models: list[str]) -> dict[str, Any]:
+        with closing(self.connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT selected_model FROM ai_servers WHERE id = ?", (server_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(server_id)
+            selected = row["selected_model"] if row["selected_model"] in models else None
+            connection.execute(
+                """UPDATE ai_servers SET models_json = ?, selected_model = ?,
+                   updated_at = ? WHERE id = ?""",
+                (json.dumps(models, separators=(",", ":")), selected, utc_now(), server_id),
+            )
+        return self.get_ai_server(server_id)
+
+    def select_ai_model(self, server_id: str, model: str) -> dict[str, Any]:
+        with closing(self.connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT models_json FROM ai_servers WHERE id = ?", (server_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(server_id)
+            if model not in json.loads(row["models_json"]):
+                raise BrainError("selected model is not available on AI server")
+            connection.execute("UPDATE ai_servers SET active = 0 WHERE active = 1")
+            connection.execute(
+                """UPDATE ai_servers SET active = 1, selected_model = ?, updated_at = ?
+                   WHERE id = ?""",
+                (model, utc_now(), server_id),
+            )
+        return self.get_ai_server(server_id)
+
+    def delete_ai_server(self, server_id: str) -> bool:
+        with closing(self.connect()) as connection, connection:
+            cursor = connection.execute(
+                "DELETE FROM ai_servers WHERE id = ?", (server_id,)
+            )
+        return cursor.rowcount == 1
+
+    def seed_ai_server(self, endpoint_url: str, api_key: str, model: str) -> None:
+        """Compatibility hook for embedded callers; environment startup passes blanks."""
+        if not endpoint_url or not model:
+            return
+        with closing(self.connect()) as connection:
+            exists = connection.execute("SELECT 1 FROM ai_servers LIMIT 1").fetchone()
+        if exists is None:
+            self.save_ai_server(
+                None, "Configured AI", normalize_llm_endpoint(endpoint_url), api_key, [model]
+            )
+
     def check_health(self) -> None:
         try:
             with closing(self.connect()) as connection:
@@ -2473,6 +2706,50 @@ class SessionStore:
         with closing(self.connect()) as connection, connection:
             cursor = connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         return cursor.rowcount == 1
+
+
+class DynamicLLMClient:
+    """Resolve global Web UI selection before every model call."""
+
+    def __init__(self, config: Config, store: SessionStore):
+        self.config = config
+        self.store = store
+        self._guard = threading.Lock()
+        self._cache_key: tuple[str, str, str, str] | None = None
+        self._client: LLMClient | None = None
+
+    def current_client(self) -> LLMClient:
+        active = self.store.active_ai_model()
+        if active is None or not active["selected_model"]:
+            raise BrainError("No AI model configured. Configure one in Web UI.")
+        key = (
+            active["server_id"], active["endpoint_url"],
+            active["api_key"], active["selected_model"],
+        )
+        with self._guard:
+            if key != self._cache_key:
+                self._client = LLMClient(replace(
+                    self.config,
+                    llm_endpoint_url=active["endpoint_url"],
+                    llm_api_key=active["api_key"],
+                    model_name=active["selected_model"],
+                ))
+                self._cache_key = key
+            assert self._client is not None
+            return self._client
+
+    def complete(self, *args: Any, **kwargs: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        return self.current_client().complete(*args, **kwargs)
+
+    def context_window(self) -> dict[str, Any]:
+        try:
+            return self.current_client().context_window()
+        except BrainError:
+            return {
+                "tokens": self.config.model_context_tokens,
+                "source": "unconfigured",
+                "stale": True,
+            }
 
 
 class SessionLocks:
@@ -2579,7 +2856,10 @@ class BrainService:
     def __init__(self, config: Config, system_prompt: str):
         self.config = config
         self.store = SessionStore(config.database_path, system_prompt)
-        self.llm = LLMClient(config)
+        self.store.seed_ai_server(
+            config.llm_endpoint_url, config.llm_api_key, config.model_name
+        )
+        self.llm = DynamicLLMClient(config, self.store)
         self.locks = SessionLocks()
         self.live_turns = LiveTurns()
         self._runner_guard = threading.Lock()
@@ -3795,7 +4075,7 @@ class BrainHandler(BaseHTTPRequestHandler):
             self.command == "GET"
             and self.path in {
                 "/healthz", "/livez", "/readyz", "/v1/conversations",
-                "/v1/servers", "/v1/runners",
+                "/v1/servers", "/v1/runners", "/v1/ai/config",
             }
             and int(code) < 400
         ):
@@ -3834,6 +4114,7 @@ class BrainHandler(BaseHTTPRequestHandler):
             or self.path == "/v1/servers"
             or self.path == "/v1/runners"
             or self.path == "/v1/memories"
+            or self.path == "/v1/ai/config"
             or CONVERSATION_ATTACHMENTS_RE.fullmatch(self.path) is not None
             or ATTACHMENT_RE.fullmatch(self.path) is not None
             or self.path == "/v1/server-setup"
@@ -3994,6 +4275,18 @@ class BrainHandler(BaseHTTPRequestHandler):
                 cache_control="no-store",
             )
             return
+        if self.path == "/v1/ai/config":
+            if not self.server.web:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+                return
+            servers = self.server.service.store.list_ai_servers()
+            active = next((item for item in servers if item["active"]), None)
+            self.send_json(
+                HTTPStatus.OK,
+                {"servers": servers, "active": active},
+                cache_control="no-store",
+            )
+            return
         events_match = CONVERSATION_EVENTS_RE.fullmatch(self.path)
         if events_match:
             self.stream_conversation(events_match.group(1))
@@ -4093,6 +4386,115 @@ class BrainHandler(BaseHTTPRequestHandler):
         if not self.server.web and self.headers.get("Origin") is not None:
             self.close_connection = True
             self.send_error_json(HTTPStatus.FORBIDDEN, "browser writes must use the web port")
+            return
+        ai_server_match = AI_SERVER_PATH_RE.fullmatch(self.path)
+        ai_models_match = AI_SERVER_MODELS_RE.fullmatch(self.path)
+        if self.path == "/v1/ai/servers" or ai_server_match:
+            if not self.server.web:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+                return
+            if not self.dashboard_write_allowed(require_json=True):
+                return
+            try:
+                body = self.read_json_body()
+                server_id = ai_server_match.group(1) if ai_server_match else None
+                existing = (
+                    self.server.service.store.get_ai_server(server_id)
+                    if server_id else None
+                )
+                name = body.get("name")
+                endpoint_url = normalize_llm_endpoint(body.get("endpoint_url"))
+                api_key = body.get("api_key", None if existing else "")
+                if (
+                    not isinstance(name, str) or not name.strip()
+                    or len(name.strip()) > 100
+                    or any(ord(char) < 32 for char in name)
+                ):
+                    raise BrainError("AI server name requires 1-100 characters without controls")
+                if api_key is not None and (
+                    not isinstance(api_key, str) or len(api_key) > 8192
+                    or any(character in api_key for character in "\r\n\0")
+                ):
+                    raise BrainError("invalid AI API key")
+                discovery_key = (
+                    existing["api_key"] if existing and api_key is None else api_key or ""
+                )
+                models = discover_llm_models(
+                    endpoint_url, discovery_key,
+                    self.server.service.config.llm_timeout_seconds,
+                )
+                saved = self.server.service.store.save_ai_server(
+                    server_id, name.strip(), endpoint_url, api_key, models
+                )
+            except KeyError:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "AI server not found")
+                return
+            except BrainError as error:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, str(error))
+                return
+            self.send_json(
+                HTTPStatus.OK if server_id else HTTPStatus.CREATED,
+                {"server": {key: value for key, value in saved.items() if key != "api_key"}},
+                cache_control="no-store",
+            )
+            return
+        if ai_models_match:
+            if not self.server.web:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+                return
+            if not self.dashboard_write_allowed(require_json=True):
+                return
+            try:
+                self.read_json_body(allow_empty=True)
+                server = self.server.service.store.get_ai_server(ai_models_match.group(1))
+                models = discover_llm_models(
+                    server["endpoint_url"], server["api_key"],
+                    self.server.service.config.llm_timeout_seconds,
+                )
+                saved = self.server.service.store.refresh_ai_models(
+                    server["server_id"], models
+                )
+            except KeyError:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "AI server not found")
+                return
+            except BrainError as error:
+                self.send_error_json(HTTPStatus.BAD_GATEWAY, str(error))
+                return
+            self.send_json(
+                HTTPStatus.OK,
+                {"server": {key: value for key, value in saved.items() if key != "api_key"}},
+                cache_control="no-store",
+            )
+            return
+        if self.path == "/v1/ai/selection":
+            if not self.server.web:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+                return
+            if not self.dashboard_write_allowed(require_json=True):
+                return
+            try:
+                body = self.read_json_body()
+                server_id, model = body.get("server_id"), body.get("model")
+                if not isinstance(server_id, str) or not isinstance(model, str):
+                    raise BrainError("selection requires server_id and model")
+                server = self.server.service.store.get_ai_server(server_id)
+                models = discover_llm_models(
+                    server["endpoint_url"], server["api_key"],
+                    self.server.service.config.llm_timeout_seconds,
+                )
+                self.server.service.store.refresh_ai_models(server_id, models)
+                selected = self.server.service.store.select_ai_model(server_id, model)
+            except KeyError:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "AI server not found")
+                return
+            except BrainError as error:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, str(error))
+                return
+            self.send_json(
+                HTTPStatus.OK,
+                {"server": {key: value for key, value in selected.items() if key != "api_key"}},
+                cache_control="no-store",
+            )
             return
         attachment_match = CONVERSATION_ATTACHMENTS_RE.fullmatch(self.path)
         if attachment_match:
@@ -4762,6 +5164,17 @@ class BrainHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         if self.server.web:
+            ai_server_match = AI_SERVER_PATH_RE.fullmatch(self.path)
+            if ai_server_match:
+                if not self.dashboard_write_allowed(require_json=False):
+                    return
+                if not self.server.service.store.delete_ai_server(ai_server_match.group(1)):
+                    self.send_error_json(HTTPStatus.NOT_FOUND, "AI server not found")
+                    return
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             attachment_match = ATTACHMENT_RE.fullmatch(self.path)
             if attachment_match:
                 if not self.dashboard_write_allowed(require_json=False): return

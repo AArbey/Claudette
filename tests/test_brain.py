@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -214,6 +215,19 @@ class FakeHTTPResponse:
 
 
 class LLMStreamTests(unittest.TestCase):
+    def test_discovers_models_from_base_url(self):
+        response = FakeHTTPResponse([
+            '{"data":[{"id":"model-b"},{"id":"model-a"},{"id":"model-b"}]}'
+        ])
+        with patch.object(brain, "urlopen", return_value=response) as upstream:
+            models = brain.discover_llm_models(
+                "http://llm.test:8080/v1", "secret", 30
+            )
+        self.assertEqual(models, ["model-b", "model-a"])
+        request = upstream.call_args.args[0]
+        self.assertEqual(request.full_url, "http://llm.test:8080/v1/models")
+        self.assertEqual(request.headers["Authorization"], "Bearer secret")
+
     def test_detects_and_caches_runtime_context_window(self):
         with tempfile.TemporaryDirectory() as directory:
             client = brain.LLMClient(config(Path(directory)))
@@ -373,6 +387,67 @@ class LLMStreamTests(unittest.TestCase):
 
 
 class StoreAndServiceTests(unittest.TestCase):
+    def test_ai_servers_are_persisted_and_global_selection_changes_client(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = brain.BrainService(
+                brain.replace(
+                    config(root), llm_endpoint_url="", llm_api_key="", model_name=""
+                ),
+                "system",
+            )
+            self.assertEqual(service.store.list_ai_servers(), [])
+            with self.assertRaisesRegex(brain.BrainError, "No AI model configured"):
+                service.llm.current_client()
+
+            first = service.store.save_ai_server(
+                None, "Local", "http://one.test/v1/chat/completions",
+                "top-secret", ["one", "two"],
+            )
+            second = service.store.save_ai_server(
+                None, "Remote", "https://two.test/v1/chat/completions",
+                "", ["three"],
+            )
+            public = service.store.list_ai_servers()
+            self.assertNotIn("api_key", public[0])
+            self.assertTrue(public[0]["has_api_key"])
+            self.assertEqual(service.llm.current_client().config.model_name, "one")
+
+            service.store.select_ai_model(second["server_id"], "three")
+            selected = service.llm.current_client().config
+            self.assertEqual(selected.model_name, "three")
+            self.assertEqual(selected.llm_endpoint_url, second["endpoint_url"])
+            self.assertNotEqual(first["server_id"], second["server_id"])
+
+    def test_schema_8_adds_ai_servers(self):
+        with closing(sqlite3.connect(":memory:")) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO app_metadata VALUES ('schema_version', '8')"
+            )
+            brain.SessionStore.migrate_schema(connection)
+            self.assertIsNotNone(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_servers'"
+            ).fetchone())
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 9)
+
+    def test_environment_ignores_legacy_ai_configuration(self):
+        with patch.dict(os.environ, {
+            "BRAIN_URL": "http://brain.test:8080",
+            "LLM_ENDPOINT_URL": "http://legacy.test/v1/chat/completions",
+            "LLM_API_KEY": "secret",
+            "MODEL_NAME": "legacy-model",
+            "SUPPORT_MODEL_NAME": "legacy-support",
+        }, clear=True):
+            loaded = brain.Config.from_environment()
+        self.assertEqual(loaded.llm_endpoint_url, "")
+        self.assertEqual(loaded.llm_api_key, "")
+        self.assertEqual(loaded.model_name, "")
+        self.assertEqual(loaded.support_model_name, "")
+
     def test_uploaded_file_content_is_sent_inline_not_as_host_path(self):
         with tempfile.TemporaryDirectory() as directory:
             service = brain.BrainService(config(Path(directory)), "system")
@@ -415,19 +490,19 @@ class StoreAndServiceTests(unittest.TestCase):
             self.assertEqual(loaded["cwd"], "/srv/project")
             self.assertEqual(
                 loaded["messages"][-1]["content"],
-                "The commands you run will run on the host host at IP 192.0.2.20.",
+                "The commands you run will run on the host host at IP 192.0.2.20. Durable memory is scoped to this runner; do not use memories from other runners.",
             )
             created = store.create(client_id)
             self.assertEqual(
                 created["messages"][-1]["content"],
-                "The commands you run will run on the host host at IP 192.0.2.20.",
+                "The commands you run will run on the host host at IP 192.0.2.20. Durable memory is scoped to this runner; do not use memories from other runners.",
             )
             bound = store.create()
             store.bind_client(bound["session_id"], client_id, "/srv/other")
             bound = store.get(bound["session_id"])
             self.assertEqual(
                 bound["messages"][-1]["content"],
-                "The commands you run will run on the host host at IP 192.0.2.20.",
+                "The commands you run will run on the host host at IP 192.0.2.20. Durable memory is scoped to this runner; do not use memories from other runners.",
             )
             with self.assertRaises(KeyError):
                 store.complete_runner_enrollment(
@@ -439,7 +514,7 @@ class StoreAndServiceTests(unittest.TestCase):
             self.assertIsNone(loaded["runner_id"])
             self.assertEqual(
                 loaded["messages"][-1]["content"],
-                "No runner is selected. You cannot run commands.",
+                "No runner is selected. You cannot run commands or use durable runner memory.",
             )
             self.assertTrue(loaded["messages"][-1]["ui"]["notice"])
 
@@ -820,7 +895,7 @@ class StoreAndServiceTests(unittest.TestCase):
                 row["name"] for row in connection.execute("PRAGMA table_info(runners)")
             }
             self.assertIn("runner_version", columns)
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 6)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 9)
 
     def test_message_branches_preserve_and_switch_responses(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -892,7 +967,7 @@ class StoreAndServiceTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(session["active_branch_id"], branch["id"])
             self.assertEqual(branch["cwd"], "/srv")
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 6)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 9)
 
     def test_summary_archive_and_newer_schema_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1043,6 +1118,7 @@ class StoreAndServiceTests(unittest.TestCase):
                 fresh_id,
                 [{"role": "system", "content": "system"}, {"role": "user", "content": "hello"}],
                 {"role": "assistant", "content": "hello back"},
+                [],
                 [],
                 0,
                 lambda event, _data: order.append(event),
@@ -1401,6 +1477,74 @@ class ClientTrustTests(unittest.TestCase):
 
 
 class HTTPTests(unittest.TestCase):
+    def test_web_ai_configuration_and_global_model_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(
+                brain.replace(
+                    config(Path(directory)),
+                    llm_endpoint_url="", llm_api_key="", model_name="",
+                ),
+                "system",
+            )
+            server = brain.BrainHTTPServer(("127.0.0.1", 0), service, web=True)
+            client_server = brain.BrainHTTPServer(("127.0.0.1", 0), service)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            client_thread = threading.Thread(
+                target=client_server.serve_forever, daemon=True
+            )
+            thread.start()
+            client_thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            client_base = f"http://127.0.0.1:{client_server.server_port}"
+            headers = {
+                "Content-Type": "application/json", "X-Brain-UI": "1",
+                "Origin": base,
+            }
+
+            def post(path, body):
+                request = Request(
+                    base + path, data=json.dumps(body).encode(), headers=headers,
+                    method="POST",
+                )
+                with urlopen(request) as response:
+                    return response.status, json.load(response)
+
+            try:
+                with urlopen(base + "/v1/ai/config") as response:
+                    self.assertEqual(json.load(response), {"servers": [], "active": None})
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(Request(
+                        client_base + "/v1/ai/selection", data=b"{}",
+                        headers={"Content-Type": "application/json"}, method="POST",
+                    ))
+                self.assertEqual(denied.exception.code, 404)
+                with patch.object(
+                    brain, "discover_llm_models", return_value=["small", "large"]
+                ):
+                    status, created = post("/v1/ai/servers", {
+                        "name": "Local llama.cpp",
+                        "endpoint_url": "http://llm.test:8080/v1",
+                        "api_key": "secret",
+                    })
+                    self.assertEqual(status, 201)
+                    self.assertNotIn("api_key", created["server"])
+                    self.assertTrue(created["server"]["active"])
+                    self.assertEqual(created["server"]["selected_model"], "small")
+                    status, selected = post("/v1/ai/selection", {
+                        "server_id": created["server"]["server_id"],
+                        "model": "large",
+                    })
+                    self.assertEqual(status, 200)
+                    self.assertEqual(selected["server"]["selected_model"], "large")
+                self.assertEqual(service.llm.current_client().config.model_name, "large")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                client_server.shutdown()
+                client_server.server_close()
+                client_thread.join(timeout=2)
+
     def test_conversation_metadata_validation_and_access(self):
         with tempfile.TemporaryDirectory() as directory:
             service = brain.BrainService(config(Path(directory)), "system")

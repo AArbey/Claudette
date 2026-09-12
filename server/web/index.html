@@ -77,6 +77,10 @@
           </div>
           <p id="conversation-meta">Select conversation to inspect it.</p>
         </div>
+        <button id="ai-config-button" class="ai-config-button" type="button" aria-label="Configure AI">
+          <span class="ai-config-icon" aria-hidden="true">AI</span>
+          <span class="ai-config-copy"><span>Model</span><strong id="ai-model-value">Not configured</strong></span>
+        </button>
         <div id="conversation-actions" class="conversation-actions hidden">
           <details id="runner-picker" class="runner-picker">
             <summary id="runner-picker-summary" aria-label="Change execution target">
@@ -222,6 +226,31 @@
         <button id="memory-save" type="submit">Save</button>
       </div>
     </form>
+  </dialog>
+  <dialog id="ai-config-dialog" class="dialog ai-config-dialog" aria-labelledby="ai-config-title">
+    <div>
+      <header class="new-conversation-header">
+        <div class="ai-config-icon" aria-hidden="true">AI</div>
+        <div><h2 id="ai-config-title">AI configuration</h2><p>Add OpenAI-compatible servers and choose global model.</p></div>
+        <button id="ai-config-close" class="dialog-close" type="button" aria-label="Close">&times;</button>
+      </header>
+      <div id="ai-server-list" class="ai-server-list"></div>
+      <p id="ai-config-feedback" class="dialog-feedback ai-config-feedback" role="status"></p>
+      <button id="ai-server-add" class="primary" type="button">+ Add AI server</button>
+      <form id="ai-server-form" class="ai-server-form hidden">
+        <input id="ai-server-id" type="hidden">
+        <label for="ai-server-name">Name</label>
+        <input id="ai-server-name" maxlength="100" required placeholder="Local llama.cpp" autocomplete="off">
+        <label for="ai-server-endpoint">Endpoint or API base URL</label>
+        <input id="ai-server-endpoint" type="url" maxlength="2048" required placeholder="http://192.168.1.111:8080/v1" autocomplete="off">
+        <label for="ai-server-key">API key <span id="ai-key-note">(optional)</span></label>
+        <input id="ai-server-key" type="password" maxlength="8192" placeholder="Not required for most local servers" autocomplete="new-password">
+        <div class="dialog-actions">
+          <button id="ai-server-cancel" type="button">Cancel</button>
+          <button id="ai-server-save" type="submit">Query models and save</button>
+        </div>
+      </form>
+    </div>
   </dialog>
   <div id="copy-status" class="sr-only" role="status"></div>
   <script src="/vendor/marked.js" defer></script>

@@ -66,11 +66,27 @@ const memoryValueInput = document.querySelector("#memory-value");
 const memoryScopeInput = document.querySelector("#memory-scope");
 const memoryFeedback = document.querySelector("#memory-feedback");
 const memorySaveButton = document.querySelector("#memory-save");
+const aiConfigButton = document.querySelector("#ai-config-button");
+const aiModelValue = document.querySelector("#ai-model-value");
+const aiConfigDialog = document.querySelector("#ai-config-dialog");
+const aiConfigClose = document.querySelector("#ai-config-close");
+const aiServerList = document.querySelector("#ai-server-list");
+const aiServerAdd = document.querySelector("#ai-server-add");
+const aiServerForm = document.querySelector("#ai-server-form");
+const aiServerId = document.querySelector("#ai-server-id");
+const aiServerName = document.querySelector("#ai-server-name");
+const aiServerEndpoint = document.querySelector("#ai-server-endpoint");
+const aiServerKey = document.querySelector("#ai-server-key");
+const aiKeyNote = document.querySelector("#ai-key-note");
+const aiConfigFeedback = document.querySelector("#ai-config-feedback");
+const aiServerSave = document.querySelector("#ai-server-save");
 
 let conversations = [];
 let servers = [];
 let runners = [];
 let memories = [];
+let aiServers = [];
+let aiConfigBusy = false;
 let currentView = location.hash.startsWith("#servers") ? "servers"
   : location.hash.startsWith("#memories") ? "memories" : "conversations";
 let selectedId = validSessionId(location.hash.slice(1)) ? location.hash.slice(1) : null;
@@ -539,6 +555,150 @@ async function getJson(path) {
   const response = await fetch(path, { cache: "no-store" });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
+}
+
+async function aiWrite(path, body = {}, method = "POST") {
+  const response = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+    body: method === "DELETE" ? undefined : JSON.stringify(body),
+  });
+  if (response.status === 204) return {};
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+  return result;
+}
+
+function renderAIHeader() {
+  const active = aiServers.find(server => server.active);
+  aiModelValue.textContent = active?.selected_model || "Not configured";
+  aiConfigButton.classList.toggle("error", !active?.selected_model);
+  aiConfigButton.title = active
+    ? `${active.name} · ${active.selected_model}`
+    : "Configure OpenAI-compatible server";
+  if (currentDetail && currentView === "conversations") renderComposer(currentDetail);
+}
+
+function renderAIConfig() {
+  const fragment = document.createDocumentFragment();
+  if (!aiServers.length) {
+    const empty = element("div", "ai-server-empty");
+    empty.append(element("strong", "", "No AI server"), element("p", "", "Add endpoint to discover models."));
+    fragment.append(empty);
+  }
+  for (const server of aiServers) {
+    const card = element("section", `ai-server-card${server.active ? " active" : ""}`);
+    const details = element("div", "ai-server-details");
+    details.append(
+      element("strong", "", `${server.name}${server.active ? " · Active" : ""}`),
+      element("span", "", server.endpoint_url),
+    );
+    const actions = element("div", "ai-server-actions");
+    const edit = element("button", "", "Edit");
+    edit.type = "button";
+    edit.addEventListener("click", () => openAIServerForm(server));
+    const refresh = element("button", "", "Refresh");
+    refresh.type = "button";
+    refresh.addEventListener("click", () => void refreshAIModels(server.server_id, refresh));
+    const remove = element("button", "danger", "Delete");
+    remove.type = "button";
+    remove.addEventListener("click", () => void deleteAIServer(server));
+    actions.append(edit, refresh, remove);
+    const modelRow = element("div", "ai-server-model-row");
+    const select = element("select");
+    select.setAttribute("aria-label", `Model on ${server.name}`);
+    for (const model of server.models || []) {
+      const option = element("option", "", model);
+      option.value = model;
+      option.selected = model === server.selected_model;
+      select.append(option);
+    }
+    const use = element("button", server.active ? "" : "primary", server.active ? "Selected" : "Use model");
+    use.type = "button";
+    use.disabled = server.active && select.value === server.selected_model;
+    select.addEventListener("change", () => {
+      const selected = server.active && select.value === server.selected_model;
+      use.disabled = selected;
+      use.textContent = selected ? "Selected" : "Use model";
+      use.classList.toggle("primary", !selected);
+    });
+    use.addEventListener("click", () => void selectAIModel(server.server_id, select.value, use));
+    modelRow.append(select, use);
+    card.append(details, actions, modelRow);
+    fragment.append(card);
+  }
+  aiServerList.replaceChildren(fragment);
+  renderAIHeader();
+}
+
+function openAIServerForm(server = null) {
+  aiServerId.value = server?.server_id || "";
+  aiServerName.value = server?.name || "";
+  aiServerEndpoint.value = server?.endpoint_url || "";
+  aiServerKey.value = "";
+  aiKeyNote.textContent = server?.has_api_key ? "(leave blank to keep saved key)" : "(optional)";
+  aiConfigFeedback.textContent = "";
+  aiServerForm.classList.remove("hidden");
+  aiServerAdd.classList.add("hidden");
+  aiServerName.focus();
+}
+
+function closeAIServerForm() {
+  aiServerForm.classList.add("hidden");
+  aiServerAdd.classList.remove("hidden");
+  aiConfigFeedback.textContent = "";
+}
+
+async function refreshAIConfig(discover = false) {
+  try {
+    const result = await getJson("/v1/ai/config");
+    aiServers = Array.isArray(result.servers) ? result.servers : [];
+    renderAIConfig();
+    if (discover && !aiConfigBusy && aiServers.length) {
+      aiConfigBusy = true;
+      await Promise.allSettled(aiServers.map(server => refreshAIModels(server.server_id)));
+      aiConfigBusy = false;
+    }
+  } catch (_) {
+    aiModelValue.textContent = "Unavailable";
+  }
+}
+
+async function refreshAIModels(serverId, button = null) {
+  if (button) button.disabled = true;
+  try {
+    const result = await aiWrite(`/v1/ai/servers/${encodeURIComponent(serverId)}/models`);
+    const index = aiServers.findIndex(server => server.server_id === serverId);
+    if (index >= 0) aiServers[index] = result.server;
+    renderAIConfig();
+  } catch (error) {
+    aiConfigFeedback.textContent = error.message || "Could not query models.";
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
+}
+
+async function selectAIModel(serverId, model, button) {
+  button.disabled = true;
+  aiConfigFeedback.textContent = "Selecting model…";
+  try {
+    await aiWrite("/v1/ai/selection", { server_id: serverId, model });
+    await refreshAIConfig(false);
+    aiConfigFeedback.textContent = "Model selected globally for Web UI and CLI.";
+  } catch (error) {
+    aiConfigFeedback.textContent = error.message || "Could not select model.";
+    button.disabled = false;
+  }
+}
+
+async function deleteAIServer(server) {
+  if (!confirm(`Delete AI server “${server.name}”?`)) return;
+  try {
+    await aiWrite(`/v1/ai/servers/${encodeURIComponent(server.server_id)}`, {}, "DELETE");
+    await refreshAIConfig(false);
+  } catch (error) {
+    aiConfigFeedback.textContent = error.message || "Could not delete AI server.";
+  }
 }
 
 function setConnection(online) {
@@ -1841,8 +2001,9 @@ function renderDetail(detail) {
 function renderComposer(detail) {
   const state = sessionState(detail.session_id);
   loadDraft(detail.session_id);
+  const aiReady = aiServers.some(server => server.active && server.selected_model);
   const unavailable = detail.archived || detail.active || state.messageBusy
-    || state.branchBusy || state.commandBusy || !connected;
+    || state.branchBusy || state.commandBusy || !connected || !aiReady;
   messageForm.classList.toggle("hidden", currentView !== "conversations");
   messageInput.disabled = detail.archived;
   messageSend.disabled = unavailable || !messageInput.value.trim();
@@ -1856,6 +2017,7 @@ function renderComposer(detail) {
   else if (detail.status === "awaiting_tool_results") messageHint.textContent = detail.pending_tool_calls?.some(call => call.ui?.remote)
     ? "Review command above, or send a new instruction to cancel it." : "Sending cancels pending terminal commands.";
   else if (detail.status === "continuation_pending") messageHint.textContent = "Send an instruction to resume this interrupted conversation.";
+  else if (!aiReady) messageHint.textContent = "Configure AI model before sending messages.";
   else messageHint.textContent = detail.runner
     ? `Commands run on ${detail.runner.client_name} after approval or a trusted-prefix match.`
     : "Chat only · Select a target to enable commands.";
@@ -2230,6 +2392,7 @@ async function refreshMemories() {
 }
 
 async function refreshDashboard() {
+  void refreshAIConfig(false);
   if (currentView === "servers") await refreshServers();
   else if (currentView === "memories") await refreshMemories();
   else await refreshList();
@@ -2262,6 +2425,36 @@ deleteButton.addEventListener("click", () => openEdit("delete"));
 newConversationButton.addEventListener("click", () => void openNewConversation());
 addServerButton.addEventListener("click", () => void openAddServer());
 newMemoryButton.addEventListener("click", () => openMemoryDialog());
+aiConfigButton.addEventListener("click", () => {
+  closeAIServerForm();
+  aiConfigDialog.showModal();
+  void refreshAIConfig(true);
+});
+aiConfigClose.addEventListener("click", () => aiConfigDialog.close());
+aiServerAdd.addEventListener("click", () => openAIServerForm());
+document.querySelector("#ai-server-cancel").addEventListener("click", closeAIServerForm);
+aiServerForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  if (aiServerSave.disabled) return;
+  aiServerSave.disabled = true;
+  aiConfigFeedback.textContent = "Querying available models…";
+  const id = aiServerId.value;
+  const payload = {
+    name: aiServerName.value,
+    endpoint_url: aiServerEndpoint.value,
+  };
+  if (!id || aiServerKey.value) payload.api_key = aiServerKey.value;
+  try {
+    await aiWrite(id ? `/v1/ai/servers/${encodeURIComponent(id)}` : "/v1/ai/servers", payload);
+    closeAIServerForm();
+    await refreshAIConfig(false);
+    aiConfigFeedback.textContent = id ? "AI server updated." : "AI server added. Models discovered.";
+  } catch (error) {
+    aiConfigFeedback.textContent = error.message || "Could not save AI server.";
+  } finally {
+    aiServerSave.disabled = false;
+  }
+});
 addServerClose.addEventListener("click", () => addServerDialog.close());
 addServerDone.addEventListener("click", () => addServerDialog.close());
 addServerCopy.addEventListener("click", () => void copyText(addServerCommand.textContent, addServerCopy));
@@ -2452,6 +2645,7 @@ addServerDialog.addEventListener("close", () => {
     addServerButton.focus();
   }
 });
+aiConfigDialog.addEventListener("close", () => aiConfigButton.focus());
 document.addEventListener("click", event => {
   if (!conversationMenu.contains(event.target)) conversationMenu.open = false;
   if (!runnerPicker.contains(event.target)) runnerPicker.open = false;

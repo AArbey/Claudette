@@ -115,6 +115,11 @@ summary::marker { color: var(--muted); }
 .heading-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .conversation-heading h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 17px; letter-spacing: -.4px; }
 .conversation-heading p { color: var(--muted); font-size: 11px; margin-top: 5px; overflow-wrap: anywhere; }
+.ai-config-button { display:flex; align-items:center; gap:8px; min-width:0; max-width:220px; padding:6px 9px; text-align:left; }
+.ai-config-icon { display:grid; place-items:center; flex:0 0 auto; width:30px; height:30px; border-radius:8px; color:var(--accent); background:var(--accent-soft); font-size:10px; font-weight:750; }
+.ai-config-copy { display:grid; min-width:0; line-height:1.2; }
+.ai-config-copy > span { color:var(--muted); font-size:9px; font-weight:650; letter-spacing:.05em; text-transform:uppercase; }
+.ai-config-copy strong { overflow:hidden; color:var(--text); font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
 .server-link { color: var(--accent); border: 0; background: transparent; padding: 0; min-height: 0; font: inherit; }
 .status-badge { display: inline-block; padding: 3px 8px; border-radius: 6px; color: var(--muted); background: var(--panel-raised); font-size: 10px; white-space: nowrap; }
 .status-badge.live { color: var(--accent); background: var(--accent-soft); }
@@ -349,6 +354,21 @@ summary::marker { color: var(--muted); }
 .edit-dialog textarea { display: block; margin: 0 24px 16px; width: calc(100% - 48px); min-height: 130px; padding: 10px; resize: vertical; }
 .edit-dialog #edit-feedback { color: var(--danger); }
 .edit-dialog #memory-feedback { min-height: 18px; color: var(--danger); }
+.ai-config-dialog { width:min(720px, calc(100vw - 28px)); max-height:min(820px, calc(100dvh - 28px)); }
+.ai-server-list { display:grid; gap:10px; max-height:390px; padding:0 24px 18px; overflow:auto; }
+.ai-server-empty { padding:24px; border:1px dashed var(--line); border-radius:12px; color:var(--muted); text-align:center; }
+.ai-server-card { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; padding:14px; border:1px solid var(--line); border-radius:12px; background:var(--bg); }
+.ai-server-card.active { border-color:color-mix(in srgb, var(--accent) 55%, var(--line)); background:var(--accent-soft); }
+.ai-server-details { min-width:0; }
+.ai-server-details strong, .ai-server-details span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ai-server-details span { color:var(--muted); font-size:10px; }
+.ai-server-model-row { display:flex; grid-column:1 / -1; gap:8px; }
+.ai-server-model-row select { flex:1; }
+.ai-server-actions { display:flex; gap:6px; }
+#ai-server-add { margin:0 24px 20px; }
+.ai-server-form { display:grid; gap:7px; padding:18px 24px 0; border-top:1px solid var(--line); }
+.ai-server-form label { font-size:11px; color:var(--muted); }
+.ai-server-form .dialog-actions { margin:8px -24px 0; }
 @keyframes pulse { 50% { opacity: .4; } }
 @media (max-width: 1100px) and (min-width: 900px) {
   .shell { grid-template-columns: 250px minmax(0,1fr); }
@@ -381,6 +401,7 @@ summary::marker { color: var(--muted); }
   .topbar { flex-wrap: wrap; gap: 10px; padding: max(12px, env(safe-area-inset-top)) 14px 12px; }
   .conversation-heading h2 { font-size: 16px; }
   .conversation-heading p { font-size: 10px; }
+  .ai-config-button { max-width:145px; min-height:44px; }
   .conversation-actions { width: 100%; justify-content: space-between; }
   .runner-picker { flex: 1; min-width: 0; }
   .runner-picker > summary { width: 100%; min-height: 44px; }
@@ -418,6 +439,9 @@ summary::marker { color: var(--muted); }
   .message-action svg { width: 19px; height: 19px; }
   .branch-arrow { min-height: 38px; }
   .message-editor-input { width: 100%; min-width: 0; font-size: 16px; }
+  .ai-server-card { grid-template-columns:1fr; }
+  .ai-server-actions { grid-row:3; }
+  .ai-server-model-row { grid-column:1; flex-direction:column; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }

@@ -50,19 +50,10 @@ chmod 600 .env
 editor .env
 ```
 
-Required model setting:
-
-```bash
-MODEL_NAME=MiniCPM5-1B-Q4_K_M
-```
-
-Default LLM endpoint:
-
-```bash
-LLM_ENDPOINT_URL=http://192.168.1.111:9292/v1/chat/completions
-```
-
-`LLM_API_KEY` may stay empty when local LLM server does not require one.
+No AI endpoint is configured through `.env`. After Brain starts, open Web UI,
+select **Model**, add one or more OpenAI-compatible servers, then choose global
+model. Brain queries each server's `/v1/models` endpoint automatically. Selected
+model applies immediately to Web UI conversations and CLI conversations.
 
 Set `BRAIN_URL` to stable private Brain address used by clients and runner
 installers, for example `http://192.168.1.115:8080`.
@@ -393,11 +384,6 @@ to client servers.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `LLM_ENDPOINT_URL` | `http://192.168.1.111:9292/v1/chat/completions` | Upstream model endpoint |
-| `LLM_API_KEY` | empty | Optional upstream bearer token |
-| `MODEL_NAME` | required | Upstream model name |
-| `SUPPORT_MODEL_NAME` | empty (disabled) | Model for short conversation titles, using the same endpoint and API key |
-| `MODEL_CONTEXT_TOKENS` | `32768` | Fallback context size; Web UI checks `/running`, reads loaded llama.cpp runtime through `/props`, then falls back to `/v1/models` metadata |
 | `BRAIN_BIND_HOST` | `0.0.0.0` | Brain listen address |
 | `BRAIN_PORT` | `8080` | Brain listen port |
 | `WEB_PORT` | `8081` | Web dashboard and conversation API port |

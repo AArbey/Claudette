@@ -26,6 +26,7 @@ class PreviewLLM:
 with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
     service = brain.BrainService(replace(config(Path(directory)), web_dir=Path(__file__).resolve().parents[1] / "server/web"), "PRIVATE_SYSTEM_PROMPT")
     service.llm = PreviewLLM()
+    brain.discover_llm_models = lambda *_args, **_kwargs: ["test-model", "alternate-model"]
     runner_id = "r" * 32
     for ident, name, ip in [(runner_id, "deploy@production", "127.0.0.1"), ("s" * 32, "admin@staging", "192.0.2.25")]:
         service.store.register_client(ident, name, ip)
