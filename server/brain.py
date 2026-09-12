@@ -8,6 +8,7 @@ import ipaddress
 import hashlib
 import base64
 import io
+import math
 import zipfile
 import xml.etree.ElementTree as ET
 import json
@@ -29,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -249,6 +250,7 @@ class Config:
     client_brain_connect_timeout_seconds: int
     client_brain_request_timeout_seconds: int
     support_model_name: str = ""
+    model_context_tokens: int = 32768
     runner_script_path: Path = Path("/client/runner.sh")
     runner_installer_path: Path = Path("/client/install-runner.sh")
     runner_port_start: int = 8766
@@ -271,6 +273,7 @@ class Config:
             model_name=required("MODEL_NAME"),
             brain_url=required("BRAIN_URL"),
             support_model_name=os.environ.get("SUPPORT_MODEL_NAME", "").strip(),
+            model_context_tokens=int(os.environ.get("MODEL_CONTEXT_TOKENS", "32768")),
             bind_host=os.environ.get("BRAIN_BIND_HOST", "0.0.0.0"),
             port=int(os.environ.get("BRAIN_PORT", "8080")),
             web_port=int(os.environ.get("WEB_PORT", "8081")),
@@ -311,6 +314,8 @@ class Config:
             raise BrainError("WEB_PORT must differ from BRAIN_PORT")
         if config.runner_port_start > config.runner_port_end:
             raise BrainError("RUNNER_PORT_START must not exceed RUNNER_PORT_END")
+        if config.model_context_tokens < 1024:
+            raise BrainError("MODEL_CONTEXT_TOKENS must be at least 1024")
         return config
 
 
@@ -739,9 +744,180 @@ def prepare_upstream_messages(
     return regular
 
 
+def estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
+    """Cheap tokenizer-independent estimate suitable for UI capacity feedback."""
+    characters = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            characters += len(content)
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            characters += len(json.dumps(tool_calls, ensure_ascii=False))
+        characters += 12
+    return max(1, math.ceil(characters / 4))
+
+
+def llm_metadata_urls(endpoint_url: str, model_name: str) -> tuple[str, str, str]:
+    """Build llama.cpp props and OpenAI model-list URLs beside chat completions."""
+    parsed = urlsplit(endpoint_url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1/chat/completions"):
+        root = path[: -len("/v1/chat/completions")]
+    elif path.endswith("/chat/completions"):
+        root = path[: -len("/chat/completions")]
+    else:
+        root = path.rsplit("/", 1)[0]
+    base = (parsed.scheme, parsed.netloc, root, "", "")
+    running = urlunsplit((*base[:2], root + "/running", "", ""))
+    props = urlunsplit(
+        (*base[:2], root + "/props", urlencode({"model": model_name}), "")
+    )
+    models = urlunsplit((*base[:2], root + "/v1/models", "", ""))
+    return running, props, models
+
+
+def valid_context_window(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1024:
+        return None
+    return value
+
+
+def context_window_from_props(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    settings = payload.get("default_generation_settings")
+    if not isinstance(settings, dict):
+        return None
+    return valid_context_window(settings.get("n_ctx"))
+
+
+def model_is_running(payload: Any, model_name: str) -> bool:
+    if not isinstance(payload, dict) or not isinstance(payload.get("running"), list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("model") == model_name
+        and item.get("state") == "ready"
+        for item in payload["running"]
+    )
+
+
+def context_window_from_models(payload: Any, model_name: str) -> int | None:
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return None
+    record = next(
+        (
+            item for item in payload["data"]
+            if isinstance(item, dict) and item.get("id") == model_name
+        ),
+        None,
+    )
+    if record is None:
+        return None
+    candidates = [
+        record.get("context_length"),
+        record.get("context_window"),
+        record.get("max_context_length"),
+    ]
+    meta = record.get("meta")
+    if isinstance(meta, dict):
+        candidates.append(meta.get("n_ctx"))
+        llama_swap = meta.get("llamaswap")
+        if isinstance(llama_swap, dict):
+            candidates.extend(
+                llama_swap.get(key)
+                for key in ("n_ctx", "context", "context_length", "max_context_length")
+            )
+    capabilities = record.get("capabilities")
+    if isinstance(capabilities, dict):
+        candidates.append(capabilities.get("context"))
+    return next(
+        (window for value in candidates if (window := valid_context_window(value))),
+        None,
+    )
+
+
 class LLMClient:
     def __init__(self, config: Config):
         self.config = config
+        self._context_guard = threading.Lock()
+        self._context_tokens = config.model_context_tokens
+        self._context_source = "configured"
+        self._context_stale = True
+        self._context_refresh_after = 0.0
+
+    def _get_json(self, url: str) -> Any:
+        headers = {"Accept": "application/json"}
+        if self.config.llm_api_key:
+            headers["Authorization"] = f"Bearer {self.config.llm_api_key}"
+        request = Request(url, headers=headers)
+        with urlopen(request, timeout=min(1, self.config.llm_timeout_seconds)) as response:
+            body = response.read(1024 * 1024 + 1)
+        if len(body) > 1024 * 1024:
+            raise BrainError("LLM metadata response is too large")
+        return json.loads(body)
+
+    def context_window(self) -> dict[str, Any]:
+        """Return cached runtime context, refreshing from upstream once per minute."""
+        now = time.monotonic()
+        with self._context_guard:
+            if now < self._context_refresh_after:
+                return {
+                    "tokens": self._context_tokens,
+                    "source": self._context_source,
+                    "stale": self._context_stale,
+                }
+
+            running_url, props_url, models_url = llm_metadata_urls(
+                self.config.llm_endpoint_url, self.config.model_name
+            )
+            resolved: int | None = None
+            source = ""
+            metadata_errors = (
+                BrainError, HTTPError, URLError, TimeoutError, OSError,
+                UnicodeError, json.JSONDecodeError,
+            )
+            try:
+                running = model_is_running(
+                    self._get_json(running_url), self.config.model_name
+                )
+            except metadata_errors:
+                running = False
+            if running:
+                try:
+                    resolved = context_window_from_props(self._get_json(props_url))
+                except metadata_errors:
+                    resolved = None
+                if resolved:
+                    source = "runtime"
+            if not resolved:
+                try:
+                    resolved = context_window_from_models(
+                        self._get_json(models_url), self.config.model_name
+                    )
+                except metadata_errors:
+                    resolved = None
+                if resolved:
+                    source = "models"
+
+            if resolved:
+                self._context_tokens = resolved
+                self._context_source = source
+                self._context_stale = False
+                self._context_refresh_after = now + 60
+            else:
+                self._context_stale = True
+                self._context_refresh_after = now + 10
+            return {
+                "tokens": self._context_tokens,
+                "source": self._context_source,
+                "stale": self._context_stale,
+            }
+
+    def invalidate_context_window(self) -> None:
+        with self._context_guard:
+            self._context_refresh_after = 0.0
 
     def complete(
         self,
@@ -861,6 +1037,7 @@ class LLMClient:
         }
         if tool_calls:
             assistant["tool_calls"] = tool_calls
+        self.invalidate_context_window()
         return assistant, tool_calls
 
 class SessionStore:
@@ -2519,6 +2696,32 @@ class BrainService:
             session["pending_runner_id"] if session["runner_change_pending"] else None
         )
         detail["runner_change_pending"] = session["runner_change_pending"]
+        context_messages = self.model_messages(
+            session["messages"], session["runner_id"]
+        )
+        live = detail["live"]
+        if live is not None:
+            context_messages.extend(live.get("transient_messages", []))
+            if live.get("content"):
+                context_messages.append({"role": "assistant", "content": live["content"]})
+        used = estimate_message_tokens(prepare_upstream_messages(context_messages))
+        context_window = (
+            self.llm.context_window()
+            if hasattr(self.llm, "context_window")
+            else {
+                "tokens": self.config.model_context_tokens,
+                "source": "configured",
+                "stale": True,
+            }
+        )
+        maximum = context_window["tokens"]
+        detail["context_usage"] = {
+            "estimated_tokens": used,
+            "max_tokens": maximum,
+            "percent": min(100, round(used * 100 / maximum)),
+            "max_tokens_source": context_window["source"],
+            "max_tokens_stale": context_window["stale"],
+        }
         return detail
 
     def runner_status(self, runner: dict[str, Any]) -> str:

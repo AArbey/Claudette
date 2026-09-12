@@ -106,6 +106,12 @@ class BlockingLLM:
 
 
 class PromptTests(unittest.TestCase):
+    def test_estimates_context_tokens(self):
+        self.assertEqual(
+            brain.estimate_message_tokens([{"role": "user", "content": "x" * 40}]),
+            13,
+        )
+
     def test_web_turn_keeps_attachment_references(self):
         references = [{"type": "attachment", "id": "a" * 32, "label": "notes.txt"}]
         result = brain.web_turn_body({"content": "Read it", "references": references})
@@ -203,8 +209,61 @@ class FakeHTTPResponse:
     def __iter__(self):
         return iter(self.lines)
 
+    def read(self, _limit=-1):
+        return b"".join(self.lines)
+
 
 class LLMStreamTests(unittest.TestCase):
+    def test_detects_and_caches_runtime_context_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            responses = [
+                FakeHTTPResponse([
+                    '{"running":[{"model":"test-model","state":"ready"}]}'
+                ]),
+                FakeHTTPResponse([
+                    '{"default_generation_settings":{"n_ctx":200192}}'
+                ]),
+            ]
+            with patch.object(brain, "urlopen", side_effect=responses) as upstream:
+                first = client.context_window()
+                second = client.context_window()
+            self.assertEqual(first, {
+                "tokens": 200192, "source": "runtime", "stale": False,
+            })
+            self.assertEqual(second, first)
+            self.assertEqual(upstream.call_count, 2)
+            request = upstream.call_args_list[1].args[0]
+            self.assertEqual(request.full_url, "http://127.0.0.1:1/props?model=test-model")
+
+    def test_uses_model_listing_when_runtime_props_has_no_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            responses = [
+                FakeHTTPResponse(["{\"running\":[]}"]),
+                FakeHTTPResponse([
+                    '{"data":[{"id":"test-model","context_length":131072}]}'
+                ]),
+            ]
+            with patch.object(brain, "urlopen", side_effect=responses) as upstream:
+                result = client.context_window()
+            self.assertEqual(result, {
+                "tokens": 131072, "source": "models", "stale": False,
+            })
+            self.assertEqual(
+                upstream.call_args_list[1].args[0].full_url,
+                "http://127.0.0.1:1/v1/models",
+            )
+
+    def test_keeps_configured_context_when_metadata_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            with patch.object(brain, "urlopen", side_effect=brain.URLError("offline")):
+                result = client.context_window()
+            self.assertEqual(result, {
+                "tokens": 32768, "source": "configured", "stale": True,
+            })
+
     def test_folds_target_notices_into_leading_system_message(self):
         with tempfile.TemporaryDirectory() as directory:
             client = brain.LLMClient(config(Path(directory)))

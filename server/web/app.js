@@ -47,6 +47,9 @@ const messageForm = document.querySelector("#message-form");
 const messageInput = document.querySelector("#message-input");
 const messageSend = document.querySelector("#message-send");
 const messageHint = document.querySelector("#message-hint");
+const contextMeter = document.querySelector("#context-meter");
+const contextMeterFill = document.querySelector("#context-meter-fill");
+const contextMeterLabel = document.querySelector("#context-meter-label");
 const contextAdd = document.querySelector("#context-add");
 const contextDialog = document.querySelector("#context-dialog");
 const contextClose = document.querySelector("#context-close");
@@ -139,6 +142,30 @@ function loadDraft(id) {
 function resizeComposer() {
   messageInput.style.height = "auto";
   messageInput.style.height = `${Math.min(messageInput.scrollHeight, 180)}px`;
+}
+
+function compactTokens(value) {
+  if (value < 1000) return String(value);
+  return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)}k`;
+}
+
+function renderContextMeter(detail) {
+  const usage = detail?.context_usage || {};
+  const maximum = Number(usage.max_tokens) || 32768;
+  const state = sessionState(detail?.session_id);
+  const referenceCharacters = (state.references || []).reduce((total, ref) =>
+    total + (typeof ref.snapshot === "string" ? ref.snapshot.length : Number(ref.context_chars) || 0), 0);
+  const draftTokens = Math.ceil((messageInput.value.length + referenceCharacters) / 4);
+  const used = (Number(usage.estimated_tokens) || 0) + draftTokens;
+  const percent = Math.min(100, Math.round(used * 100 / maximum));
+  contextMeterFill.style.width = `${percent}%`;
+  contextMeter.dataset.level = percent >= 90 ? "critical" : percent >= 75 ? "warning" : "normal";
+  contextMeter.setAttribute("aria-valuenow", String(percent));
+  contextMeterLabel.textContent = `Context ${compactTokens(used)} / ${compactTokens(maximum)} · ${percent}%`;
+  const source = usage.max_tokens_source === "runtime" ? "live runtime"
+    : usage.max_tokens_source === "models" ? "model metadata" : "configured fallback";
+  const stale = usage.max_tokens_stale ? " (temporarily unavailable or stale)" : "";
+  contextMeter.title = `Estimated context usage: ${used.toLocaleString()} of ${maximum.toLocaleString()} tokens · Limit from ${source}${stale}`;
 }
 
 function serverIpFromHash() {
@@ -1832,6 +1859,7 @@ function renderComposer(detail) {
   else messageHint.textContent = detail.runner
     ? `Commands run on ${detail.runner.client_name} after approval or a trusted-prefix match.`
     : "Chat only · Select a target to enable commands.";
+  renderContextMeter(detail);
 }
 
 async function changeConversationRunner(value) {
@@ -2379,7 +2407,7 @@ contextUploadButton.addEventListener("click", async () => {
     const data = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(",")[1]); reader.onerror = reject; reader.readAsDataURL(file); });
     const response = await fetch(`/v1/conversations/${encodeURIComponent(currentDetail.session_id)}/attachments`, {method:"POST", headers:{"Content-Type":"application/json", "X-Brain-UI":"1"}, body:JSON.stringify({filename:file.name,mime_type:file.type,data})});
     const result = await response.json(); if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
-    const a = result.attachment; addContextReference({type:"attachment", id:a.id, label:a.filename});
+    const a = result.attachment; addContextReference({type:"attachment", id:a.id, label:a.filename, context_chars: typeof a.extracted_text === "string" ? a.extracted_text.length : 0});
   } catch (error) { contextFeedback.textContent = error.message || "Upload failed."; }
   finally { contextUploadButton.disabled = false; }
 });

@@ -397,6 +397,7 @@ to client servers.
 | `LLM_API_KEY` | empty | Optional upstream bearer token |
 | `MODEL_NAME` | required | Upstream model name |
 | `SUPPORT_MODEL_NAME` | empty (disabled) | Model for short conversation titles, using the same endpoint and API key |
+| `MODEL_CONTEXT_TOKENS` | `32768` | Fallback context size; Web UI checks `/running`, reads loaded llama.cpp runtime through `/props`, then falls back to `/v1/models` metadata |
 | `BRAIN_BIND_HOST` | `0.0.0.0` | Brain listen address |
 | `BRAIN_PORT` | `8080` | Brain listen port |
 | `WEB_PORT` | `8081` | Web dashboard and conversation API port |

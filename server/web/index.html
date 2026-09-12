@@ -122,6 +122,10 @@
           placeholder="Continue conversation…"></textarea>
         <button id="message-send" type="submit">Send</button>
         <p id="message-hint" class="composer-hint" role="status"></p>
+        <div id="context-meter" class="context-meter" role="progressbar" aria-label="Estimated context usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span class="context-meter-track"><span id="context-meter-fill" class="context-meter-fill"></span></span>
+          <span id="context-meter-label" class="context-meter-label">Context 0 / 32k</span>
+        </div>
       </form>
     </main>
   </div>
