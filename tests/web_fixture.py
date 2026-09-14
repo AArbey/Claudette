@@ -9,15 +9,23 @@ from test_brain import brain, config, tool_call
 
 
 class PreviewLLM:
-    def complete(self, messages, emit, *, include_tools=True, model_name=None):
+    def complete(
+        self, messages, emit, *, include_tools=True, model_name=None,
+        cancellation=None,
+    ):
         last = messages[-1]
         if last.get("role") == "user" and last.get("content") == "request command" and include_tools:
             call = tool_call()
             return {"role": "assistant", "content": None, "tool_calls": [call]}, [call]
         content = "## Check complete\n\nEverything looks healthy.\n\n- Configuration loaded\n- Services responding\n\n```bash\ndocker ps\n```"
         emit("reasoning", {"delta": "Checking the current request."})
-        time.sleep(1)
+        for _ in range(20):
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            time.sleep(.05)
         for chunk in [content[:25], content[25:]]:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             emit("content", {"delta": chunk})
             time.sleep(.3)
         return {"role": "assistant", "content": content, "reasoning": "Checking the current request."}, []

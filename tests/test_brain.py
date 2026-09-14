@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -79,7 +80,8 @@ class FakeLLM:
         self.seen_include_tools = []
 
     def complete(
-        self, messages, emit, *, include_tools=True, model_name=None
+        self, messages, emit, *, include_tools=True, model_name=None,
+        cancellation=None,
     ):
         self.seen_messages.append(json.loads(json.dumps(messages)))
         self.seen_include_tools.append(include_tools)
@@ -97,12 +99,16 @@ class BlockingLLM:
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def complete(self, messages, emit, *, include_tools=True):
+    def complete(self, messages, emit, *, include_tools=True, cancellation=None):
         emit("reasoning", {"delta": "checking"})
         emit("content", {"delta": "answer"})
         self.started.set()
-        if not self.release.wait(timeout=2):
-            raise brain.BrainError("test release timed out")
+        deadline = time.monotonic() + 2
+        while not self.release.wait(timeout=.01):
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            if time.monotonic() >= deadline:
+                raise brain.BrainError("test release timed out")
         return {"role": "assistant", "content": "answer"}, []
 
 
@@ -214,7 +220,59 @@ class FakeHTTPResponse:
         return b"".join(self.lines)
 
 
+class BlockingHTTPResponse:
+    status = 200
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.closed = threading.Event()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+        return False
+
+    def __iter__(self):
+        yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n'
+        self.started.set()
+        self.closed.wait(timeout=2)
+        raise AttributeError("'NoneType' object has no attribute 'peek'")
+
+    def close(self):
+        self.closed.set()
+
+
 class LLMStreamTests(unittest.TestCase):
+    def test_cancellation_closes_active_upstream_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            response = BlockingHTTPResponse()
+            cancellation = brain.TurnCancellation()
+            errors = []
+
+            def complete():
+                try:
+                    client.complete(
+                        [{"role": "user", "content": "test"}],
+                        lambda *_: None,
+                        cancellation=cancellation,
+                    )
+                except Exception as error:  # pragma: no cover - assertion aid
+                    errors.append(error)
+
+            with patch.object(brain, "urlopen", return_value=response):
+                thread = threading.Thread(target=complete)
+                thread.start()
+                self.assertTrue(response.started.wait(timeout=1))
+                cancellation.cancel()
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(response.closed.is_set())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], brain.TurnCancelled)
+
     def test_discovers_models_from_base_url(self):
         response = FakeHTTPResponse([
             '{"data":[{"id":"model-b"},{"id":"model-a"},{"id":"model-b"}]}'
@@ -1390,6 +1448,55 @@ class StoreAndServiceTests(unittest.TestCase):
                 reopened.get(session_id)["messages"][-1]["ui"]["reasoning"], "checking"
             )
 
+    def test_stopped_generation_saves_partial_answer_and_can_continue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            blocking_llm = BlockingLLM()
+            service.llm = blocking_llm
+            session_id = service.store.create()["session_id"]
+            events = []
+            errors = []
+
+            def run_turn():
+                try:
+                    service.run_turn(
+                        session_id,
+                        {"type": "web_user", "content": "long request"},
+                        lambda event, data: events.append((event, data)),
+                    )
+                except Exception as error:  # pragma: no cover - assertion aid
+                    errors.append(error)
+
+            thread = threading.Thread(target=run_turn)
+            thread.start()
+            self.assertTrue(blocking_llm.started.wait(timeout=1))
+            self.assertTrue(service.stop_generation(session_id))
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(events[-1], ("done", {"stopped": True}))
+            stopped = service.store.get(session_id)
+            self.assertEqual(stopped["status"], "ready")
+            self.assertEqual(stopped["messages"][-1]["content"], "answer")
+            self.assertEqual(
+                stopped["messages"][-1]["ui"],
+                {"stopped": True, "reasoning": "checking"},
+            )
+            self.assertFalse(service.stop_generation(session_id))
+
+            service.llm = FakeLLM([
+                ({"role": "assistant", "content": "continued answer"}, []),
+            ])
+            service.run_turn(
+                session_id,
+                {"type": "web_user", "content": "continue"},
+                lambda *_: None,
+            )
+            continued = service.store.get(session_id)
+            self.assertEqual(continued["status"], "ready")
+            self.assertEqual(continued["messages"][-1]["content"], "continued answer")
+
 class ClientTrustTests(unittest.TestCase):
     def test_first_runner_hostname_names_server_without_overwriting_user_name(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1477,6 +1584,60 @@ class ClientTrustTests(unittest.TestCase):
 
 
 class HTTPTests(unittest.TestCase):
+    def test_web_stop_endpoint_cancels_active_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            blocking_llm = BlockingLLM()
+            service.llm = blocking_llm
+            session_id = service.store.create()["session_id"]
+            server = brain.BrainHTTPServer(("127.0.0.1", 0), service, web=True)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            headers = {
+                "Content-Type": "application/json",
+                "X-Brain-UI": "1",
+                "Origin": base,
+            }
+            turn_events = []
+            turn_errors = []
+
+            def request_turn():
+                try:
+                    request = Request(
+                        f"{base}/v1/conversations/{session_id}/turns",
+                        data=b'{"content":"long request"}',
+                        headers=headers,
+                    )
+                    with urlopen(request) as response:
+                        turn_events.append(response.read().decode())
+                except Exception as error:  # pragma: no cover - assertion aid
+                    turn_errors.append(error)
+
+            turn_thread = threading.Thread(target=request_turn)
+            turn_thread.start()
+            try:
+                self.assertTrue(blocking_llm.started.wait(timeout=1))
+                stop = Request(
+                    f"{base}/v1/conversations/{session_id}/stop",
+                    data=b"{}",
+                    headers=headers,
+                )
+                with urlopen(stop) as response:
+                    self.assertEqual(response.status, 202)
+                    self.assertEqual(json.load(response), {"stopping": True})
+                turn_thread.join(timeout=2)
+                self.assertFalse(turn_thread.is_alive())
+                self.assertEqual(turn_errors, [])
+                self.assertIn('event: done\ndata: {"stopped":true}', turn_events[0])
+                self.assertEqual(service.store.get(session_id)["status"], "ready")
+            finally:
+                blocking_llm.release.set()
+                turn_thread.join(timeout=2)
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=2)
+
     def test_web_ai_configuration_and_global_model_selection(self):
         with tempfile.TemporaryDirectory() as directory:
             service = brain.BrainService(

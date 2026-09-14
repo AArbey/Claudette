@@ -46,6 +46,7 @@ const manageRunnersButton = document.querySelector("#manage-runners");
 const messageForm = document.querySelector("#message-form");
 const messageInput = document.querySelector("#message-input");
 const messageSend = document.querySelector("#message-send");
+const messageStop = document.querySelector("#message-stop");
 const messageHint = document.querySelector("#message-hint");
 const contextMeter = document.querySelector("#context-meter");
 const contextMeterFill = document.querySelector("#context-meter-fill");
@@ -87,6 +88,79 @@ let runners = [];
 let memories = [];
 let aiServers = [];
 let aiConfigBusy = false;
+let aiConfigFeedbackTimer = null;
+let activeModelMenu = null;
+let activeModelTrigger = null;
+
+function closeModelPicker(restoreFocus = false) {
+  const menu = activeModelMenu;
+  const trigger = activeModelTrigger;
+  activeModelMenu = null;
+  activeModelTrigger = null;
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+  if (menu) {
+    menu.classList.remove("open");
+    if (typeof menu.hidePopover === "function") {
+      try { menu.hidePopover(); } catch (_) {}
+    }
+  }
+  if (restoreFocus && trigger?.isConnected) trigger.focus({ preventScroll: true });
+}
+
+function positionModelPicker() {
+  if (!activeModelMenu || !activeModelTrigger?.isConnected) return;
+  const menu = activeModelMenu;
+  const trigger = activeModelTrigger;
+  const rect = trigger.getBoundingClientRect();
+  const gap = 7;
+  const margin = 12;
+  const viewportWidth = document.documentElement.clientWidth;
+  const viewportHeight = document.documentElement.clientHeight;
+  const below = Math.max(0, viewportHeight - rect.bottom - gap - margin);
+  const above = Math.max(0, rect.top - gap - margin);
+  const desiredHeight = Math.min(360, Math.max(180, menu.scrollHeight || 280));
+  const openAbove = below < Math.min(220, desiredHeight) && above > below;
+  const availableHeight = Math.max(120, openAbove ? above : below);
+  const width = Math.min(Math.max(rect.width, 300), Math.max(240, viewportWidth - margin * 2));
+  const left = Math.min(Math.max(margin, rect.left), Math.max(margin, viewportWidth - margin - width));
+
+  menu.style.width = `${width}px`;
+  menu.style.maxHeight = `${Math.min(360, availableHeight)}px`;
+  menu.style.left = `${left}px`;
+  menu.style.right = "auto";
+  if (openAbove) {
+    menu.style.top = "auto";
+    menu.style.bottom = `${viewportHeight - rect.top + gap}px`;
+    menu.dataset.side = "top";
+  } else {
+    menu.style.top = `${rect.bottom + gap}px`;
+    menu.style.bottom = "auto";
+    menu.dataset.side = "bottom";
+  }
+}
+
+function openModelPicker(trigger, menu) {
+  if (activeModelMenu === menu) {
+    closeModelPicker(true);
+    return;
+  }
+  closeModelPicker(false);
+  activeModelMenu = menu;
+  activeModelTrigger = trigger;
+  trigger.setAttribute("aria-expanded", "true");
+  menu.classList.add("open");
+  if (typeof menu.showPopover === "function") {
+    try { menu.showPopover(); } catch (_) {}
+  }
+  positionModelPicker();
+  requestAnimationFrame(() => {
+    positionModelPicker();
+    const search = menu.querySelector(".model-picker-search");
+    const selected = menu.querySelector(".model-picker-option.selected");
+    if (search) search.focus({ preventScroll: true });
+    else selected?.scrollIntoView({ block: "nearest" });
+  });
+}
 let currentView = location.hash.startsWith("#servers") ? "servers"
   : location.hash.startsWith("#memories") ? "memories" : "conversations";
 let selectedId = validSessionId(location.hash.slice(1)) ? location.hash.slice(1) : null;
@@ -119,8 +193,8 @@ const enrollmentEditors = new Map();
 
 function sessionState(id = selectedId) {
   if (!sessionStates.has(id)) sessionStates.set(id, {
-    messageBusy: false, branchBusy: false, commandBusy: false, actionBusy: false,
-    failure: "", feedback: "", nextCommandId: "", editingMessageIndex: null,
+    messageBusy: false, stopBusy: false, branchBusy: false, commandBusy: false, actionBusy: false,
+    failure: "", feedback: "", notice: "", nextCommandId: "", editingMessageIndex: null,
     editingMessageDraft: "", references: [],
   });
   return sessionStates.get(id);
@@ -569,6 +643,29 @@ async function aiWrite(path, body = {}, method = "POST") {
   return result;
 }
 
+function setAIConfigFeedback(message = "", state = "info", autoHide = false) {
+  if (aiConfigFeedbackTimer) {
+    clearTimeout(aiConfigFeedbackTimer);
+    aiConfigFeedbackTimer = null;
+  }
+  aiConfigFeedback.textContent = message;
+  if (!message) {
+    aiConfigFeedback.removeAttribute("data-state");
+    return;
+  }
+  aiConfigFeedback.dataset.state = state;
+  if (autoHide) {
+    const shownMessage = message;
+    aiConfigFeedbackTimer = window.setTimeout(() => {
+      if (aiConfigFeedback.textContent === shownMessage) {
+        aiConfigFeedback.textContent = "";
+        aiConfigFeedback.removeAttribute("data-state");
+      }
+      aiConfigFeedbackTimer = null;
+    }, 2600);
+  }
+}
+
 function renderAIHeader() {
   const active = aiServers.find(server => server.active);
   aiModelValue.textContent = active?.selected_model || "Not configured";
@@ -580,7 +677,10 @@ function renderAIHeader() {
 }
 
 function renderAIConfig() {
+  closeModelPicker(false);
+  document.querySelectorAll('.model-picker-menu[data-model-popover="true"]').forEach(node => node.remove());
   const fragment = document.createDocumentFragment();
+  const popovers = [];
   if (!aiServers.length) {
     const empty = element("div", "ai-server-empty");
     empty.append(element("strong", "", "No AI server"), element("p", "", "Add endpoint to discover models."));
@@ -589,45 +689,131 @@ function renderAIConfig() {
   for (const server of aiServers) {
     const card = element("section", `ai-server-card${server.active ? " active" : ""}`);
     const details = element("div", "ai-server-details");
-    details.append(
-      element("strong", "", `${server.name}${server.active ? " · Active" : ""}`),
-      element("span", "", server.endpoint_url),
-    );
+    const title = element("div", "ai-server-title");
+    title.append(element("strong", "", server.name));
+    if (server.active) title.append(element("span", "ai-server-active-badge", "Active"));
+    details.append(title, element("span", "ai-server-endpoint", server.endpoint_url));
+
     const actions = element("div", "ai-server-actions");
-    const edit = element("button", "", "Edit");
+    const edit = element("button", "ai-server-action", "Edit");
     edit.type = "button";
     edit.addEventListener("click", () => openAIServerForm(server));
-    const refresh = element("button", "", "Refresh");
+    const refresh = element("button", "ai-server-action", "Refresh");
     refresh.type = "button";
     refresh.addEventListener("click", () => void refreshAIModels(server.server_id, refresh));
-    const remove = element("button", "danger", "Delete");
+    const remove = element("button", "ai-server-action danger", "Delete");
     remove.type = "button";
     remove.addEventListener("click", () => void deleteAIServer(server));
     actions.append(edit, refresh, remove);
+
+    const models = Array.isArray(server.models) ? server.models : [];
+    let selectedModel = models.includes(server.selected_model) ? server.selected_model : (models[0] || "");
     const modelRow = element("div", "ai-server-model-row");
-    const select = element("select");
-    select.setAttribute("aria-label", `Model on ${server.name}`);
-    for (const model of server.models || []) {
-      const option = element("option", "", model);
-      option.value = model;
-      option.selected = model === server.selected_model;
-      select.append(option);
-    }
-    const use = element("button", server.active ? "" : "primary", server.active ? "Selected" : "Use model");
+    const modelField = element("div", "ai-model-field");
+    modelField.append(element("span", "ai-model-label", "Model"));
+
+    const picker = element("div", "model-picker");
+    const trigger = element("button", "model-picker-summary");
+    trigger.type = "button";
+    trigger.setAttribute("aria-label", `Choose model on ${server.name}`);
+    trigger.setAttribute("aria-haspopup", "listbox");
+    trigger.setAttribute("aria-expanded", "false");
+    const summaryValue = element("span", "model-picker-value", selectedModel || "No models discovered");
+    trigger.append(
+      element("span", "model-picker-dot", ""),
+      summaryValue,
+      element("span", "model-picker-chevron", "⌄"),
+    );
+
+    const menu = element("div", "model-picker-menu");
+    menu.dataset.modelPopover = "true";
+    menu.setAttribute("popover", "manual");
+    menu.setAttribute("role", "listbox");
+    menu.setAttribute("aria-label", `Models on ${server.name}`);
+    const optionList = element("div", "model-picker-options");
+
+    const use = element("button", server.active ? "ai-model-use" : "ai-model-use primary", server.active ? "Selected" : "Use model");
     use.type = "button";
-    use.disabled = server.active && select.value === server.selected_model;
-    select.addEventListener("change", () => {
-      const selected = server.active && select.value === server.selected_model;
-      use.disabled = selected;
-      use.textContent = selected ? "Selected" : "Use model";
-      use.classList.toggle("primary", !selected);
+
+    const updateUseButton = () => {
+      const isCurrent = server.active && selectedModel === server.selected_model;
+      use.disabled = !selectedModel || isCurrent;
+      use.textContent = isCurrent ? "Selected" : "Use model";
+      use.classList.toggle("primary", Boolean(selectedModel) && !isCurrent);
+    };
+
+    let noResults = null;
+    if (models.length) {
+      if (models.length > 8) {
+        const searchWrap = element("div", "model-picker-search-wrap");
+        const search = element("input", "model-picker-search");
+        search.type = "search";
+        search.placeholder = `Search ${models.length} models…`;
+        search.setAttribute("aria-label", `Search models on ${server.name}`);
+        search.autocomplete = "off";
+        searchWrap.append(search);
+        menu.append(searchWrap);
+        noResults = element("div", "model-picker-no-results hidden", "No matching models");
+        search.addEventListener("input", () => {
+          const query = search.value.trim().toLowerCase();
+          let visible = 0;
+          for (const item of optionList.querySelectorAll(".model-picker-option")) {
+            const match = !query || item.dataset.model.toLowerCase().includes(query);
+            item.classList.toggle("hidden", !match);
+            if (match) visible += 1;
+          }
+          noResults.classList.toggle("hidden", visible !== 0);
+        });
+      }
+      for (const model of models) {
+        const option = element("button", `model-picker-option${model === selectedModel ? " selected" : ""}`);
+        option.type = "button";
+        option.dataset.model = model;
+        option.setAttribute("role", "option");
+        option.setAttribute("aria-selected", String(model === selectedModel));
+        option.append(
+          element("span", "model-picker-option-name", model),
+          element("span", "model-picker-check", model === selectedModel ? "✓" : ""),
+        );
+        option.addEventListener("click", () => {
+          selectedModel = model;
+          summaryValue.textContent = model;
+          for (const item of optionList.querySelectorAll(".model-picker-option")) {
+            const chosen = item === option;
+            item.classList.toggle("selected", chosen);
+            item.setAttribute("aria-selected", String(chosen));
+            item.querySelector(".model-picker-check").textContent = chosen ? "✓" : "";
+          }
+          updateUseButton();
+          closeModelPicker(true);
+        });
+        optionList.append(option);
+      }
+      if (noResults) optionList.append(noResults);
+    } else {
+      optionList.append(element("div", "model-picker-empty", "No models cached yet. Choose Refresh to query this server."));
+    }
+
+    menu.append(optionList);
+    trigger.addEventListener("click", event => {
+      event.preventDefault();
+      openModelPicker(trigger, menu);
     });
-    use.addEventListener("click", () => void selectAIModel(server.server_id, select.value, use));
-    modelRow.append(select, use);
+    picker.append(trigger);
+    popovers.push(menu);
+    modelField.append(picker);
+    updateUseButton();
+    use.addEventListener("click", () => void selectAIModel(server.server_id, selectedModel, use));
+    modelRow.append(modelField, use);
     card.append(details, actions, modelRow);
     fragment.append(card);
   }
   aiServerList.replaceChildren(fragment);
+  // Keep model popovers as DOM descendants of the modal dialog. A modal <dialog>
+  // makes everything outside itself inert; appending these to document.body made
+  // the top-layer menu visible but unable to receive pointer interaction. Popover
+  // rendering still lifts the menu out of the dialog's clipping/scrolling region.
+  for (const menu of popovers) aiConfigDialog.append(menu);
   renderAIHeader();
 }
 
@@ -637,7 +823,7 @@ function openAIServerForm(server = null) {
   aiServerEndpoint.value = server?.endpoint_url || "";
   aiServerKey.value = "";
   aiKeyNote.textContent = server?.has_api_key ? "(leave blank to keep saved key)" : "(optional)";
-  aiConfigFeedback.textContent = "";
+  setAIConfigFeedback();
   aiServerForm.classList.remove("hidden");
   aiServerAdd.classList.add("hidden");
   aiServerName.focus();
@@ -646,17 +832,18 @@ function openAIServerForm(server = null) {
 function closeAIServerForm() {
   aiServerForm.classList.add("hidden");
   aiServerAdd.classList.remove("hidden");
-  aiConfigFeedback.textContent = "";
+  setAIConfigFeedback();
 }
 
-async function refreshAIConfig(discover = false) {
+async function refreshAIConfig(discover = false, preserveOpenDialog = false) {
   try {
     const result = await getJson("/v1/ai/config");
     aiServers = Array.isArray(result.servers) ? result.servers : [];
-    renderAIConfig();
+    if (preserveOpenDialog && aiConfigDialog.open) renderAIHeader();
+    else renderAIConfig();
     if (discover && !aiConfigBusy && aiServers.length) {
       aiConfigBusy = true;
-      await Promise.allSettled(aiServers.map(server => refreshAIModels(server.server_id)));
+      await Promise.allSettled(aiServers.map(server => refreshAIModels(server.server_id, null, true)));
       aiConfigBusy = false;
     }
   } catch (_) {
@@ -664,15 +851,16 @@ async function refreshAIConfig(discover = false) {
   }
 }
 
-async function refreshAIModels(serverId, button = null) {
+async function refreshAIModels(serverId, button = null, preserveOpenDialog = false) {
   if (button) button.disabled = true;
   try {
     const result = await aiWrite(`/v1/ai/servers/${encodeURIComponent(serverId)}/models`);
     const index = aiServers.findIndex(server => server.server_id === serverId);
     if (index >= 0) aiServers[index] = result.server;
-    renderAIConfig();
+    if (preserveOpenDialog && aiConfigDialog.open) renderAIHeader();
+    else renderAIConfig();
   } catch (error) {
-    aiConfigFeedback.textContent = error.message || "Could not query models.";
+    setAIConfigFeedback(error.message || "Could not query models.", "error");
   } finally {
     if (button?.isConnected) button.disabled = false;
   }
@@ -680,13 +868,13 @@ async function refreshAIModels(serverId, button = null) {
 
 async function selectAIModel(serverId, model, button) {
   button.disabled = true;
-  aiConfigFeedback.textContent = "Selecting model…";
+  setAIConfigFeedback("Updating model…", "info");
   try {
     await aiWrite("/v1/ai/selection", { server_id: serverId, model });
     await refreshAIConfig(false);
-    aiConfigFeedback.textContent = "Model selected globally for Web UI and CLI.";
+    setAIConfigFeedback("Model updated", "success", true);
   } catch (error) {
-    aiConfigFeedback.textContent = error.message || "Could not select model.";
+    setAIConfigFeedback(error.message || "Could not select model.", "error");
     button.disabled = false;
   }
 }
@@ -697,7 +885,7 @@ async function deleteAIServer(server) {
     await aiWrite(`/v1/ai/servers/${encodeURIComponent(server.server_id)}`, {}, "DELETE");
     await refreshAIConfig(false);
   } catch (error) {
-    aiConfigFeedback.textContent = error.message || "Could not delete AI server.";
+    setAIConfigFeedback(error.message || "Could not delete AI server.", "error");
   }
 }
 
@@ -1186,7 +1374,9 @@ function renderMessage(message, index, results = []) {
   const row = element("article", `message-row ${role}`);
   const stack = element("div", "message-stack");
   const labels = { user: "You", assistant: "Brain", tool: "Tool result", system: "Target" };
-  stack.append(element("div", "message-label", labels[role] || role));
+  const label = element("div", "message-label", labels[role] || role);
+  if (message.ui?.stopped) label.append(element("span", "message-stopped", "Stopped"));
+  stack.append(label);
   if (message.ui?.reasoning) {
     stack.append(renderReasoning(message.ui.reasoning, `message:${index}:thinking`));
   }
@@ -2000,20 +2190,26 @@ function renderDetail(detail) {
 
 function renderComposer(detail) {
   const state = sessionState(detail.session_id);
+  if (!detail.active) state.stopBusy = false;
   loadDraft(detail.session_id);
   const aiReady = aiServers.some(server => server.active && server.selected_model);
   const unavailable = detail.archived || detail.active || state.messageBusy
     || state.branchBusy || state.commandBusy || !connected || !aiReady;
   messageForm.classList.toggle("hidden", currentView !== "conversations");
   messageInput.disabled = detail.archived;
+  messageSend.classList.toggle("hidden", detail.active);
+  messageStop.classList.toggle("hidden", !detail.active);
+  messageStop.disabled = state.stopBusy || !connected;
   messageSend.disabled = unavailable || !messageInput.value.trim();
   messageSend.textContent = state.messageBusy ? "Sending…"
     : state.branchBusy ? "Switching…" : state.commandBusy ? "Working…" : "Send";
   messageHint.classList.toggle("error", Boolean(state.failure));
   if (state.failure) messageHint.textContent = state.failure;
+  else if (state.notice && !detail.active) messageHint.textContent = state.notice;
   else if (detail.archived) messageHint.textContent = "Restore conversation before replying.";
   else if (!connected) messageHint.textContent = "Reconnecting. Your draft is kept here.";
-  else if (detail.active) messageHint.textContent = "Brain is replying. You can draft your next message.";
+  else if (detail.active) messageHint.textContent = state.stopBusy
+    ? "Stopping generation…" : "Brain is replying. You can draft your next message.";
   else if (detail.status === "awaiting_tool_results") messageHint.textContent = detail.pending_tool_calls?.some(call => call.ui?.remote)
     ? "Review command above, or send a new instruction to cancel it." : "Sending cancels pending terminal commands.";
   else if (detail.status === "continuation_pending") messageHint.textContent = "Send an instruction to resume this interrupted conversation.";
@@ -2134,6 +2330,7 @@ async function sendWebMessage() {
   }
   saveDraft();
   state.failure = "";
+  state.notice = "";
   state.messageBusy = true;
   let accepted = false;
   renderComposer(currentDetail);
@@ -2163,6 +2360,30 @@ async function sendWebMessage() {
       : `${error.message || "Could not send message."} Draft kept. Check the transcript before retrying.`;
   } finally {
     state.messageBusy = false;
+    if (currentDetail?.session_id === sessionId) renderComposer(currentDetail);
+  }
+}
+
+async function stopGeneration() {
+  if (!currentDetail?.active) return;
+  const sessionId = currentDetail.session_id;
+  const state = sessionState(sessionId);
+  if (state.stopBusy) return;
+  state.stopBusy = true;
+  state.failure = "";
+  renderComposer(currentDetail);
+  try {
+    const response = await fetch(`/v1/conversations/${encodeURIComponent(sessionId)}/stop`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: "{}",
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    state.notice = "Generation stopped. Send a message to continue.";
+    if (currentDetail?.session_id === sessionId) renderComposer(currentDetail);
+  } catch (error) {
+    state.stopBusy = false;
+    state.failure = error.message || "Could not stop generation.";
     if (currentDetail?.session_id === sessionId) renderComposer(currentDetail);
   }
 }
@@ -2392,7 +2613,7 @@ async function refreshMemories() {
 }
 
 async function refreshDashboard() {
-  void refreshAIConfig(false);
+  void refreshAIConfig(false, true);
   if (currentView === "servers") await refreshServers();
   else if (currentView === "memories") await refreshMemories();
   else await refreshList();
@@ -2437,7 +2658,7 @@ aiServerForm.addEventListener("submit", async event => {
   event.preventDefault();
   if (aiServerSave.disabled) return;
   aiServerSave.disabled = true;
-  aiConfigFeedback.textContent = "Querying available models…";
+  setAIConfigFeedback("Checking models…", "info");
   const id = aiServerId.value;
   const payload = {
     name: aiServerName.value,
@@ -2448,9 +2669,9 @@ aiServerForm.addEventListener("submit", async event => {
     await aiWrite(id ? `/v1/ai/servers/${encodeURIComponent(id)}` : "/v1/ai/servers", payload);
     closeAIServerForm();
     await refreshAIConfig(false);
-    aiConfigFeedback.textContent = id ? "AI server updated." : "AI server added. Models discovered.";
+    setAIConfigFeedback(id ? "Server updated" : "Server added", "success", true);
   } catch (error) {
-    aiConfigFeedback.textContent = error.message || "Could not save AI server.";
+    setAIConfigFeedback(error.message || "Could not save AI server.", "error");
   } finally {
     aiServerSave.disabled = false;
   }
@@ -2490,6 +2711,7 @@ messageForm.addEventListener("submit", (event) => {
   event.preventDefault();
   void sendWebMessage();
 });
+messageStop.addEventListener("click", () => void stopGeneration());
 memoryForm.addEventListener("submit", (event) => {
   event.preventDefault();
   void saveMemoryFromDialog();
@@ -2645,13 +2867,21 @@ addServerDialog.addEventListener("close", () => {
     addServerButton.focus();
   }
 });
-aiConfigDialog.addEventListener("close", () => aiConfigButton.focus());
+aiConfigDialog.addEventListener("close", () => { closeModelPicker(false); aiConfigButton.focus(); });
 document.addEventListener("click", event => {
   if (!conversationMenu.contains(event.target)) conversationMenu.open = false;
   if (!runnerPicker.contains(event.target)) runnerPicker.open = false;
   if (!themePicker.contains(event.target)) themePicker.open = false;
+  if (activeModelMenu && !activeModelMenu.contains(event.target) && !activeModelTrigger?.contains(event.target)) {
+    closeModelPicker(false);
+  }
 });
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && activeModelMenu) {
+    event.preventDefault();
+    closeModelPicker(true);
+    return;
+  }
   if (event.key === "Escape") {
     const popupOpen = conversationMenu.open || runnerPicker.open || themePicker.open;
     conversationMenu.open = false;
@@ -2668,6 +2898,8 @@ document.addEventListener("keydown", event => {
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
   }
 });
+window.addEventListener("resize", positionModelPicker);
+aiConfigDialog.addEventListener("scroll", positionModelPicker, { passive: true });
 matchMedia("(max-width: 899px)").addEventListener("change", () => setSidebar(false, false));
 setSidebar(false, false);
 renderView();

@@ -177,6 +177,7 @@ SERVER_NAME_PATH_RE = re.compile(r"^/v1/servers/([^/]+)/name$")
 CONVERSATION_PATH_RE = re.compile(r"^/v1/conversations/([A-Za-z0-9_-]{32})$")
 CONVERSATION_EVENTS_RE = re.compile(r"^/v1/conversations/([A-Za-z0-9_-]{32})/events$")
 CONVERSATION_TURN_RE = re.compile(r"^/v1/conversations/([A-Za-z0-9_-]{32})/turns$")
+CONVERSATION_STOP_RE = re.compile(r"^/v1/conversations/([A-Za-z0-9_-]{32})/stop$")
 CONVERSATION_BRANCH_RE = re.compile(
     r"^/v1/conversations/([A-Za-z0-9_-]{32})/branches/([A-Za-z0-9_-]{32})$"
 )
@@ -224,6 +225,48 @@ INTERRUPTED_CONTINUATION = "Your session was interrupted, continue"
 
 class BrainError(Exception):
     """Expected request, state, configuration, or upstream error."""
+
+
+class TurnCancelled(Exception):
+    """Internal signal raised when a user stops an active generation."""
+
+
+class TurnCancellation:
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._guard = threading.Lock()
+        self._response: Any = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise TurnCancelled()
+
+    def bind(self, response: Any) -> None:
+        with self._guard:
+            self._response = response
+            cancelled = self.cancelled
+        if cancelled:
+            response.close()
+            raise TurnCancelled()
+
+    def unbind(self, response: Any) -> None:
+        with self._guard:
+            if self._response is response:
+                self._response = None
+
+    def cancel(self) -> None:
+        self._event.set()
+        with self._guard:
+            response = self._response
+        if response is not None:
+            try:
+                response.close()
+            except (OSError, ValueError):
+                pass
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -999,6 +1042,7 @@ class LLMClient:
         include_tools: bool = True,
         include_memory_tools: bool = True,
         model_name: str | None = None,
+        cancellation: TurnCancellation | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         upstream_messages = prepare_upstream_messages(messages)
         payload: dict[str, Any] = {
@@ -1029,11 +1073,18 @@ class LLMClient:
         content_parts: list[str] = []
         tool_call_slots: list[dict[str, Any] | None] = []
         done = False
+        response: Any = None
         try:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             with urlopen(request, timeout=self.config.llm_timeout_seconds) as response:
+                if cancellation is not None:
+                    cancellation.bind(response)
                 if response.status < 200 or response.status >= 300:
                     raise BrainError(f"LLM returned HTTP {response.status}")
                 for raw_line in response:
+                    if cancellation is not None:
+                        cancellation.raise_if_cancelled()
                     try:
                         line = raw_line.decode("utf-8").rstrip("\r\n")
                     except UnicodeError as error:
@@ -1091,7 +1142,22 @@ class LLMClient:
             raise BrainError(f"cannot reach LLM: {error.reason}") from error
         except TimeoutError as error:
             raise BrainError("LLM request timed out") from error
+        except (OSError, ValueError) as error:
+            if cancellation is not None and cancellation.cancelled:
+                raise TurnCancelled() from error
+            raise BrainError(f"cannot read LLM stream: {error}") from error
+        except Exception as error:
+            # Closing urllib's response from another thread can surface
+            # implementation-specific exceptions from its buffered iterator.
+            if cancellation is not None and cancellation.cancelled:
+                raise TurnCancelled() from error
+            raise
+        finally:
+            if cancellation is not None and response is not None:
+                cancellation.unbind(response)
 
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         if not done:
             raise BrainError("LLM returned incomplete SSE stream")
         if any(call is None for call in tool_call_slots):
@@ -2865,6 +2931,55 @@ class BrainService:
         self._runner_guard = threading.Lock()
         self._active_runner_requests: dict[str, int] = {}
         self._runner_monitor_stop = threading.Event()
+        self._cancellation_guard = threading.Lock()
+        self._turn_cancellations: dict[str, TurnCancellation] = {}
+
+    def start_turn_cancellation(self, session_id: str) -> TurnCancellation:
+        cancellation = TurnCancellation()
+        with self._cancellation_guard:
+            self._turn_cancellations[session_id] = cancellation
+        return cancellation
+
+    def finish_turn_cancellation(
+        self, session_id: str, cancellation: TurnCancellation
+    ) -> None:
+        with self._cancellation_guard:
+            if self._turn_cancellations.get(session_id) is cancellation:
+                del self._turn_cancellations[session_id]
+
+    def stop_generation(self, session_id: str) -> bool:
+        self.store.get(session_id)
+        with self._cancellation_guard:
+            cancellation = self._turn_cancellations.get(session_id)
+        if cancellation is None:
+            return False
+        cancellation.cancel()
+        return True
+
+    def save_stopped_turn(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        emit: Callable[[str, dict[str, Any]], None],
+    ) -> None:
+        live = self.live_turns.get(session_id) or {}
+        reasoning = live.get("reasoning", "")
+        content = live.get("content", "")
+        if reasoning or content:
+            assistant: dict[str, Any] = {
+                "role": "assistant",
+                "content": content or None,
+                "ui": {"stopped": True},
+            }
+            if reasoning:
+                assistant["ui"]["reasoning"] = reasoning
+            messages.append(assistant)
+        with self.live_turns._guard:
+            self.store.save(session_id, messages, "ready", [], 0)
+            self.live_turns.remove(session_id)
+        self.store.apply_pending_runner(session_id)
+        self.live_turns.changed(session_id)
+        emit("done", {"stopped": True})
 
     @staticmethod
     def public_session(session: dict[str, Any]) -> dict[str, Any]:
@@ -3515,6 +3630,7 @@ class BrainService:
         lock = self.locks.acquire(session_id)
         if lock is None:
             raise BrainError("another turn is already running for this session")
+        cancellation = self.start_turn_cancellation(session_id)
         live_started = False
         downstream_open = True
         try:
@@ -3634,7 +3750,12 @@ class BrainService:
                         self.model_messages(messages, session["runner_id"]),
                         tracked_emit,
                         include_tools=True,
+                        cancellation=cancellation,
                     )
+                    cancellation.raise_if_cancelled()
+                except TurnCancelled:
+                    self.save_stopped_turn(session_id, messages, emit)
+                    return
                 except BrainError as error:
                     if str(error) == INTERRUPTED_RESPONSE_ERROR and reasoning_parts:
                         messages.append({
@@ -3665,6 +3786,7 @@ class BrainService:
         finally:
             if live_started:
                 self.live_turns.remove(session_id)
+            self.finish_turn_cancellation(session_id, cancellation)
             self.locks.release(session_id, lock)
 
     def run_turn(
@@ -3676,6 +3798,7 @@ class BrainService:
         lock = self.locks.acquire(session_id)
         if lock is None:
             raise BrainError("another turn is already running for this session")
+        cancellation = self.start_turn_cancellation(session_id)
         live_started = False
         downstream_open = True
         try:
@@ -3875,7 +3998,12 @@ class BrainService:
                         self.model_messages(messages, session["runner_id"]),
                         tracked_emit,
                         include_tools=include_tools,
+                        cancellation=cancellation,
                     )
+                    cancellation.raise_if_cancelled()
+                except TurnCancelled:
+                    self.save_stopped_turn(session_id, messages, emit)
+                    return
                 except BrainError as error:
                     if str(error) == INTERRUPTED_RESPONSE_ERROR and reasoning_parts:
                         messages.append({
@@ -3916,6 +4044,7 @@ class BrainService:
         finally:
             if live_started:
                 self.live_turns.remove(session_id)
+            self.finish_turn_cancellation(session_id, cancellation)
             self.locks.release(session_id, lock)
 
     def generate_conversation_title(
@@ -4577,6 +4706,36 @@ class BrainHandler(BaseHTTPRequestHandler):
                 self.send_error_json(HTTPStatus.BAD_REQUEST, str(error))
                 return
             self.change_server_name(server_ip)
+            return
+        stop_match = CONVERSATION_STOP_RE.fullmatch(self.path)
+        if stop_match:
+            if not self.server.web:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+                return
+            if not self.dashboard_write_allowed(require_json=True):
+                return
+            try:
+                self.read_json_body(allow_empty=True)
+                stopped = self.server.service.stop_generation(stop_match.group(1))
+            except KeyError:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "conversation not found")
+                return
+            except BrainError as error:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, str(error))
+                return
+            if not stopped:
+                self.send_error_json(
+                    HTTPStatus.CONFLICT, "conversation is not generating"
+                )
+                return
+            log_event(
+                "generation_stop_requested",
+                session_id=stop_match.group(1),
+                source_ip=normalize_ip(self.client_address[0]),
+            )
+            self.send_json(
+                HTTPStatus.ACCEPTED, {"stopping": True}, cache_control="no-store"
+            )
             return
         metadata_match = CONVERSATION_METADATA_RE.fullmatch(self.path)
         if metadata_match:

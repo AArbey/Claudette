@@ -166,8 +166,20 @@ async function noOverflow(page) {
     await page.locator('#message-send').click();
     await page.waitForFunction(() => currentDetail?.active);
     assert.equal(await page.locator('#message-input').isEnabled(), true);
+    await page.locator('#message-stop').waitFor();
+    assert.deepEqual(
+      await page.locator('#message-stop').evaluate(button => [getComputedStyle(button).width, getComputedStyle(button).height]),
+      ['46px', '46px'],
+    );
     await page.locator('#message-input').fill('Next question');
+    await page.locator('#message-stop').click();
     await page.waitForFunction(() => !currentDetail?.active && !sessionState().messageBusy);
+    await waitText(page, '#message-hint', 'Generation stopped');
+    assert.equal(await page.locator('.message-stopped').last().innerText(), 'Stopped');
+    assert.equal(await page.locator('#message-send').isEnabled(), true);
+    await page.locator('#message-send').click();
+    await page.waitForFunction(() => !currentDetail?.active && !sessionState().messageBusy);
+    await page.locator('#message-input').fill('Next question');
     assert.equal(await page.locator('#message-input').inputValue(), 'Next question');
     assert.equal(await page.locator('.reasoning').first().getAttribute('open'), '');
     await page.locator('.reasoning summary').first().click();
