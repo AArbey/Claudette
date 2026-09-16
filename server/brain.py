@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -297,7 +297,6 @@ class Config:
     client_brain_connect_timeout_seconds: int
     client_brain_request_timeout_seconds: int
     support_model_name: str = ""
-    model_context_tokens: int = 32768
     runner_script_path: Path = Path("/client/runner.sh")
     runner_installer_path: Path = Path("/client/install-runner.sh")
     runner_port_start: int = 8766
@@ -321,7 +320,6 @@ class Config:
             model_name="",
             brain_url=required("BRAIN_URL"),
             support_model_name="",
-            model_context_tokens=32768,
             bind_host=os.environ.get("BRAIN_BIND_HOST", "0.0.0.0"),
             port=int(os.environ.get("BRAIN_PORT", "8080")),
             web_port=int(os.environ.get("WEB_PORT", "8081")),
@@ -362,8 +360,6 @@ class Config:
             raise BrainError("WEB_PORT must differ from BRAIN_PORT")
         if config.runner_port_start > config.runner_port_end:
             raise BrainError("RUNNER_PORT_START must not exceed RUNNER_PORT_END")
-        if config.model_context_tokens < 1024:
-            raise BrainError("model context fallback must be at least 1024 tokens")
         return config
 
 
@@ -806,23 +802,11 @@ def estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
     return max(1, math.ceil(characters / 4))
 
 
-def llm_metadata_urls(endpoint_url: str, model_name: str) -> tuple[str, str, str]:
-    """Build llama.cpp props and OpenAI model-list URLs beside chat completions."""
+def llm_models_url(endpoint_url: str) -> str:
+    """Build model-list URL beside normalized chat-completions URL."""
     parsed = urlsplit(endpoint_url)
-    path = parsed.path.rstrip("/")
-    if path.endswith("/v1/chat/completions"):
-        root = path[: -len("/v1/chat/completions")]
-    elif path.endswith("/chat/completions"):
-        root = path[: -len("/chat/completions")]
-    else:
-        root = path.rsplit("/", 1)[0]
-    base = (parsed.scheme, parsed.netloc, root, "", "")
-    running = urlunsplit((*base[:2], root + "/running", "", ""))
-    props = urlunsplit(
-        (*base[:2], root + "/props", urlencode({"model": model_name}), "")
-    )
-    models = urlunsplit((*base[:2], root + "/v1/models", "", ""))
-    return running, props, models
+    path = parsed.path.removesuffix("/chat/completions") + "/models"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
 def normalize_llm_endpoint(endpoint_url: Any) -> str:
@@ -855,7 +839,7 @@ def discover_llm_models(
     endpoint_url: str, api_key: str, timeout_seconds: int
 ) -> list[str]:
     endpoint_url = normalize_llm_endpoint(endpoint_url)
-    models_url = llm_metadata_urls(endpoint_url, "")[2]
+    models_url = llm_models_url(endpoint_url)
     headers = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -898,57 +882,19 @@ def valid_context_window(value: Any) -> int | None:
     return value
 
 
-def context_window_from_props(payload: Any) -> int | None:
+def context_window_from_response(payload: Any) -> int | None:
+    """Read llama.cpp context size included in a completion response."""
     if not isinstance(payload, dict):
         return None
-    settings = payload.get("default_generation_settings")
-    if not isinstance(settings, dict):
-        return None
-    return valid_context_window(settings.get("n_ctx"))
-
-
-def model_is_running(payload: Any, model_name: str) -> bool:
-    if not isinstance(payload, dict) or not isinstance(payload.get("running"), list):
-        return False
-    return any(
-        isinstance(item, dict)
-        and item.get("model") == model_name
-        and item.get("state") == "ready"
-        for item in payload["running"]
+    verbose = payload.get("__verbose")
+    settings = verbose.get("generation_settings") if isinstance(verbose, dict) else None
+    candidates = (
+        payload.get("generation_settings/n_ctx"),
+        payload.get("n_ctx"),
+        settings.get("n_ctx") if isinstance(settings, dict) else None,
     )
-
-
-def context_window_from_models(payload: Any, model_name: str) -> int | None:
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        return None
-    record = next(
-        (
-            item for item in payload["data"]
-            if isinstance(item, dict) and item.get("id") == model_name
-        ),
-        None,
-    )
-    if record is None:
-        return None
-    candidates = [
-        record.get("context_length"),
-        record.get("context_window"),
-        record.get("max_context_length"),
-    ]
-    meta = record.get("meta")
-    if isinstance(meta, dict):
-        candidates.append(meta.get("n_ctx"))
-        llama_swap = meta.get("llamaswap")
-        if isinstance(llama_swap, dict):
-            candidates.extend(
-                llama_swap.get(key)
-                for key in ("n_ctx", "context", "context_length", "max_context_length")
-            )
-    capabilities = record.get("capabilities")
-    if isinstance(capabilities, dict):
-        candidates.append(capabilities.get("context"))
     return next(
-        (window for value in candidates if (window := valid_context_window(value))),
+        (value for item in candidates if (value := valid_context_window(item))),
         None,
     )
 
@@ -957,82 +903,13 @@ class LLMClient:
     def __init__(self, config: Config):
         self.config = config
         self._context_guard = threading.Lock()
-        self._context_tokens = config.model_context_tokens
-        self._context_source = "configured"
-        self._context_stale = True
-        self._context_refresh_after = 0.0
+        self._context_tokens: int | None = None
+        self._context_requested = False
 
-    def _get_json(self, url: str) -> Any:
-        headers = {"Accept": "application/json"}
-        if self.config.llm_api_key:
-            headers["Authorization"] = f"Bearer {self.config.llm_api_key}"
-        request = Request(url, headers=headers)
-        with urlopen(request, timeout=min(1, self.config.llm_timeout_seconds)) as response:
-            body = response.read(1024 * 1024 + 1)
-        if len(body) > 1024 * 1024:
-            raise BrainError("LLM metadata response is too large")
-        return json.loads(body)
-
-    def context_window(self) -> dict[str, Any]:
-        """Return cached runtime context, refreshing from upstream once per minute."""
-        now = time.monotonic()
+    def context_window(self) -> int | None:
+        """Return context size learned from first real completion."""
         with self._context_guard:
-            if now < self._context_refresh_after:
-                return {
-                    "tokens": self._context_tokens,
-                    "source": self._context_source,
-                    "stale": self._context_stale,
-                }
-
-            running_url, props_url, models_url = llm_metadata_urls(
-                self.config.llm_endpoint_url, self.config.model_name
-            )
-            resolved: int | None = None
-            source = ""
-            metadata_errors = (
-                BrainError, HTTPError, URLError, TimeoutError, OSError,
-                UnicodeError, json.JSONDecodeError,
-            )
-            try:
-                running = model_is_running(
-                    self._get_json(running_url), self.config.model_name
-                )
-            except metadata_errors:
-                running = False
-            if running:
-                try:
-                    resolved = context_window_from_props(self._get_json(props_url))
-                except metadata_errors:
-                    resolved = None
-                if resolved:
-                    source = "runtime"
-            if not resolved:
-                try:
-                    resolved = context_window_from_models(
-                        self._get_json(models_url), self.config.model_name
-                    )
-                except metadata_errors:
-                    resolved = None
-                if resolved:
-                    source = "models"
-
-            if resolved:
-                self._context_tokens = resolved
-                self._context_source = source
-                self._context_stale = False
-                self._context_refresh_after = now + 60
-            else:
-                self._context_stale = True
-                self._context_refresh_after = now + 10
-            return {
-                "tokens": self._context_tokens,
-                "source": self._context_source,
-                "stale": self._context_stale,
-            }
-
-    def invalidate_context_window(self) -> None:
-        with self._context_guard:
-            self._context_refresh_after = 0.0
+            return self._context_tokens
 
     def complete(
         self,
@@ -1052,6 +929,17 @@ class LLMClient:
             "messages": upstream_messages,
             "stream": True,
         }
+        with self._context_guard:
+            request_context = (
+                (model_name is None or model_name == self.config.model_name)
+                and not self._context_requested
+            )
+            if request_context:
+                self._context_requested = True
+        if request_context:
+            # llama.cpp includes generation_settings in this same streamed response.
+            # No metadata request means llama-swap loads model only for user's request.
+            payload["verbose"] = True
         tools = []
         if include_tools:
             tools.extend(COMMAND_TOOLS)
@@ -1107,6 +995,11 @@ class LLMClient:
                         raise BrainError("LLM returned invalid JSON in SSE event") from error
                     if not isinstance(event, dict):
                         raise BrainError("LLM SSE event must be an object")
+                    if request_context:
+                        context_tokens = context_window_from_response(event)
+                        if context_tokens:
+                            with self._context_guard:
+                                self._context_tokens = context_tokens
                     error_value = event.get("error")
                     if isinstance(error_value, dict) and error_value.get("message"):
                         raise BrainError(str(error_value["message"]))
@@ -1175,7 +1068,6 @@ class LLMClient:
         }
         if tool_calls:
             assistant["tool_calls"] = tool_calls
-        self.invalidate_context_window()
         return assistant, tool_calls
 
 class SessionStore:
@@ -2807,15 +2699,11 @@ class DynamicLLMClient:
     def complete(self, *args: Any, **kwargs: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         return self.current_client().complete(*args, **kwargs)
 
-    def context_window(self) -> dict[str, Any]:
+    def context_window(self) -> int | None:
         try:
             return self.current_client().context_window()
         except BrainError:
-            return {
-                "tokens": self.config.model_context_tokens,
-                "source": "unconfigured",
-                "stale": True,
-            }
+            return None
 
 
 class SessionLocks:
@@ -3100,22 +2988,15 @@ class BrainService:
             if live.get("content"):
                 context_messages.append({"role": "assistant", "content": live["content"]})
         used = estimate_message_tokens(prepare_upstream_messages(context_messages))
-        context_window = (
+        maximum = (
             self.llm.context_window()
             if hasattr(self.llm, "context_window")
-            else {
-                "tokens": self.config.model_context_tokens,
-                "source": "configured",
-                "stale": True,
-            }
+            else None
         )
-        maximum = context_window["tokens"]
         detail["context_usage"] = {
             "estimated_tokens": used,
             "max_tokens": maximum,
-            "percent": min(100, round(used * 100 / maximum)),
-            "max_tokens_source": context_window["source"],
-            "max_tokens_stale": context_window["stale"],
+            "percent": min(100, round(used * 100 / maximum)) if maximum else None,
         }
         return detail
 

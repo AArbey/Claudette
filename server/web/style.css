@@ -221,12 +221,12 @@ summary::marker { color: var(--muted); }
 .message-stop:hover:not(:disabled) { opacity: .86; }
 .message-stop:disabled { opacity: .55; }
 .composer-hint { grid-column: 1 / -1; color: var(--muted); font-size: 11px; min-height: 17px; }
-.context-meter { grid-column: 1 / -1; display:flex; align-items:center; gap:8px; color:var(--muted); font-size:10px; }
-.context-meter-track { flex:1; height:3px; overflow:hidden; border-radius:999px; background:var(--line); }
+.context-meter { grid-column: 1 / -1; display:flex; min-width:0; align-items:center; gap:8px; color:var(--muted); font-size:10px; }
+.context-meter-track { flex:1 1 auto; min-width:32px; height:3px; overflow:hidden; border-radius:999px; background:var(--line); }
 .context-meter-fill { display:block; width:0; height:100%; border-radius:inherit; background:var(--accent); transition:width .18s ease, background .18s ease; }
 .context-meter[data-level="warning"] .context-meter-fill { background:#d97706; }
 .context-meter[data-level="critical"] .context-meter-fill { background:var(--danger); }
-.context-meter-label { min-width:110px; text-align:right; font-variant-numeric:tabular-nums; }
+.context-meter-label { flex:0 0 auto; text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
 .context-add { align-self: end; width: 42px; height: 46px; min-width: 42px; font-size: 24px; }
 .context-dialog { width: min(520px, calc(100vw - 28px)); }
 .context-tabs { display:flex; gap:6px; margin: 12px 0; }
@@ -520,6 +520,7 @@ summary::marker { color: var(--muted); }
   .composer { padding: 12px 14px max(12px, env(safe-area-inset-bottom)); gap: 8px; }
   .composer textarea { font-size: 16px; }
   .composer-hint { font-size: 10px; }
+  .context-meter { gap:6px; font-size:9px; }
   .feedback, .connection-retry, .approval-banner { margin: 10px 14px 0; }
   .tool-summary { flex-wrap: wrap; }
   .command-badges { width: 100%; padding-left: 20px; }

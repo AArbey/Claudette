@@ -235,27 +235,32 @@ function resizeComposer() {
 }
 
 function compactTokens(value) {
-  if (value < 1000) return String(value);
-  return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)}k`;
+  if (value < 1024) return String(value);
+  const thousands = value / 1024;
+  return `${thousands.toFixed(thousands < 10 ? 1 : 0).replace(/\.0$/, "")}k`;
 }
 
 function renderContextMeter(detail) {
   const usage = detail?.context_usage || {};
-  const maximum = Number(usage.max_tokens) || 32768;
+  const maximum = Number(usage.max_tokens);
+  if (!Number.isFinite(maximum) || maximum < 1024) {
+    contextMeter.hidden = true;
+    contextMeterFill.style.width = "0";
+    contextMeterLabel.textContent = "";
+    return;
+  }
   const state = sessionState(detail?.session_id);
   const referenceCharacters = (state.references || []).reduce((total, ref) =>
     total + (typeof ref.snapshot === "string" ? ref.snapshot.length : Number(ref.context_chars) || 0), 0);
   const draftTokens = Math.ceil((messageInput.value.length + referenceCharacters) / 4);
   const used = (Number(usage.estimated_tokens) || 0) + draftTokens;
   const percent = Math.min(100, Math.round(used * 100 / maximum));
+  contextMeter.hidden = false;
   contextMeterFill.style.width = `${percent}%`;
   contextMeter.dataset.level = percent >= 90 ? "critical" : percent >= 75 ? "warning" : "normal";
   contextMeter.setAttribute("aria-valuenow", String(percent));
-  contextMeterLabel.textContent = `Context ${compactTokens(used)} / ${compactTokens(maximum)} · ${percent}%`;
-  const source = usage.max_tokens_source === "runtime" ? "live runtime"
-    : usage.max_tokens_source === "models" ? "model metadata" : "configured fallback";
-  const stale = usage.max_tokens_stale ? " (temporarily unavailable or stale)" : "";
-  contextMeter.title = `Estimated context usage: ${used.toLocaleString()} of ${maximum.toLocaleString()} tokens · Limit from ${source}${stale}`;
+  contextMeterLabel.textContent = `~${compactTokens(used)} / ${compactTokens(maximum)} · ${percent}%`;
+  contextMeter.title = `Estimated context usage: ${used.toLocaleString()} of ${maximum.toLocaleString()} tokens`;
 }
 
 function serverIpFromHash() {
