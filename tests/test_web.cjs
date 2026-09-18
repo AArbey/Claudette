@@ -53,12 +53,25 @@ async function noOverflow(page) {
     await waitText(page, '#ai-model-value', 'test-model');
     await page.getByRole('button', { name: 'Configure AI' }).click();
     await waitText(page, '#ai-server-list', 'Configured AI');
-    assert.equal(await page.locator('#ai-server-list .model-picker-value').innerText(), 'test-model');
-    await page.getByRole('button', { name: 'Choose model on Configured AI' }).click();
-    await page.locator('.model-picker-option[data-model="alternate-model"]').click();
+    const chatPicker = page.getByRole('button', { name: 'Choose model on Configured AI' });
+    const supportPicker = page.getByRole('button', { name: 'Choose support model on Configured AI' });
+    assert.equal(await chatPicker.locator('.model-picker-value').innerText(), 'test-model');
+    assert.equal(await supportPicker.locator('.model-picker-value').innerText(), 'test-model');
+    await chatPicker.click();
+    await page.getByRole('listbox', { name: 'Model options on Configured AI' })
+      .getByRole('option', { name: 'alternate-model' }).click();
     await page.getByRole('button', { name: 'Use model', exact: true }).click();
     await waitText(page, '#ai-model-value', 'alternate-model');
     await waitText(page, '#ai-config-feedback', 'Model updated');
+    await page.getByRole('button', { name: 'Choose support model on Configured AI' }).click();
+    await page.getByRole('listbox', { name: 'Support model options on Configured AI' })
+      .getByRole('option', { name: 'alternate-model' }).click();
+    await waitText(page, '#ai-config-feedback', 'Support model updated');
+    const waitForMain = page.getByRole('checkbox', { name: 'Wait for main LLM completion on Configured AI' });
+    assert.equal(await waitForMain.isChecked(), false);
+    await waitForMain.check();
+    await waitText(page, '#ai-config-feedback', 'Title timing updated');
+    assert.equal(await page.getByRole('checkbox', { name: 'Wait for main LLM completion on Configured AI' }).isChecked(), true);
     await noOverflow(page);
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     const mobilePage = await context.newPage();

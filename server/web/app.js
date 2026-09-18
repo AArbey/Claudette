@@ -710,6 +710,94 @@ function renderAIHeader() {
   if (currentDetail && currentView === "conversations") renderComposer(currentDetail);
 }
 
+function createAIModelPicker(server, models, initialModel, label, note, onChoose) {
+  let selectedModel = models.includes(initialModel) ? initialModel : (models[0] || "");
+  const field = element("div", "ai-model-field");
+  const labelRow = element("div", "ai-model-label-row");
+  labelRow.append(element("span", "ai-model-label", label));
+  if (note) labelRow.append(element("span", "ai-model-note", note));
+  field.append(labelRow);
+
+  const picker = element("div", "model-picker");
+  const trigger = element("button", "model-picker-summary");
+  trigger.type = "button";
+  trigger.setAttribute("aria-label", `Choose ${label.toLowerCase()} on ${server.name}`);
+  trigger.setAttribute("aria-haspopup", "listbox");
+  trigger.setAttribute("aria-expanded", "false");
+  const summaryValue = element("span", "model-picker-value", selectedModel || "No models discovered");
+  trigger.append(
+    element("span", "model-picker-dot", ""),
+    summaryValue,
+    element("span", "model-picker-chevron", "⌄"),
+  );
+
+  const menu = element("div", "model-picker-menu");
+  menu.dataset.modelPopover = "true";
+  menu.setAttribute("popover", "manual");
+  menu.setAttribute("role", "listbox");
+  menu.setAttribute("aria-label", `${label} options on ${server.name}`);
+  const optionList = element("div", "model-picker-options");
+  let noResults = null;
+  if (models.length) {
+    if (models.length > 8) {
+      const searchWrap = element("div", "model-picker-search-wrap");
+      const search = element("input", "model-picker-search");
+      search.type = "search";
+      search.placeholder = `Search ${models.length} models…`;
+      search.setAttribute("aria-label", `Search ${label.toLowerCase()} options on ${server.name}`);
+      search.autocomplete = "off";
+      searchWrap.append(search);
+      menu.append(searchWrap);
+      noResults = element("div", "model-picker-no-results hidden", "No matching models");
+      search.addEventListener("input", () => {
+        const query = search.value.trim().toLowerCase();
+        let visible = 0;
+        for (const item of optionList.querySelectorAll(".model-picker-option")) {
+          const match = !query || item.dataset.model.toLowerCase().includes(query);
+          item.classList.toggle("hidden", !match);
+          if (match) visible += 1;
+        }
+        noResults.classList.toggle("hidden", visible !== 0);
+      });
+    }
+    for (const model of models) {
+      const option = element("button", `model-picker-option${model === selectedModel ? " selected" : ""}`);
+      option.type = "button";
+      option.dataset.model = model;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", String(model === selectedModel));
+      option.append(
+        element("span", "model-picker-option-name", model),
+        element("span", "model-picker-check", model === selectedModel ? "✓" : ""),
+      );
+      option.addEventListener("click", () => {
+        selectedModel = model;
+        summaryValue.textContent = model;
+        for (const item of optionList.querySelectorAll(".model-picker-option")) {
+          const chosen = item === option;
+          item.classList.toggle("selected", chosen);
+          item.setAttribute("aria-selected", String(chosen));
+          item.querySelector(".model-picker-check").textContent = chosen ? "✓" : "";
+        }
+        closeModelPicker(true);
+        onChoose(model);
+      });
+      optionList.append(option);
+    }
+    if (noResults) optionList.append(noResults);
+  } else {
+    optionList.append(element("div", "model-picker-empty", "No models cached yet. Choose Refresh to query this server."));
+  }
+  menu.append(optionList);
+  trigger.addEventListener("click", event => {
+    event.preventDefault();
+    openModelPicker(trigger, menu);
+  });
+  picker.append(trigger);
+  field.append(picker);
+  return { field, menu, selectedModel: () => selectedModel };
+}
+
 function renderAIConfig() {
   closeModelPicker(false);
   document.querySelectorAll('.model-picker-menu[data-model-popover="true"]').forEach(node => node.remove());
@@ -741,105 +829,58 @@ function renderAIConfig() {
     actions.append(edit, refresh, remove);
 
     const models = Array.isArray(server.models) ? server.models : [];
-    let selectedModel = models.includes(server.selected_model) ? server.selected_model : (models[0] || "");
     const modelRow = element("div", "ai-server-model-row");
-    const modelField = element("div", "ai-model-field");
-    modelField.append(element("span", "ai-model-label", "Model"));
-
-    const picker = element("div", "model-picker");
-    const trigger = element("button", "model-picker-summary");
-    trigger.type = "button";
-    trigger.setAttribute("aria-label", `Choose model on ${server.name}`);
-    trigger.setAttribute("aria-haspopup", "listbox");
-    trigger.setAttribute("aria-expanded", "false");
-    const summaryValue = element("span", "model-picker-value", selectedModel || "No models discovered");
-    trigger.append(
-      element("span", "model-picker-dot", ""),
-      summaryValue,
-      element("span", "model-picker-chevron", "⌄"),
+    let updateUseButton = () => {};
+    const modelPicker = createAIModelPicker(
+      server,
+      models,
+      server.selected_model,
+      "Model",
+      "Chat",
+      () => updateUseButton(),
     );
-
-    const menu = element("div", "model-picker-menu");
-    menu.dataset.modelPopover = "true";
-    menu.setAttribute("popover", "manual");
-    menu.setAttribute("role", "listbox");
-    menu.setAttribute("aria-label", `Models on ${server.name}`);
-    const optionList = element("div", "model-picker-options");
-
     const use = element("button", server.active ? "ai-model-use" : "ai-model-use primary", server.active ? "Selected" : "Use model");
     use.type = "button";
-
-    const updateUseButton = () => {
+    updateUseButton = () => {
+      const selectedModel = modelPicker.selectedModel();
       const isCurrent = server.active && selectedModel === server.selected_model;
       use.disabled = !selectedModel || isCurrent;
       use.textContent = isCurrent ? "Selected" : "Use model";
       use.classList.toggle("primary", Boolean(selectedModel) && !isCurrent);
     };
-
-    let noResults = null;
-    if (models.length) {
-      if (models.length > 8) {
-        const searchWrap = element("div", "model-picker-search-wrap");
-        const search = element("input", "model-picker-search");
-        search.type = "search";
-        search.placeholder = `Search ${models.length} models…`;
-        search.setAttribute("aria-label", `Search models on ${server.name}`);
-        search.autocomplete = "off";
-        searchWrap.append(search);
-        menu.append(searchWrap);
-        noResults = element("div", "model-picker-no-results hidden", "No matching models");
-        search.addEventListener("input", () => {
-          const query = search.value.trim().toLowerCase();
-          let visible = 0;
-          for (const item of optionList.querySelectorAll(".model-picker-option")) {
-            const match = !query || item.dataset.model.toLowerCase().includes(query);
-            item.classList.toggle("hidden", !match);
-            if (match) visible += 1;
-          }
-          noResults.classList.toggle("hidden", visible !== 0);
-        });
-      }
-      for (const model of models) {
-        const option = element("button", `model-picker-option${model === selectedModel ? " selected" : ""}`);
-        option.type = "button";
-        option.dataset.model = model;
-        option.setAttribute("role", "option");
-        option.setAttribute("aria-selected", String(model === selectedModel));
-        option.append(
-          element("span", "model-picker-option-name", model),
-          element("span", "model-picker-check", model === selectedModel ? "✓" : ""),
-        );
-        option.addEventListener("click", () => {
-          selectedModel = model;
-          summaryValue.textContent = model;
-          for (const item of optionList.querySelectorAll(".model-picker-option")) {
-            const chosen = item === option;
-            item.classList.toggle("selected", chosen);
-            item.setAttribute("aria-selected", String(chosen));
-            item.querySelector(".model-picker-check").textContent = chosen ? "✓" : "";
-          }
-          updateUseButton();
-          closeModelPicker(true);
-        });
-        optionList.append(option);
-      }
-      if (noResults) optionList.append(noResults);
-    } else {
-      optionList.append(element("div", "model-picker-empty", "No models cached yet. Choose Refresh to query this server."));
-    }
-
-    menu.append(optionList);
-    trigger.addEventListener("click", event => {
-      event.preventDefault();
-      openModelPicker(trigger, menu);
-    });
-    picker.append(trigger);
-    popovers.push(menu);
-    modelField.append(picker);
     updateUseButton();
-    use.addEventListener("click", () => void selectAIModel(server.server_id, selectedModel, use));
-    modelRow.append(modelField, use);
-    card.append(details, actions, modelRow);
+    use.addEventListener("click", () => void selectAIModel(server.server_id, modelPicker.selectedModel(), use));
+    modelRow.append(modelPicker.field, use);
+
+    const supportRow = element("div", "ai-server-support-row");
+    const supportPicker = createAIModelPicker(
+      server,
+      models,
+      server.support_model || server.selected_model,
+      "Support model",
+      "Conversation names",
+      model => {
+        if (model !== server.support_model) void selectAISupportModel(server.server_id, model);
+      },
+    );
+    const waitToggle = element("label", "ai-support-wait");
+    const waitInput = element("input", "ai-support-wait-input");
+    waitInput.type = "checkbox";
+    waitInput.checked = Boolean(server.support_wait_for_main);
+    waitInput.setAttribute("aria-label", `Wait for main LLM completion on ${server.name}`);
+    const waitCopy = element("span", "ai-support-wait-copy");
+    waitCopy.append(
+      element("strong", "", "Wait for main LLM completion"),
+      element("span", "", "Generate title after first answer finishes"),
+    );
+    waitInput.addEventListener("change", () => {
+      waitInput.disabled = true;
+      void setAISupportWait(server.server_id, waitInput.checked);
+    });
+    waitToggle.append(waitInput, waitCopy);
+    supportRow.append(supportPicker.field, waitToggle);
+    popovers.push(modelPicker.menu, supportPicker.menu);
+    card.append(details, actions, modelRow, supportRow);
     fragment.append(card);
   }
   aiServerList.replaceChildren(fragment);
@@ -908,6 +949,33 @@ async function selectAIModel(serverId, model, button) {
   } catch (error) {
     setAIConfigFeedback(error.message || "Could not select model.", "error");
     button.disabled = false;
+  }
+}
+
+async function selectAISupportModel(serverId, model) {
+  setAIConfigFeedback("Updating support model…", "info");
+  try {
+    await aiWrite("/v1/ai/support-selection", { server_id: serverId, model });
+    await refreshAIConfig(false);
+    setAIConfigFeedback("Support model updated", "success", true);
+  } catch (error) {
+    await refreshAIConfig(false);
+    setAIConfigFeedback(error.message || "Could not select support model.", "error");
+  }
+}
+
+async function setAISupportWait(serverId, waitForMain) {
+  setAIConfigFeedback("Updating title timing…", "info");
+  try {
+    await aiWrite("/v1/ai/support-settings", {
+      server_id: serverId,
+      wait_for_main: waitForMain,
+    });
+    await refreshAIConfig(false);
+    setAIConfigFeedback("Title timing updated", "success", true);
+  } catch (error) {
+    await refreshAIConfig(false);
+    setAIConfigFeedback(error.message || "Could not update title timing.", "error");
   }
 }
 

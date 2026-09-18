@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 from contextlib import closing
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 from urllib.request import Request, urlopen
@@ -25,9 +26,7 @@ sys.modules[SPEC.name] = brain
 SPEC.loader.exec_module(brain)
 
 
-def config(
-    root: Path, *, max_tool_rounds: int = 8, support_model_name: str = ""
-):
+def config(root: Path, *, max_tool_rounds: int = 8):
     return brain.Config(
         llm_endpoint_url="http://127.0.0.1:1/v1/chat/completions",
         llm_api_key="",
@@ -49,7 +48,6 @@ def config(
         client_max_tool_output_bytes=65536,
         client_brain_connect_timeout_seconds=10,
         client_brain_request_timeout_seconds=30,
-        support_model_name=support_model_name,
         runner_script_path=ROOT / "client" / "runner.sh",
         runner_installer_path=ROOT / "client" / "install-runner.sh",
     )
@@ -78,6 +76,7 @@ class FakeLLM:
         self.responses = list(responses)
         self.seen_messages = []
         self.seen_include_tools = []
+        self.seen_model_names = []
 
     def complete(
         self, messages, emit, *, include_tools=True, model_name=None,
@@ -85,6 +84,7 @@ class FakeLLM:
     ):
         self.seen_messages.append(json.loads(json.dumps(messages)))
         self.seen_include_tools.append(include_tools)
+        self.seen_model_names.append(model_name)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -563,12 +563,22 @@ class StoreAndServiceTests(unittest.TestCase):
             public = service.store.list_ai_servers()
             self.assertNotIn("api_key", public[0])
             self.assertTrue(public[0]["has_api_key"])
+            self.assertEqual(first["support_model"], "one")
+            self.assertFalse(first["support_wait_for_main"])
             self.assertEqual(service.llm.current_client().config.model_name, "one")
 
+            service.store.select_ai_support_model(second["server_id"], "three")
+            service.store.set_ai_support_wait(second["server_id"], True)
             service.store.select_ai_model(second["server_id"], "three")
             selected = service.llm.current_client().config
             self.assertEqual(selected.model_name, "three")
             self.assertEqual(selected.llm_endpoint_url, second["endpoint_url"])
+            self.assertEqual(
+                service.store.active_ai_model()["support_model"], "three"
+            )
+            self.assertTrue(
+                service.store.active_ai_model()["support_wait_for_main"]
+            )
             self.assertNotEqual(first["server_id"], second["server_id"])
 
     def test_schema_8_adds_ai_servers(self):
@@ -584,7 +594,46 @@ class StoreAndServiceTests(unittest.TestCase):
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_servers'"
             ).fetchone())
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 9)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+
+    def test_schema_9_adds_support_model(self):
+        with closing(sqlite3.connect(":memory:")) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            brain.SessionStore.create_schema(connection)
+            connection.execute(
+                "ALTER TABLE ai_servers DROP COLUMN support_wait_for_main"
+            )
+            connection.execute("ALTER TABLE ai_servers DROP COLUMN support_model")
+            connection.execute(
+                "INSERT INTO ai_servers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "server", "Local", "http://llm.test/v1/chat/completions", "",
+                    '["chat","small"]', "chat", 1, "now", "now",
+                ),
+            )
+            brain.SessionStore.set_schema_version(connection, 9)
+            brain.SessionStore.migrate_schema(connection)
+            row = connection.execute(
+                "SELECT support_model FROM ai_servers WHERE id = 'server'"
+            ).fetchone()
+            self.assertEqual(row["support_model"], "chat")
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+
+    def test_schema_10_adds_support_wait_setting(self):
+        with closing(sqlite3.connect(":memory:")) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            brain.SessionStore.create_schema(connection)
+            connection.execute(
+                "ALTER TABLE ai_servers DROP COLUMN support_wait_for_main"
+            )
+            brain.SessionStore.set_schema_version(connection, 10)
+            brain.SessionStore.migrate_schema(connection)
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(ai_servers)")
+            }
+            self.assertIn("support_wait_for_main", columns)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
 
     def test_environment_ignores_legacy_ai_configuration(self):
         with patch.dict(os.environ, {
@@ -598,7 +647,7 @@ class StoreAndServiceTests(unittest.TestCase):
         self.assertEqual(loaded.llm_endpoint_url, "")
         self.assertEqual(loaded.llm_api_key, "")
         self.assertEqual(loaded.model_name, "")
-        self.assertEqual(loaded.support_model_name, "")
+        self.assertFalse(hasattr(loaded, "support_model_name"))
 
     def test_uploaded_file_content_is_sent_inline_not_as_host_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1047,7 +1096,7 @@ class StoreAndServiceTests(unittest.TestCase):
                 row["name"] for row in connection.execute("PRAGMA table_info(runners)")
             }
             self.assertIn("runner_version", columns)
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 9)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
 
     def test_message_branches_preserve_and_switch_responses(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1119,7 +1168,7 @@ class StoreAndServiceTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(session["active_branch_id"], branch["id"])
             self.assertEqual(branch["cwd"], "/srv")
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 9)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
 
     def test_summary_archive_and_newer_schema_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1220,16 +1269,24 @@ class StoreAndServiceTests(unittest.TestCase):
                 "cancelled",
             )
 
-    def test_title_uses_final_exchange_and_starts_after_done(self):
+    def test_title_uses_first_user_request_and_starts_after_main_request(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            service = brain.BrainService(
-                config(root, support_model_name="title-model"), "system"
+            service = brain.BrainService(config(root), "system")
+            server = service.store.save_ai_server(
+                None, "Local", "http://llm.test/v1/chat/completions", "",
+                ["chat-model", "title-model"],
             )
+            service.store.select_ai_model(server["server_id"], "chat-model")
+            service.store.select_ai_support_model(server["server_id"], "title-model")
             session_id = service.store.create()["session_id"]
             messages = [
                 {"role": "system", "content": "system"},
-                {"role": "user", "content": "inspect server"},
+                {
+                    "role": "user",
+                    "content": "inspect server\nprivate attachment text",
+                    "ui": {"display_content": "inspect server"},
+                },
                 {"role": "assistant", "content": None, "tool_calls": [tool_call()]},
                 {"role": "tool", "tool_call_id": "call_1", "content": "private output"},
                 {"role": "assistant", "content": "server looks healthy", "ui": {"reasoning": "private thinking"}},
@@ -1245,9 +1302,11 @@ class StoreAndServiceTests(unittest.TestCase):
             )
             title_input = json.dumps(title_llm.seen_messages)
             self.assertIn("inspect server", title_input)
-            self.assertIn("server looks healthy", title_input)
+            self.assertNotIn("server looks healthy", title_input)
+            self.assertNotIn("private attachment text", title_input)
             self.assertNotIn("private output", title_input)
             self.assertNotIn("private thinking", title_input)
+            self.assertEqual(title_llm.seen_model_names, ["title-model"])
 
             invalid_id = service.store.create()["session_id"]
             service.store.save(invalid_id, messages, "ready", [], 0)
@@ -1256,6 +1315,20 @@ class StoreAndServiceTests(unittest.TestCase):
             ])
             service.generate_conversation_title(invalid_id, messages)
             self.assertIsNone(service.store.get(invalid_id)["title"])
+            service.llm = FakeLLM([
+                ({"role": "assistant", "content": "Server Health Inspection"}, [])
+            ])
+            service.generate_conversation_title(
+                invalid_id,
+                messages + [
+                    {"role": "user", "content": "what next"},
+                    {"role": "assistant", "content": "apply updates"},
+                ],
+            )
+            self.assertEqual(
+                service.store.get(invalid_id)["title"], "Server Health Inspection"
+            )
+            self.assertNotIn("apply updates", json.dumps(service.llm.seen_messages))
 
             failed_id = service.store.create()["session_id"]
             service.store.save(failed_id, messages, "ready", [], 0)
@@ -1263,19 +1336,97 @@ class StoreAndServiceTests(unittest.TestCase):
             service.generate_conversation_title(failed_id, messages)
             self.assertIsNone(service.store.get(failed_id)["title"])
 
-            order = []
+            class TimingLLM:
+                def __init__(self):
+                    self.title_started = threading.Event()
+                    self.seen_messages = []
+                    self.seen_model_names = []
+
+                def complete(
+                    self, current_messages, emit, *, include_tools=True,
+                    model_name=None, cancellation=None,
+                ):
+                    self.seen_messages.append(deepcopy(current_messages))
+                    self.seen_model_names.append(model_name)
+                    if model_name == "title-model":
+                        self.title_started.set()
+                        return {
+                            "role": "assistant",
+                            "content": "Maintenance Planning Request",
+                        }, []
+                    if self.title_started.is_set():
+                        raise AssertionError("title request started before main stream")
+                    emit("content", {"delta": "main answer"})
+                    if not self.title_started.wait(1):
+                        raise AssertionError("title request did not start during main stream")
+                    return {"role": "assistant", "content": "main answer"}, []
+
             fresh_id = service.store.create()["session_id"]
-            service.schedule_conversation_title = lambda *_: order.append("title")
-            service.finish_completion(
+            timing_llm = TimingLLM()
+            service.llm = timing_llm
+            service.run_turn(
                 fresh_id,
-                [{"role": "system", "content": "system"}, {"role": "user", "content": "hello"}],
-                {"role": "assistant", "content": "hello back"},
-                [],
-                [],
-                0,
-                lambda event, _data: order.append(event),
+                {"type": "web_user", "content": "plan maintenance"},
+                lambda *_: None,
             )
-            self.assertEqual(order, ["done", "title"])
+            deadline = time.monotonic() + 1
+            while service.store.get(fresh_id)["title"] is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(
+                service.store.get(fresh_id)["title"], "Maintenance Planning Request"
+            )
+            self.assertEqual(timing_llm.seen_model_names, [None, "title-model"])
+            title_input = json.dumps(timing_llm.seen_messages[1])
+            self.assertIn("plan maintenance", title_input)
+            self.assertNotIn("main answer", title_input)
+
+            class WaitingTitleLLM:
+                def __init__(self):
+                    self.main_finished = threading.Event()
+                    self.title_started = threading.Event()
+                    self.seen_model_names = []
+
+                def complete(
+                    self, current_messages, emit, *, include_tools=True,
+                    model_name=None, cancellation=None,
+                ):
+                    self.seen_model_names.append(model_name)
+                    if model_name == "title-model":
+                        if not self.main_finished.is_set():
+                            raise AssertionError(
+                                "title request started before main completion"
+                            )
+                        self.title_started.set()
+                        return {
+                            "role": "assistant",
+                            "content": "Delayed Maintenance Request",
+                        }, []
+                    emit("content", {"delta": "main answer"})
+                    if self.title_started.is_set():
+                        raise AssertionError(
+                            "title request started during main stream"
+                        )
+                    self.main_finished.set()
+                    return {"role": "assistant", "content": "main answer"}, []
+
+            service.store.set_ai_support_wait(server["server_id"], True)
+            delayed_id = service.store.create()["session_id"]
+            waiting_llm = WaitingTitleLLM()
+            service.llm = waiting_llm
+            service.run_turn(
+                delayed_id,
+                {"type": "user", "content": "delay title generation"},
+                lambda *_: None,
+            )
+            self.assertTrue(waiting_llm.title_started.wait(1))
+            deadline = time.monotonic() + 1
+            while service.store.get(delayed_id)["title"] is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(
+                service.store.get(delayed_id)["title"],
+                "Delayed Maintenance Request",
+            )
+            self.assertEqual(waiting_llm.seen_model_names, [None, "title-model"])
 
     def test_lock_entries_do_not_accumulate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1773,6 +1924,18 @@ class HTTPTests(unittest.TestCase):
                         headers={"Content-Type": "application/json"}, method="POST",
                     ))
                 self.assertEqual(denied.exception.code, 404)
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(Request(
+                        client_base + "/v1/ai/support-selection", data=b"{}",
+                        headers={"Content-Type": "application/json"}, method="POST",
+                    ))
+                self.assertEqual(denied.exception.code, 404)
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(Request(
+                        client_base + "/v1/ai/support-settings", data=b"{}",
+                        headers={"Content-Type": "application/json"}, method="POST",
+                    ))
+                self.assertEqual(denied.exception.code, 404)
                 with patch.object(
                     brain, "discover_llm_models", return_value=["small", "large"]
                 ):
@@ -1785,12 +1948,32 @@ class HTTPTests(unittest.TestCase):
                     self.assertNotIn("api_key", created["server"])
                     self.assertTrue(created["server"]["active"])
                     self.assertEqual(created["server"]["selected_model"], "small")
+                    self.assertEqual(created["server"]["support_model"], "small")
+                    self.assertFalse(
+                        created["server"]["support_wait_for_main"]
+                    )
+                    status, support = post("/v1/ai/support-selection", {
+                        "server_id": created["server"]["server_id"],
+                        "model": "large",
+                    })
+                    self.assertEqual(status, 200)
+                    self.assertEqual(support["server"]["selected_model"], "small")
+                    self.assertEqual(support["server"]["support_model"], "large")
+                    status, settings = post("/v1/ai/support-settings", {
+                        "server_id": created["server"]["server_id"],
+                        "wait_for_main": True,
+                    })
+                    self.assertEqual(status, 200)
+                    self.assertTrue(
+                        settings["server"]["support_wait_for_main"]
+                    )
                     status, selected = post("/v1/ai/selection", {
                         "server_id": created["server"]["server_id"],
                         "model": "large",
                     })
                     self.assertEqual(status, 200)
                     self.assertEqual(selected["server"]["selected_model"], "large")
+                    self.assertEqual(selected["server"]["support_model"], "large")
                 self.assertEqual(service.llm.current_client().config.model_name, "large")
             finally:
                 server.shutdown()
