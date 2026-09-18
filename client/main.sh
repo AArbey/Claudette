@@ -47,7 +47,7 @@ capture_readline_input() {
 }
 
 configure_readline() {
-    [[ -t 0 ]] || return
+    [[ -t 0 ]] || return 0
     set -o emacs
     bind -x '"\e[99~": capture_readline_input'
     bind '"\e[98~": accept-line'

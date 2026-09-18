@@ -29,7 +29,7 @@ body_from_response() { printf '%s' "${1#*$'\r\n\r\n'}"; }
 
 health=$(request GET /healthz)
 [[ "$health" == HTTP/1.1\ 200* ]]
-jq -e '.status == "ready" and .home == "/tmp" and .protocol_version == 1 and .runner_version == 1' \
+jq -e '.status == "ready" and .home == "/tmp" and .protocol_version == 1 and .runner_version == 2' \
     <<<"$(body_from_response "$health")" >/dev/null
 
 bad_source=$(REMOTE_ADDR_OVERRIDE=192.0.2.99 request GET /healthz)

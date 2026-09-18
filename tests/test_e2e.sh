@@ -15,7 +15,11 @@ cleanup() {
     [[ -n "$mock_pid" ]] && kill "$mock_pid" 2>/dev/null || true
     wait "$brain_pid" 2>/dev/null || true
     wait "$mock_pid" 2>/dev/null || true
-    rm -rf -- "$test_dir"
+    if [[ ${KEEP_E2E_ARTIFACTS:-0} == 1 ]]; then
+        printf 'E2E artifacts: %s\n' "$test_dir" >&2
+    else
+        rm -rf -- "$test_dir"
+    fi
 }
 trap cleanup EXIT
 
@@ -48,6 +52,21 @@ start_brain() {
     return 1
 }
 
+configure_ai() {
+    local response server_id
+    response=$(curl --fail --silent --show-error --request POST \
+        --header 'Content-Type: application/json' --header 'X-Brain-UI: 1' \
+        --header "Origin: http://127.0.0.1:${web_port}" \
+        --data "{\"name\":\"Mock AI\",\"endpoint_url\":\"http://127.0.0.1:${mock_port}/v1/chat/completions\",\"api_key\":\"\"}" \
+        "http://127.0.0.1:${web_port}/v1/ai/servers")
+    server_id=$(jq -er '.server.server_id' <<<"$response")
+    curl --fail --silent --show-error --request POST \
+        --header 'Content-Type: application/json' --header 'X-Brain-UI: 1' \
+        --header "Origin: http://127.0.0.1:${web_port}" \
+        --data "{\"server_id\":\"${server_id}\",\"model\":\"mock\"}" \
+        "http://127.0.0.1:${web_port}/v1/ai/selection" >/dev/null
+}
+
 prepare_home() {
     mkdir -p "$1"
     printf '[["printf"]]\n' >"$1/.bash-helper-trusted-commands.json"
@@ -65,6 +84,7 @@ prepare_home "$server_one_home"
 prepare_home "$server_two_home"
 
 start_brain
+configure_ai
 [[ $(curl --silent --output /dev/null --write-out '%{http_code}' \
     "http://127.0.0.1:${brain_port}/") == 404 ]]
 [[ $(curl --silent --output /dev/null --write-out '%{http_code}' \

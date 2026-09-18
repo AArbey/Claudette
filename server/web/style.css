@@ -158,6 +158,10 @@ summary::marker { color: var(--muted); }
 .action-menu > summary::-webkit-details-marker { display: none; }
 .action-menu-items { position: absolute; top: calc(100% + 8px); right: 0; width: 190px; display: grid; gap: 3px; padding: 6px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: var(--shadow); z-index: 10; }
 .action-menu-items button { text-align: left; border: 0; font-size: 13px; }
+.answers-only { min-height: 38px; padding: 7px 11px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.answers-only.active { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.conversation-info { max-width: 240px; padding: 8px 12px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.conversation-heading p:empty { display: none; }
 .menu-button, .sidebar-close, .sidebar-shade { display: none; }
 .feedback, .connection-retry, .approval-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 12px 24px 0; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; flex-shrink: 0; font-size: 12px; overflow-wrap: anywhere; }
 .feedback { color: var(--danger); background: var(--panel); }
@@ -170,6 +174,23 @@ summary::marker { color: var(--muted); }
 .message-row.user .message-stack { max-width: 85%; width: fit-content; }
 .message-label { margin: 0 2px 8px; color: var(--muted); font-size: 11px; font-weight: 650; }
 .message-row.user .message-label { text-align: right; }
+.response-group { margin: -18px 0 30px; }
+.response-group > .message-row { margin-bottom: 12px; }
+.response-group > .message-row:last-child { margin-bottom: 0; }
+.response-activity { margin: 0 0 12px; color: var(--muted); }
+.response-activity.answers-only-hidden { display: none; }
+.response-activity-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: fit-content; min-height: 34px; padding: 5px 8px; border-radius: 8px; list-style: none; cursor: pointer; font-size: 12px; }
+.response-activity-summary::-webkit-details-marker { display: none; }
+.response-activity-summary::before { content: "›"; margin-right: 2px; font-size: 18px; transition: transform 120ms; }
+.response-activity[open] > .response-activity-summary::before { transform: rotate(90deg); }
+.response-activity-body { display: grid; gap: 8px; margin-top: 4px; padding-left: 12px; border-left: 2px solid var(--line); }
+.activity-count { color: var(--muted); font-size: 10px; }
+.live-activity-state { padding: 5px 8px; color: var(--accent); font-size: 11px; }
+.activity-thinking, .activity-commentary { padding: 8px 10px; border-radius: 8px; background: var(--panel-raised); }
+.activity-thinking strong { display: block; margin-bottom: 5px; font-size: 11px; }
+.activity-thinking pre { max-height: 300px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.65 ui-monospace, SFMono-Regular, monospace; }
+.activity-commentary { color: var(--text); font-size: 12px; }
+.response-ended { margin: 6px 0; color: var(--muted); font-size: 12px; }
 .bubble { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); overflow: hidden; }
 .message-row.user .bubble { background: var(--user); border-color: transparent; }
 .message-content { margin: 0; padding: 18px 20px; color: var(--text); font: inherit; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -214,6 +235,7 @@ summary::marker { color: var(--muted); }
 .markdown th { background: var(--panel-raised); }
 .markdown hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
 .composer { display: grid; grid-template-columns: auto minmax(0,1fr) auto; gap: 8px 12px; flex-shrink: 0; border-top: 1px solid var(--line); padding: 16px max(24px, calc((100% - 850px) / 2)) max(16px, env(safe-area-inset-bottom)); background: var(--panel); }
+.response-status { flex-shrink: 0; padding: 9px max(24px, calc((100% - 850px) / 2)); border-top: 1px solid var(--line); color: var(--accent); background: var(--panel); font-size: 11px; }
 .composer textarea { width: 100%; min-height: 46px; max-height: 180px; resize: none; padding: 11px 14px; line-height: 1.5; background: var(--bg); }
 .composer button { align-self: end; height: 46px; min-width: 74px; }
 .composer .message-stop { width: 46px; min-width: 46px; padding: 0; border-color: var(--text); border-radius: 14px; background: var(--text); }
@@ -239,6 +261,7 @@ summary::marker { color: var(--muted); }
 .command-group-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 3px 5px 5px; color: var(--muted); font-size: 11px; }
 .command-group-header strong { color: var(--text); font-size: 12px; }
 .tool-card { margin-top: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.response-activity-body > .tool-card { margin-top: 0; }
 .command-group .tool-card { margin-top: 0; border-radius: 10px; }
 .tool-summary { display: flex; align-items: center; gap: 10px; min-height: 52px; padding: 12px 14px; list-style: none; }
 .tool-summary::-webkit-details-marker { display: none; }
@@ -510,6 +533,7 @@ summary::marker { color: var(--muted); }
   .conversation-heading p { font-size: 10px; }
   .ai-config-button { max-width:145px; min-height:44px; }
   .conversation-actions { width: 100%; justify-content: space-between; }
+  .answers-only { order: 2; margin-left: auto; }
   .runner-picker { flex: 1; min-width: 0; }
   .runner-picker > summary { width: 100%; min-height: 44px; }
   .runner-menu { left: 0; right: auto; }
@@ -518,6 +542,9 @@ summary::marker { color: var(--muted); }
   .message-content { padding: 14px; }
   .message-row.user .message-stack { max-width: 94%; }
   .composer { padding: 12px 14px max(12px, env(safe-area-inset-bottom)); gap: 8px; }
+  .response-status { padding: 8px 14px; }
+  .response-group { margin-top: -12px; margin-bottom: 24px; }
+  .response-activity-body { padding-left: 8px; }
   .composer textarea { font-size: 16px; }
   .composer-hint { font-size: 10px; }
   .context-meter { gap:6px; font-size:9px; }

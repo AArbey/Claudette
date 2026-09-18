@@ -20,7 +20,7 @@ import sqlite3
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -267,6 +267,45 @@ class TurnCancellation:
                 response.close()
             except (OSError, ValueError):
                 pass
+
+
+def cancellable_urlopen(
+    request: Request, timeout: float, cancellation: TurnCancellation | None
+) -> Any:
+    """Open an upstream request without making Stop wait for response headers."""
+    if cancellation is None:
+        return urlopen(request, timeout=timeout)
+
+    finished = threading.Event()
+    result: dict[str, Any] = {}
+
+    def open_request() -> None:
+        try:
+            response = urlopen(request, timeout=timeout)
+            if cancellation.cancelled:
+                response.close()
+                result["error"] = TurnCancelled()
+            else:
+                result["response"] = response
+        except Exception as error:
+            result["error"] = error
+        finally:
+            finished.set()
+
+    threading.Thread(
+        target=open_request, name="llm-response-open", daemon=True
+    ).start()
+    while not finished.wait(.05):
+        cancellation.raise_if_cancelled()
+    if cancellation.cancelled:
+        response = result.get("response")
+        if response is not None:
+            response.close()
+        raise TurnCancelled()
+    error = result.get("error")
+    if error is not None:
+        raise error
+    return result["response"]
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -888,9 +927,11 @@ def context_window_from_response(payload: Any) -> int | None:
         return None
     verbose = payload.get("__verbose")
     settings = verbose.get("generation_settings") if isinstance(verbose, dict) else None
+    generation_settings = payload.get("generation_settings")
     candidates = (
         payload.get("generation_settings/n_ctx"),
         payload.get("n_ctx"),
+        generation_settings.get("n_ctx") if isinstance(generation_settings, dict) else None,
         settings.get("n_ctx") if isinstance(settings, dict) else None,
     )
     return next(
@@ -900,16 +941,131 @@ def context_window_from_response(payload: Any) -> int | None:
 
 
 class LLMClient:
-    def __init__(self, config: Config):
+    CONTEXT_LOOKUP_TIMEOUT_SECONDS = 3.0
+
+    def __init__(
+        self,
+        config: Config,
+        context_changed: Callable[[], None] | None = None,
+    ):
         self.config = config
         self._context_guard = threading.Lock()
         self._context_tokens: int | None = None
-        self._context_requested = False
+        self._context_state = "unknown"
+        self._context_lookup_running = False
+        self._context_lookup_unsupported = False
+        self._context_changed = context_changed
 
     def context_window(self) -> int | None:
         """Return context size learned from first real completion."""
         with self._context_guard:
             return self._context_tokens
+
+    def context_info(self) -> dict[str, Any]:
+        with self._context_guard:
+            return {
+                "max_tokens": self._context_tokens,
+                "discovery": self._context_state,
+            }
+
+    def _notify_context_changed(self) -> None:
+        if self._context_changed is not None:
+            self._context_changed()
+
+    def _set_context(self, tokens: int) -> None:
+        changed = False
+        with self._context_guard:
+            if self._context_tokens != tokens or self._context_state != "ready":
+                self._context_tokens = tokens
+                self._context_state = "ready"
+                changed = True
+        if changed:
+            self._notify_context_changed()
+
+    def _props_url(self) -> str:
+        parts = urlsplit(self.config.llm_endpoint_url)
+        path = parts.path.rstrip("/")
+        for suffix in ("/v1/chat/completions", "/chat/completions"):
+            if path.endswith(suffix):
+                path = path[:-len(suffix)]
+                break
+        query = urlencode({"model": self.config.model_name})
+        return urlunsplit((parts.scheme, parts.netloc, f"{path}/props", query, ""))
+
+    def _start_context_lookup(self) -> None:
+        if self._context_changed is None:
+            return
+        with self._context_guard:
+            if (
+                self._context_tokens is not None
+                or self._context_lookup_running
+                or self._context_lookup_unsupported
+            ):
+                return
+            self._context_lookup_running = True
+            self._context_state = "loading"
+        self._notify_context_changed()
+
+        def lookup() -> None:
+            result: dict[str, Any] = {"state": "unknown", "tokens": None}
+            finished = threading.Event()
+            request = Request(self._props_url(), headers={"Accept": "application/json"})
+            if self.config.llm_api_key:
+                request.add_header("Authorization", f"Bearer {self.config.llm_api_key}")
+
+            def probe() -> None:
+                try:
+                    with urlopen(
+                        request, timeout=self.CONTEXT_LOOKUP_TIMEOUT_SECONDS
+                    ) as response:
+                        payload = json.load(response)
+                    settings = (
+                        payload.get("default_generation_settings")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    tokens = valid_context_window(
+                        settings.get("n_ctx") if isinstance(settings, dict) else None
+                    )
+                    result.update(
+                        state="ready" if tokens else "unavailable", tokens=tokens
+                    )
+                except HTTPError as error:
+                    result["state"] = (
+                        "unavailable"
+                        if error.code in {400, 404, 405, 501}
+                        else "unknown"
+                    )
+                except (
+                    OSError,
+                    TimeoutError,
+                    URLError,
+                    ValueError,
+                    json.JSONDecodeError,
+                    AttributeError,
+                ):
+                    result["state"] = "unknown"
+                finally:
+                    finished.set()
+
+            threading.Thread(
+                target=probe, name="context-properties-request", daemon=True
+            ).start()
+            finished.wait(self.CONTEXT_LOOKUP_TIMEOUT_SECONDS)
+            state = result["state"] if finished.is_set() else "unknown"
+            tokens = result["tokens"] if finished.is_set() else None
+            changed = False
+            with self._context_guard:
+                self._context_lookup_running = False
+                if self._context_tokens is None:
+                    self._context_tokens = tokens
+                    self._context_state = state
+                    self._context_lookup_unsupported = state == "unavailable"
+                    changed = True
+            if changed:
+                self._notify_context_changed()
+
+        threading.Thread(target=lookup, name="context-properties", daemon=True).start()
 
     def complete(
         self,
@@ -920,6 +1076,7 @@ class LLMClient:
         include_memory_tools: bool = True,
         model_name: str | None = None,
         cancellation: TurnCancellation | None = None,
+        emit_activity: bool = False,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         upstream_messages = prepare_upstream_messages(messages)
         payload: dict[str, Any] = {
@@ -930,12 +1087,8 @@ class LLMClient:
             "stream": True,
         }
         with self._context_guard:
-            request_context = (
-                (model_name is None or model_name == self.config.model_name)
-                and not self._context_requested
-            )
-            if request_context:
-                self._context_requested = True
+            discover_context = model_name is None and self._context_tokens is None
+            request_context = discover_context and not self._context_lookup_unsupported
         if request_context:
             # llama.cpp includes generation_settings in this same streamed response.
             # No metadata request means llama-swap loads model only for user's request.
@@ -965,7 +1118,9 @@ class LLMClient:
         try:
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            with urlopen(request, timeout=self.config.llm_timeout_seconds) as response:
+            with cancellable_urlopen(
+                request, self.config.llm_timeout_seconds, cancellation
+            ) as response:
                 if cancellation is not None:
                     cancellation.bind(response)
                 if response.status < 200 or response.status >= 300:
@@ -995,18 +1150,22 @@ class LLMClient:
                         raise BrainError("LLM returned invalid JSON in SSE event") from error
                     if not isinstance(event, dict):
                         raise BrainError("LLM SSE event must be an object")
-                    if request_context:
+                    if discover_context:
                         context_tokens = context_window_from_response(event)
                         if context_tokens:
-                            with self._context_guard:
-                                self._context_tokens = context_tokens
+                            self._set_context(context_tokens)
+                        elif request_context:
+                            self._start_context_lookup()
                     error_value = event.get("error")
                     if isinstance(error_value, dict) and error_value.get("message"):
                         raise BrainError(str(error_value["message"]))
 
                     choices = event.get("choices")
-                    if not isinstance(choices, list) or not choices:
+                    if not isinstance(choices, list):
                         raise BrainError("LLM SSE event has no choices")
+                    if not choices:
+                        # OpenAI-compatible streams may send a final usage-only chunk.
+                        continue
                     choice = choices[0]
                     if not isinstance(choice, dict):
                         raise BrainError("LLM SSE event has invalid choice")
@@ -1023,12 +1182,25 @@ class LLMClient:
                     if not isinstance(reasoning, str) or not isinstance(content, str):
                         raise BrainError("LLM returned non-string content delta")
                     if reasoning:
+                        if emit_activity:
+                            emit("activity", {"phase": "thinking"})
                         emit("reasoning", {"delta": reasoning})
                     if content:
+                        if emit_activity:
+                            emit("activity", {"phase": "writing"})
                         content_parts.append(content)
                         emit("content", {"delta": content})
                     if "tool_calls" in delta:
                         merge_tool_call_deltas(tool_call_slots, delta["tool_calls"])
+                        names = [
+                            call["function"]["name"] for call in tool_call_slots
+                            if call and call["function"]["name"]
+                        ]
+                        if emit_activity:
+                            emit("activity", {
+                                "phase": "preparing_tool",
+                                "tools": [{"name": name, "state": "preparing"} for name in names],
+                            })
         except HTTPError as error:
             raise BrainError(f"LLM returned HTTP {error.code}") from error
         except URLError as error:
@@ -2669,12 +2841,18 @@ class SessionStore:
 class DynamicLLMClient:
     """Resolve global Web UI selection before every model call."""
 
-    def __init__(self, config: Config, store: SessionStore):
+    def __init__(
+        self,
+        config: Config,
+        store: SessionStore,
+        context_changed: Callable[[], None] | None = None,
+    ):
         self.config = config
         self.store = store
         self._guard = threading.Lock()
         self._cache_key: tuple[str, str, str, str] | None = None
         self._client: LLMClient | None = None
+        self._context_changed = context_changed
 
     def current_client(self) -> LLMClient:
         active = self.store.active_ai_model()
@@ -2686,17 +2864,21 @@ class DynamicLLMClient:
         )
         with self._guard:
             if key != self._cache_key:
-                self._client = LLMClient(replace(
-                    self.config,
-                    llm_endpoint_url=active["endpoint_url"],
-                    llm_api_key=active["api_key"],
-                    model_name=active["selected_model"],
-                ))
+                self._client = LLMClient(
+                    replace(
+                        self.config,
+                        llm_endpoint_url=active["endpoint_url"],
+                        llm_api_key=active["api_key"],
+                        model_name=active["selected_model"],
+                    ),
+                    self._context_changed,
+                )
                 self._cache_key = key
             assert self._client is not None
             return self._client
 
     def complete(self, *args: Any, **kwargs: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        kwargs.setdefault("emit_activity", True)
         return self.current_client().complete(*args, **kwargs)
 
     def context_window(self) -> int | None:
@@ -2704,6 +2886,12 @@ class DynamicLLMClient:
             return self.current_client().context_window()
         except BrainError:
             return None
+
+    def context_info(self) -> dict[str, Any]:
+        try:
+            return self.current_client().context_info()
+        except BrainError:
+            return {"max_tokens": None, "discovery": "unknown"}
 
 
 class SessionLocks:
@@ -2742,6 +2930,7 @@ class LiveTurns:
         self._conditions: dict[str, threading.Condition] = {}
         self._revisions: dict[str, int] = {}
         self._turns: dict[str, dict[str, Any]] = {}
+        self._generation_ids: dict[str, str] = {}
 
     def _condition(self, session_id: str) -> threading.Condition:
         return self._conditions.setdefault(
@@ -2765,16 +2954,22 @@ class LiveTurns:
 
     def start(
         self, session_id: str, transient_messages: list[dict[str, Any]]
-    ) -> None:
+    ) -> str:
         with self._guard:
+            generation_id = self._generation_ids.setdefault(
+                session_id, secrets.token_urlsafe(12)
+            )
             self._turns[session_id] = {
                 "active": True,
                 "started_at": utc_now(),
+                "generation_id": generation_id,
                 "reasoning": "",
                 "content": "",
                 "transient_messages": transient_messages,
+                "activity": {"phase": "waiting", "tools": []},
             }
             self.changed(session_id)
+            return generation_id
 
     def changed(self, session_id: str) -> None:
         with self._guard:
@@ -2782,16 +2977,24 @@ class LiveTurns:
             self._condition(session_id).notify_all()
 
     def append(self, session_id: str, event: str, data: dict[str, Any]) -> None:
-        if event not in {"reasoning", "content"}:
-            return
-        delta = data.get("delta")
-        if not isinstance(delta, str):
-            return
         with self._guard:
             turn = self._turns.get(session_id)
-            if turn is not None:
+            if turn is None:
+                return
+            if event in {"reasoning", "content"}:
+                delta = data.get("delta")
+                if not isinstance(delta, str):
+                    return
                 turn[event] += delta
-                self.changed(session_id)
+            elif event == "activity":
+                phase = data.get("phase")
+                tools = data.get("tools", turn["activity"].get("tools", []))
+                if not isinstance(phase, str) or not isinstance(tools, list):
+                    return
+                turn["activity"] = {"phase": phase, "tools": deepcopy(tools)}
+            else:
+                return
+            self.changed(session_id)
 
     def get(self, session_id: str) -> dict[str, Any] | None:
         with self._guard:
@@ -2805,6 +3008,12 @@ class LiveTurns:
             self._turns.pop(session_id, None)
             self.changed(session_id)
 
+    def finish(self, session_id: str) -> None:
+        with self._guard:
+            self._turns.pop(session_id, None)
+            self._generation_ids.pop(session_id, None)
+            self.changed(session_id)
+
 
 class BrainService:
     def __init__(self, config: Config, system_prompt: str):
@@ -2813,14 +3022,23 @@ class BrainService:
         self.store.seed_ai_server(
             config.llm_endpoint_url, config.llm_api_key, config.model_name
         )
-        self.llm = DynamicLLMClient(config, self.store)
         self.locks = SessionLocks()
         self.live_turns = LiveTurns()
+        self.llm = DynamicLLMClient(config, self.store, self.context_changed)
         self._runner_guard = threading.Lock()
         self._active_runner_requests: dict[str, int] = {}
         self._runner_monitor_stop = threading.Event()
         self._cancellation_guard = threading.Lock()
         self._turn_cancellations: dict[str, TurnCancellation] = {}
+
+    def context_changed(self) -> None:
+        """Wake open Web streams when model context discovery changes."""
+        try:
+            session_ids = [item["session_id"] for item in self.store.list_summaries()]
+        except sqlite3.Error:
+            return
+        for session_id in session_ids:
+            self.live_turns.changed(session_id)
 
     def start_turn_cancellation(self, session_id: str) -> TurnCancellation:
         cancellation = TurnCancellation()
@@ -2988,15 +3206,22 @@ class BrainService:
             if live.get("content"):
                 context_messages.append({"role": "assistant", "content": live["content"]})
         used = estimate_message_tokens(prepare_upstream_messages(context_messages))
-        maximum = (
-            self.llm.context_window()
-            if hasattr(self.llm, "context_window")
-            else None
-        )
+        if hasattr(self.llm, "context_info"):
+            context_info = self.llm.context_info()
+        elif hasattr(self.llm, "context_window"):
+            fallback_window = self.llm.context_window()
+            context_info = {
+                "max_tokens": fallback_window,
+                "discovery": "ready" if fallback_window else "unknown",
+            }
+        else:
+            context_info = {"max_tokens": None, "discovery": "unknown"}
+        maximum = context_info["max_tokens"]
         detail["context_usage"] = {
             "estimated_tokens": used,
             "max_tokens": maximum,
             "percent": min(100, round(used * 100 / maximum)) if maximum else None,
+            "discovery": context_info["discovery"],
         }
         return detail
 
@@ -3480,10 +3705,28 @@ class BrainService:
             )
 
         if approved:
+            running_tools = [
+                {"id": call["id"], "name": call["function"]["name"], "state": "running"}
+                for call, _approval, _request_id in approved
+            ]
+            self.live_turns.append(session_id, "activity", {
+                "phase": "running_tools",
+                "tools": running_tools,
+            })
             with ThreadPoolExecutor(max_workers=len(approved)) as executor:
-                completed = executor.map(run_approved, approved)
-                for item, outcome in zip(approved, completed):
-                    outcomes[item[0]["id"]] = outcome
+                futures = {
+                    executor.submit(run_approved, item): item for item in approved
+                }
+                for future in as_completed(futures):
+                    item = futures[future]
+                    outcomes[item[0]["id"]] = future.result()
+                    for tool in running_tools:
+                        if tool["id"] == item[0]["id"]:
+                            tool["state"] = "completed"
+                            break
+                    self.live_turns.append(session_id, "activity", {
+                        "phase": "running_tools", "tools": running_tools,
+                    })
 
         pending_calls = []
         for call in tool_calls:
@@ -3493,6 +3736,13 @@ class BrainService:
             else:
                 messages.append(outcome)
         if pending_calls:
+            self.live_turns.append(session_id, "activity", {
+                "phase": "approval",
+                "tools": [
+                    {"id": call["id"], "name": call["function"]["name"], "state": "approval"}
+                    for call in pending_calls
+                ],
+            })
             save("awaiting_tool_results", pending_calls, current_round + 1)
             emit("tool_calls", {"tool_calls": pending_calls})
             return False
@@ -3564,7 +3814,23 @@ class BrainService:
                 else:
                     approval = {"decision": "allowed_once", "prefix": []}
                 try:
+                    self.live_turns.append(session_id, "activity", {
+                        "phase": "running_tools",
+                        "tools": [{
+                            "id": call["id"],
+                            "name": call["function"]["name"],
+                            "state": "running",
+                        }],
+                    })
                     result = self.execute_runner(session, call, approval)
+                    self.live_turns.append(session_id, "activity", {
+                        "phase": "running_tools",
+                        "tools": [{
+                            "id": call["id"],
+                            "name": call["function"]["name"],
+                            "state": "completed",
+                        }],
+                    })
                 except BrainError as error:
                     failed = deepcopy(call)
                     failed["ui"] = {
@@ -3619,7 +3885,7 @@ class BrainService:
                     if event == "reasoning":
                         reasoning_parts.append(data["delta"])
                     self.live_turns.append(session_id, event, data)
-                    if downstream_open:
+                    if downstream_open and event not in {"activity", "context"}:
                         try:
                             emit(event, data)
                         except OSError:
@@ -3651,6 +3917,15 @@ class BrainService:
                     raise
                 if reasoning_parts:
                     assistant["ui"] = {"reasoning": "".join(reasoning_parts)}
+                if any(
+                    call.get("function", {}).get("name") in {
+                        "save_memory", "recall_memory", "delete_memory",
+                    }
+                    for call in tool_calls
+                ):
+                    self.live_turns.append(
+                        session_id, "activity", {"phase": "updating_memory"}
+                    )
                 tool_calls, memory_results = self.split_tool_calls(
                     session,
                     tool_calls,
@@ -3666,7 +3941,7 @@ class BrainService:
                 current_round = session["tool_round"]
         finally:
             if live_started:
-                self.live_turns.remove(session_id)
+                self.live_turns.finish(session_id)
             self.finish_turn_cancellation(session_id, cancellation)
             self.locks.release(session_id, lock)
 
@@ -3867,7 +4142,7 @@ class BrainService:
                     if event == "reasoning":
                         reasoning_parts.append(data["delta"])
                     self.live_turns.append(session_id, event, data)
-                    if downstream_open:
+                    if downstream_open and event not in {"activity", "context"}:
                         try:
                             emit(event, data)
                         except OSError:
@@ -3899,6 +4174,15 @@ class BrainService:
                     raise
                 if reasoning_parts:
                     assistant["ui"] = {"reasoning": "".join(reasoning_parts)}
+                if any(
+                    call.get("function", {}).get("name") in {
+                        "save_memory", "recall_memory", "delete_memory",
+                    }
+                    for call in tool_calls
+                ):
+                    self.live_turns.append(
+                        session_id, "activity", {"phase": "updating_memory"}
+                    )
                 tool_calls, memory_results = self.split_tool_calls(
                     session,
                     tool_calls,
@@ -3924,7 +4208,7 @@ class BrainService:
                 current_round = session["tool_round"]
         finally:
             if live_started:
-                self.live_turns.remove(session_id)
+                self.live_turns.finish(session_id)
             self.finish_turn_cancellation(session_id, cancellation)
             self.locks.release(session_id, lock)
 
@@ -4384,6 +4668,19 @@ class BrainHandler(BaseHTTPRequestHandler):
                         delta = current_live[key][len(old_live[key]):]
                         if delta:
                             self.send_event(key, {"delta": delta})
+                    if current_live.get("activity") != old_live.get("activity"):
+                        self.send_event("activity", current_live["activity"])
+                    if detail["context_usage"] != previous["context_usage"]:
+                        self.send_event("context", detail["context_usage"])
+                elif previous is not None:
+                    old_without_context = dict(previous)
+                    new_without_context = dict(detail)
+                    old_without_context.pop("context_usage", None)
+                    new_without_context.pop("context_usage", None)
+                    if old_without_context == new_without_context:
+                        self.send_event("context", detail["context_usage"])
+                    elif detail != previous:
+                        self.send_event("snapshot", detail)
                 elif detail != previous:
                     self.send_event("snapshot", detail)
                 previous = detail
@@ -4494,6 +4791,10 @@ class BrainHandler(BaseHTTPRequestHandler):
                 )
                 self.server.service.store.refresh_ai_models(server_id, models)
                 selected = self.server.service.store.select_ai_model(server_id, model)
+                # Re-resolve model-scoped context and wake every open chat meter.
+                if hasattr(self.server.service.llm, "current_client"):
+                    self.server.service.llm.current_client()
+                self.server.service.context_changed()
             except KeyError:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "AI server not found")
                 return

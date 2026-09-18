@@ -82,6 +82,7 @@
           <span class="ai-config-copy"><span>Model</span><strong id="ai-model-value">Not configured</strong></span>
         </button>
         <div id="conversation-actions" class="conversation-actions hidden">
+          <button id="answers-only" class="answers-only" type="button" aria-pressed="false">Answers only</button>
           <details id="runner-picker" class="runner-picker">
             <summary id="runner-picker-summary" aria-label="Change execution target">
               <span id="runner-picker-icon" class="runner-picker-icon" aria-hidden="true">◇</span>
@@ -95,6 +96,7 @@
           </details>
           <details id="conversation-menu" class="action-menu"><summary aria-label="Conversation actions">•••</summary>
             <div class="action-menu-items">
+              <p id="conversation-info" class="conversation-info"></p>
               <button id="rename-button" type="button">Rename</button>
               <button id="pin-button" type="button">Pin conversation</button>
               <button id="archive-button" type="button">Archive</button>
@@ -119,11 +121,12 @@
       </section>
 
       <button id="jump-latest" class="jump-latest hidden" type="button">↓ Jump to latest</button>
+      <div id="response-status" class="response-status hidden" role="status" aria-live="polite"></div>
       <form id="message-form" class="composer hidden">
         <label class="sr-only" for="message-input">Continue conversation</label>
         <button id="context-add" class="context-add" type="button" aria-label="Add context">+</button>
         <textarea id="message-input" rows="1" maxlength="100000"
-          placeholder="Continue conversation…"></textarea>
+          placeholder="Message"></textarea>
         <button id="message-send" type="submit">Send</button>
         <button id="message-stop" class="message-stop hidden" type="button"
           aria-label="Stop generating" title="Stop generating">

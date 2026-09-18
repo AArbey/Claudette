@@ -9,6 +9,9 @@ from test_brain import brain, config, tool_call
 
 
 class PreviewLLM:
+    def context_info(self):
+        return {"max_tokens": 32768, "discovery": "ready"}
+
     def complete(
         self, messages, emit, *, include_tools=True, model_name=None,
         cancellation=None,

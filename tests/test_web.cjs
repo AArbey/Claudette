@@ -53,11 +53,12 @@ async function noOverflow(page) {
     await waitText(page, '#ai-model-value', 'test-model');
     await page.getByRole('button', { name: 'Configure AI' }).click();
     await waitText(page, '#ai-server-list', 'Configured AI');
-    assert.equal(await page.locator('#ai-server-list select').inputValue(), 'test-model');
-    await page.locator('#ai-server-list select').selectOption('alternate-model');
+    assert.equal(await page.locator('#ai-server-list .model-picker-value').innerText(), 'test-model');
+    await page.getByRole('button', { name: 'Choose model on Configured AI' }).click();
+    await page.locator('.model-picker-option[data-model="alternate-model"]').click();
     await page.getByRole('button', { name: 'Use model', exact: true }).click();
     await waitText(page, '#ai-model-value', 'alternate-model');
-    await waitText(page, '#ai-config-feedback', 'Web UI and CLI');
+    await waitText(page, '#ai-config-feedback', 'Model updated');
     await noOverflow(page);
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     const mobilePage = await context.newPage();
@@ -69,6 +70,7 @@ async function noOverflow(page) {
     await mobilePage.close();
     console.log('AI configuration desktop/mobile passed');
     await page.locator('.markdown table').waitFor();
+    await waitText(page, '#context-meter-label', '/ 32k');
     assert.equal(await page.locator('.markdown img, .markdown script, .markdown iframe').count(), 0);
     assert.equal(await page.evaluate(() => window.pwned), undefined);
     assert.equal(await page.locator('.markdown a[href^="javascript:"]').count(), 0);
@@ -181,15 +183,19 @@ async function noOverflow(page) {
     await page.waitForFunction(() => !currentDetail?.active && !sessionState().messageBusy);
     await page.locator('#message-input').fill('Next question');
     assert.equal(await page.locator('#message-input').inputValue(), 'Next question');
-    assert.equal(await page.locator('.reasoning').first().getAttribute('open'), '');
-    await page.locator('.reasoning summary').first().click();
+    assert.equal(await page.locator('.response-activity').first().getAttribute('open'), null);
+    await page.locator('.response-activity summary').first().click();
+    await page.getByRole('button', { name: 'Answers only' }).click();
+    assert.equal(await page.locator('.response-activity').first().isVisible(), false);
+    assert.equal(await page.getByRole('button', { name: 'Answers only' }).getAttribute('aria-pressed'), 'true');
+    await page.getByRole('button', { name: 'Answers only' }).click();
     await page.locator('#transcript').evaluate(node => { node.scrollTop = 0; });
     await page.locator('#jump-latest').waitFor();
     await page.evaluate(() => { conversationStream.close(); conversationStream.onerror(); });
     await page.locator('#connection-retry').click();
     await page.waitForFunction(() => connected && currentDetail !== null);
     assert.equal(await page.locator('#transcript').evaluate(node => node.scrollTop), 0, 'reconnect preserves reading position');
-    assert.equal(await page.locator('.reasoning').first().getAttribute('open'), null);
+    assert.equal(await page.locator('.response-activity').first().getAttribute('open'), '');
     assert.equal(await page.locator('#message-input').inputValue(), 'Next question');
     await page.locator('#jump-latest').click();
     await page.locator('#jump-latest').waitFor({ state: 'hidden' });
@@ -209,13 +215,13 @@ async function noOverflow(page) {
     await page.waitForFunction(() => currentDetail?.status === 'ready' && !currentDetail.active && !sessionState().commandBusy);
     await openChat(page, fixture, 'multi');
     await waitText(page, '#approval-banner', '3 commands need review');
-    assert.equal(await page.locator('.command-group .tool-card').count(), 3);
-    assert.equal(await page.locator('.command-group .tool-card[open]').count(), 1);
+    assert.equal(await page.locator('.response-group > .tool-card').count(), 3);
+    assert.equal(await page.locator('.response-group > .tool-card[open]').count(), 1);
     await page.getByRole('button', { name: 'Allow once', exact: true }).click();
     await page.waitForFunction(() => currentDetail?.pending_tool_calls?.length === 2
       && !currentDetail.active && !sessionState().commandBusy);
     await waitText(page, '#approval-banner', '2 commands need review');
-    assert.equal(await page.locator('.command-group .tool-card[open]').count(), 1);
+    assert.equal(await page.locator('.response-group > .tool-card[open]').count(), 1);
     await page.getByRole('button', { name: 'Trust', exact: true }).click();
     await page.waitForFunction(() => currentDetail?.pending_tool_calls?.length === 1
       && !currentDetail.active && !sessionState().commandBusy);
@@ -231,7 +237,7 @@ async function noOverflow(page) {
 
     await page.goto(`${fixture.base}/#servers/127.0.0.1`);
     await page.locator('#server-name').waitFor();
-    await waitText(page, '.runner-version', 'v1 · Latest');
+    await waitText(page, '.runner-version', 'v2 · Latest');
     await page.locator('#server-name').fill('Production renamed');
     await page.getByRole('button', { name: 'Save name', exact: true }).click();
     await waitText(page, '#conversation-title', 'Production renamed');
@@ -290,11 +296,12 @@ async function noOverflow(page) {
     await page.locator('#runner-picker-summary').click();
     await page.locator('#runner-menu [data-runner-id=""]').click();
     await page.waitForFunction(() => currentDetail && !currentDetail.runner_id);
+    await page.waitForFunction(() => !document.querySelector('#runner-picker').open);
     assert.equal(await page.locator('#runner-picker').getAttribute('open'), null);
     console.log('New conversation, target errors/retry, target changes passed');
 
     // Visual and keyboard acceptance matrix.
-    for (const width of [360, 390, 768, 1024, 1440]) {
+    for (const width of [320, 390, 768, 1440]) {
       await page.setViewportSize({ width, height: width < 600 ? 844 : 1000 });
       for (const theme of ['light', 'dark']) {
         await page.evaluate(theme => {
@@ -336,6 +343,8 @@ async function noOverflow(page) {
         assert.equal(await page.locator('#menu-button').evaluate(node => node === document.activeElement), true);
         await page.locator('#menu-button').click();
       }
+      await page.locator('#conversations-view').click();
+      if (width < 900) await page.locator('#menu-button').click();
       await page.locator('#new-conversation').click();
       await page.getByRole('radio', { name: /Chat only/ }).waitFor();
       await noOverflow(page);

@@ -20,6 +20,8 @@ const memoryRunnerListElement = document.querySelector("#memory-runner-list");
 const filterElement = document.querySelector("#conversation-filter");
 const filterLabel = filterElement.closest("label");
 const actionsElement = document.querySelector("#conversation-actions");
+const answersOnlyButton = document.querySelector("#answers-only");
+const conversationInfo = document.querySelector("#conversation-info");
 const archiveButton = document.querySelector("#archive-button");
 const deleteButton = document.querySelector("#delete-button");
 const runnerPicker = document.querySelector("#runner-picker");
@@ -48,6 +50,7 @@ const messageInput = document.querySelector("#message-input");
 const messageSend = document.querySelector("#message-send");
 const messageStop = document.querySelector("#message-stop");
 const messageHint = document.querySelector("#message-hint");
+const responseStatus = document.querySelector("#response-status");
 const contextMeter = document.querySelector("#context-meter");
 const contextMeterFill = document.querySelector("#context-meter-fill");
 const contextMeterLabel = document.querySelector("#context-meter-label");
@@ -187,7 +190,10 @@ let editAction = null;
 let editingMemoryId = null;
 let newConversationBusy = false;
 let newRunnerLoading = false;
+let streamFrame = 0;
+const streamDeltas = { reasoning: "", content: "" };
 const disclosureState = new Map();
+const activityState = new Map();
 const trustEditors = new Map();
 const enrollmentEditors = new Map();
 
@@ -195,9 +201,28 @@ function sessionState(id = selectedId) {
   if (!sessionStates.has(id)) sessionStates.set(id, {
     messageBusy: false, stopBusy: false, branchBusy: false, commandBusy: false, actionBusy: false,
     failure: "", feedback: "", notice: "", nextCommandId: "", editingMessageIndex: null,
-    editingMessageDraft: "", references: [],
+    editingMessageDraft: "", references: [], answersOnly: null, answersKey: "",
   });
   return sessionStates.get(id);
+}
+
+function activityStorageKey(key) {
+  return `brain.activity.${key}`;
+}
+
+function answersOnlyKey(detail = currentDetail) {
+  return detail ? `brain.answers.${detail.session_id}.${detail.active_branch_id || "legacy"}` : "";
+}
+
+function answersOnlyEnabled(detail = currentDetail) {
+  if (!detail) return false;
+  const state = sessionState(detail.session_id);
+  const key = answersOnlyKey(detail);
+  if (state.answersOnly === null || state.answersKey !== key) {
+    state.answersKey = key;
+    state.answersOnly = storageRead("sessionStorage", key, "") === "1";
+  }
+  return state.answersOnly;
 }
 
 function storageRead(storage, key, fallback = "") {
@@ -244,9 +269,13 @@ function renderContextMeter(detail) {
   const usage = detail?.context_usage || {};
   const maximum = Number(usage.max_tokens);
   if (!Number.isFinite(maximum) || maximum < 1024) {
-    contextMeter.hidden = true;
+    const state = usage.discovery || "unknown";
+    contextMeter.hidden = !["loading", "unavailable"].includes(state);
     contextMeterFill.style.width = "0";
-    contextMeterLabel.textContent = "";
+    contextMeterLabel.textContent = state === "loading"
+      ? "Detecting context…" : state === "unavailable" ? "Context size unavailable" : "";
+    contextMeter.removeAttribute("aria-valuenow");
+    contextMeter.title = contextMeterLabel.textContent;
     return;
   }
   const state = sessionState(detail?.session_id);
@@ -844,8 +873,7 @@ async function refreshAIConfig(discover = false, preserveOpenDialog = false) {
   try {
     const result = await getJson("/v1/ai/config");
     aiServers = Array.isArray(result.servers) ? result.servers : [];
-    if (preserveOpenDialog && aiConfigDialog.open) renderAIHeader();
-    else renderAIConfig();
+    renderAIConfig();
     if (discover && !aiConfigBusy && aiServers.length) {
       aiConfigBusy = true;
       await Promise.allSettled(aiServers.map(server => refreshAIModels(server.server_id, null, true)));
@@ -862,8 +890,7 @@ async function refreshAIModels(serverId, button = null, preserveOpenDialog = fal
     const result = await aiWrite(`/v1/ai/servers/${encodeURIComponent(serverId)}/models`);
     const index = aiServers.findIndex(server => server.server_id === serverId);
     if (index >= 0) aiServers[index] = result.server;
-    if (preserveOpenDialog && aiConfigDialog.open) renderAIHeader();
-    else renderAIConfig();
+    renderAIConfig();
   } catch (error) {
     setAIConfigFeedback(error.message || "Could not query models.", "error");
   } finally {
@@ -1174,6 +1201,24 @@ function disclosure(className, key, initiallyOpen = false) {
   return details;
 }
 
+function activityDisclosure(key, live) {
+  const details = element("details", "response-activity");
+  details.dataset.key = key;
+  let saved = activityState.get(key);
+  if (saved === undefined) {
+    const stored = storageRead("sessionStorage", activityStorageKey(key), "");
+    saved = stored === "open" ? true : stored === "closed" ? false : undefined;
+    if (saved !== undefined) activityState.set(key, saved);
+  }
+  details.open = saved ?? live;
+  details.addEventListener("toggle", () => {
+    if (!details.isConnected) return;
+    activityState.set(key, details.open);
+    storageWrite("sessionStorage", activityStorageKey(key), details.open ? "open" : "closed");
+  });
+  return details;
+}
+
 function formatCommand(tokens) {
   return tokens.map((token) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(token)
     ? token : `'${token.replaceAll("'", "'\\''")}'`).join(" ");
@@ -1338,13 +1383,14 @@ function renderTool(call, result, key) {
       `Trust saves this exact prefix for ${currentDetail.runner?.server_ip || currentDetail.client?.server_ip || "the selected server"}. Matching commands can run without asking.`));
   }
   if (result) {
-    const output = disclosure("tool-output", `${key}:output`, true);
-    output.append(element("summary", "", "Output"), element("pre", "tool-body",
-      (result.content || "").replace(/^exit_code=\d+\n?/, "") || "No output."));
-    output.append(copyButton((result.content || "").replace(/^exit_code=\d+\n?/, ""), "Copy output"));
-    body.append(output);
+    const output = (result.content || "").replace(/^exit_code=\d+\n?/, "") || "No output.";
+    body.append(element("pre", "tool-body", output), copyButton(output, "Copy output"));
   } else if (pending?.ui?.remote) {
     if (pending.ui.error) body.append(element("p", "command-note error", pending.ui.error));
+    body.append(element(
+      "p", "command-note",
+      `Target: ${currentDetail.runner?.client_name || currentDetail.client?.name || currentDetail.client?.server_ip || "selected server"}`,
+    ));
     const controls = element("div", "command-actions");
     controls.classList.toggle("approval-actions", pending.ui.state !== "failed");
     const actions = pending.ui.state === "failed"
@@ -1367,14 +1413,12 @@ function renderTool(call, result, key) {
 }
 
 function renderReasoning(text, key, live = false) {
-  const details = disclosure("reasoning", key, true);
-  const summary = element("summary", "", "Thinking");
-  summary.append(element("span", "reasoning-state", live ? "Live" : "Saved"));
-  details.append(summary, element("pre", "", text));
+  const details = disclosure("reasoning", key, live);
+  details.append(element("summary", "", "Thinking"), element("pre", "", text));
   return details;
 }
 
-function renderMessage(message, index, results = []) {
+function renderMessage(message, index, results = [], options = {}) {
   const role = message.role;
   const row = element("article", `message-row ${role}`);
   const stack = element("div", "message-stack");
@@ -1382,7 +1426,7 @@ function renderMessage(message, index, results = []) {
   const label = element("div", "message-label", labels[role] || role);
   if (message.ui?.stopped) label.append(element("span", "message-stopped", "Stopped"));
   stack.append(label);
-  if (message.ui?.reasoning) {
+  if (message.ui?.reasoning && options.reasoning !== false) {
     stack.append(renderReasoning(message.ui.reasoning, `message:${index}:thinking`));
   }
 
@@ -1475,7 +1519,7 @@ function renderMessage(message, index, results = []) {
     }
   }
 
-  if (Array.isArray(message.tool_calls)) {
+  if (Array.isArray(message.tool_calls) && options.tools !== false) {
     const commandGroup = element("div", message.tool_calls.length > 1 ? "command-group" : "");
     if (message.tool_calls.length > 1) {
       const ids = new Set(message.tool_calls.map(call => call.id));
@@ -1598,21 +1642,13 @@ function renderLive(live, index) {
   const row = element("article", "message-row assistant");
   row.dataset.live = "true";
   const stack = element("div", "message-stack");
-  stack.append(element("div", "message-label", "Brain · live"));
-
-  if (live.reasoning) {
-    stack.append(renderReasoning(live.reasoning, `message:${index}:thinking`, true));
-  }
+  stack.append(element("div", "message-label", "Brain"));
 
   const bubble = element("div", "bubble");
   if (live.content) {
     bubble.append(element("pre", "message-content", live.content));
-  } else {
-    const typing = element("div", "typing");
-    typing.append(element("span"), element("span"), element("span"));
-    bubble.append(typing);
+    stack.append(bubble);
   }
-  stack.append(bubble);
   row.append(stack);
   return row;
 }
@@ -2113,6 +2149,151 @@ async function deleteMemoryItem(memory) {
   }
 }
 
+const activityLabels = {
+  waiting: "Waiting for model",
+  thinking: "Thinking",
+  preparing_tool: "Preparing command",
+  running_tools: "Running commands",
+  updating_memory: "Updating memory",
+  writing: "Writing response",
+  approval: "Approval needed",
+  stopped: "Stopped",
+  failed: "Failed",
+};
+
+function activityLabel(activity, startedAt = "") {
+  const phase = activity?.phase || "waiting";
+  let label = activityLabels[phase] || "Working";
+  const tools = Array.isArray(activity?.tools) ? activity.tools : [];
+  if (phase === "running_tools" && tools.length > 1) {
+    const complete = tools.filter(tool => tool.state === "completed").length;
+    label += ` · ${complete} of ${tools.length} finished`;
+  }
+  if (["waiting", "thinking", "preparing_tool"].includes(phase) && startedAt) {
+    const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000));
+    if (Number.isFinite(seconds)) label += ` · ${seconds}s`;
+  }
+  return label;
+}
+
+function groupConversation(messages) {
+  const groups = [];
+  let current = null;
+  messages.forEach((message, index) => {
+    if (message.role === "user") {
+      current = { user: { message, index }, entries: [] };
+      groups.push(current);
+    } else if (current) {
+      current.entries.push({ message, index });
+    } else {
+      groups.push({ user: null, entries: [{ message, index }] });
+    }
+  });
+  return groups;
+}
+
+function responseKey(detail, group, position) {
+  const id = group.user?.message.ui?.message_id || group.user?.index || `legacy-${position}`;
+  return `${detail.session_id}:${detail.active_branch_id || "legacy"}:${id}`;
+}
+
+function appendReasoningBlock(container, text) {
+  if (!text) return;
+  const block = element("div", "activity-thinking");
+  block.append(element("strong", "", "Thinking"), element("pre", "", text));
+  container.append(block);
+}
+
+function renderResponseGroup(detail, group, position, isLast) {
+  const fragment = document.createDocumentFragment();
+  if (group.user) fragment.append(renderMessage(group.user.message, group.user.index));
+  const section = element("section", "response-group");
+  const key = responseKey(detail, group, position);
+  section.dataset.responseKey = key;
+
+  const assistants = group.entries.filter(entry => entry.message.role === "assistant");
+  const stoppedEntry = [...assistants].reverse().find(entry => entry.message.ui?.stopped);
+  const finalEntry = [...assistants].reverse().find(entry => (
+    typeof entry.message.content === "string" && entry.message.content.length
+    && !entry.message.tool_calls?.length
+  ));
+  const results = group.entries.filter(entry => entry.message.role === "tool").map(entry => entry.message);
+  const pendingIds = new Set((detail.pending_tool_calls || []).filter(call => call.ui?.remote).map(call => call.id));
+  const activityBody = element("div", "response-activity-body");
+  let activityCount = 0;
+
+  for (const entry of assistants) {
+    const message = entry.message;
+    if (message.ui?.reasoning) {
+      appendReasoningBlock(activityBody, message.ui.reasoning);
+      activityCount += 1;
+    }
+    if (entry !== finalEntry && typeof message.content === "string" && message.content.length) {
+      const note = element("div", "activity-commentary");
+      note.append(markdownContent(message.content));
+      activityBody.append(note);
+      activityCount += 1;
+    }
+    const completedCalls = (message.tool_calls || []).filter(call => !pendingIds.has(call.id));
+    for (const [callIndex, call] of completedCalls.entries()) {
+      activityBody.append(renderTool(
+        call,
+        results.find(result => result.tool_call_id === call.id),
+        `${key}:tool:${entry.index}:${callIndex}`,
+      ));
+      activityCount += 1;
+    }
+  }
+
+  const live = isLast ? detail.live : null;
+  if (live?.reasoning) {
+    appendReasoningBlock(activityBody, live.reasoning);
+    activityCount += 1;
+  }
+  if (live) {
+    const status = element("div", "live-activity-state", activityLabel(live.activity, live.started_at));
+    activityBody.prepend(status);
+    activityCount += 1;
+  }
+
+  if (activityCount) {
+    const activity = activityDisclosure(`${key}:activity`, Boolean(live));
+    const count = activityBody.querySelectorAll(".tool-card").length;
+    const summary = element("summary", "response-activity-summary");
+    summary.append(
+      element("span", "", live ? activityLabel(live.activity, live.started_at) : "Activity"),
+      element("span", "activity-count", count ? `${count} ${count === 1 ? "action" : "actions"}` : ""),
+    );
+    activity.append(summary, activityBody);
+    activity.classList.toggle("answers-only-hidden", answersOnlyEnabled(detail));
+    section.append(activity);
+  }
+
+  for (const entry of group.entries.filter(entry => entry.message.role === "system")) {
+    section.append(renderMessage(entry.message, entry.index));
+  }
+
+  for (const [pendingIndex, call] of (detail.pending_tool_calls || []).filter(call => (
+    call.ui?.remote && assistants.some(entry => entry.message.tool_calls?.some(item => item.id === call.id))
+  )).entries()) {
+    section.append(renderTool(call, null, `${key}:pending:${pendingIndex}`));
+  }
+
+  if (finalEntry) {
+    section.append(renderMessage(finalEntry.message, finalEntry.index, [], { reasoning: false, tools: false }));
+  }
+  if (live?.content) section.append(renderLive(live, group.entries.length));
+  if (!finalEntry && !live && group.user && activityCount && !pendingIds.size) {
+    section.append(element(
+      "p",
+      stoppedEntry ? "response-ended message-stopped" : "response-ended",
+      stoppedEntry ? "Stopped" : "No final answer.",
+    ));
+  }
+  fragment.append(section);
+  return fragment;
+}
+
 function renderDetail(detail) {
   const state = sessionState(detail.session_id);
   rememberDisclosures(transcript);
@@ -2126,21 +2307,13 @@ function renderDetail(detail) {
   const fragment = document.createDocumentFragment();
   const messages = [...detail.messages];
   if (detail.live) messages.push(...detail.live.transient_messages);
-  const groupedResults = new Set();
-  for (const [index, message] of messages.entries()) {
-    if (groupedResults.has(index)) continue;
-    const results = [];
-    if (message.tool_calls?.length) {
-      for (let next = index + 1; next < messages.length && messages[next].role === "tool"; next++) {
-        if (message.tool_calls.some((call) => call.id === messages[next].tool_call_id)) {
-          results.push(messages[next]);
-          groupedResults.add(next);
-        }
-      }
-    }
-    fragment.append(renderMessage(message, index, results));
+  const groups = groupConversation(messages);
+  groups.forEach((group, index) => {
+    fragment.append(renderResponseGroup(detail, group, index, index === groups.length - 1));
+  });
+  if (detail.live && !groups.length) {
+    fragment.append(renderResponseGroup(detail, { user: null, entries: [] }, 0, true));
   }
-  if (detail.live) fragment.append(renderLive(detail.live, messages.length));
   if (!messages.length && !detail.live) {
     fragment.append(emptyState("Empty conversation", "No client messages yet."));
   }
@@ -2155,8 +2328,8 @@ function renderDetail(detail) {
   updateJump();
 
   titleElement.textContent = detail.title || `Conversation ${shortId(detail.session_id)}`;
-  metaElement.replaceChildren(document.createTextNode(
-    `Started ${fullTime(detail.created_at)} · ${detail.message_count} messages`));
+  conversationInfo.textContent = `Started ${fullTime(detail.created_at)} · ${detail.message_count} messages`;
+  metaElement.replaceChildren();
   if (detail.client?.server_ip) {
     const link = element("button", "server-link", `Server ${detail.client.server_ip}`);
     link.type = "button";
@@ -2178,6 +2351,9 @@ function renderDetail(detail) {
     : remote?.ui.state === "failed" ? "Runner unavailable · View command"
       : "Command needs approval · Review command";
   actionsElement.classList.remove("hidden");
+  const answersOnly = answersOnlyEnabled(detail);
+  answersOnlyButton.setAttribute("aria-pressed", String(answersOnly));
+  answersOnlyButton.classList.toggle("active", answersOnly);
   archiveButton.textContent = detail.archived ? "Unarchive" : "Archive";
   archiveButton.disabled = state.actionBusy || detail.active;
   deleteButton.disabled = state.actionBusy || detail.active;
@@ -2187,10 +2363,26 @@ function renderDetail(detail) {
   showFeedback(state.feedback);
   renderConversationRunnerPicker(detail, state);
   renderComposer(detail);
+  renderResponseStatus(detail);
   state.nextCommandId = "";
   // Header/composer height may change after rendering a snapshot.
   if (wasNearBottom) transcript.scrollTop = transcript.scrollHeight;
   updateJump();
+}
+
+function renderResponseStatus(detail) {
+  if (currentView !== "conversations") {
+    responseStatus.classList.add("hidden");
+    return;
+  }
+  const remote = detail.pending_tool_calls?.filter(call => call.ui?.remote) || [];
+  let text = "";
+  if (detail.live) text = activityLabel(detail.live.activity, detail.live.started_at);
+  else if (remote.length) text = remote.length === 1
+    ? "Approval needed" : `Approval needed · ${remote.length} commands`;
+  else if (sessionState(detail.session_id).stopBusy) text = "Stopping generation…";
+  responseStatus.textContent = text;
+  responseStatus.classList.toggle("hidden", !text);
 }
 
 function renderComposer(detail) {
@@ -2459,6 +2651,10 @@ function refreshDetail() {
   conversationStream = stream;
   stream.addEventListener("snapshot", (event) => {
     if (conversationStream !== stream) return;
+    if (streamFrame) cancelAnimationFrame(streamFrame);
+    streamFrame = 0;
+    streamDeltas.reasoning = "";
+    streamDeltas.content = "";
     currentDetail = JSON.parse(event.data);
     renderDetail(currentDetail);
   });
@@ -2467,20 +2663,46 @@ function refreshDetail() {
       if (conversationStream !== stream || !currentDetail?.live) return;
       const delta = JSON.parse(event.data).delta;
       currentDetail.live[kind] += delta;
-      const follow = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 24;
-      const row = transcript.querySelector('[data-live="true"]');
-      const target = row?.querySelector(kind === "reasoning" ? ".reasoning pre" : ".message-content");
-      if (target) {
-        target.append(document.createTextNode(delta));
-      } else if (row) {
-        rememberDisclosures(row);
-        row.replaceWith(renderLive(currentDetail.live,
-          currentDetail.messages.length + currentDetail.live.transient_messages.length));
-      }
-      if (follow) transcript.scrollTop = transcript.scrollHeight;
-      updateJump();
+      streamDeltas[kind] += delta;
+      if (streamFrame) return;
+      streamFrame = requestAnimationFrame(() => {
+        streamFrame = 0;
+        const follow = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 24;
+        let needsRender = false;
+        for (const type of ["reasoning", "content"]) {
+          const chunk = streamDeltas[type];
+          streamDeltas[type] = "";
+          if (!chunk) continue;
+          const target = type === "reasoning"
+            ? transcript.querySelector(".response-group:last-child .activity-thinking:last-of-type pre")
+            : transcript.querySelector('[data-live="true"] .message-content');
+          if (target) target.append(document.createTextNode(chunk));
+          else needsRender = true;
+        }
+        if (needsRender && currentDetail) renderDetail(currentDetail);
+        else {
+          if (follow) transcript.scrollTop = transcript.scrollHeight;
+          updateJump();
+        }
+      });
     });
   }
+  stream.addEventListener("activity", event => {
+    if (conversationStream !== stream || !currentDetail?.live) return;
+    currentDetail.live.activity = JSON.parse(event.data);
+    const label = activityLabel(currentDetail.live.activity, currentDetail.live.started_at);
+    responseStatus.textContent = label;
+    responseStatus.classList.remove("hidden");
+    const liveState = transcript.querySelector(".live-activity-state");
+    if (liveState) liveState.textContent = label;
+    const summary = transcript.querySelector(".response-group:last-child .response-activity-summary span");
+    if (summary) summary.textContent = label;
+  });
+  stream.addEventListener("context", event => {
+    if (conversationStream !== stream || !currentDetail) return;
+    currentDetail.context_usage = JSON.parse(event.data);
+    renderContextMeter(currentDetail);
+  });
   stream.addEventListener("deleted", () => {
     if (conversationStream !== stream) return;
     closeConversationStream();
@@ -2838,6 +3060,14 @@ approvalBanner.addEventListener("click", () => {
   const card = [...transcript.querySelectorAll("[data-call-id]")].find(node => node.dataset.callId === pending?.id);
   if (card) { card.open = true; card.scrollIntoView({ block: "center" }); card.querySelector("summary").focus({ preventScroll: true }); }
 });
+answersOnlyButton.addEventListener("click", () => {
+  if (!currentDetail) return;
+  const state = sessionState(currentDetail.session_id);
+  state.answersOnly = !answersOnlyEnabled(currentDetail);
+  storageWrite("sessionStorage", answersOnlyKey(currentDetail), state.answersOnly ? "1" : "");
+  renderDetail(currentDetail);
+  answersOnlyButton.focus({ preventScroll: true });
+});
 document.querySelector("#connection-retry").addEventListener("click", () => {
   if (currentView === "servers") void refreshServers();
   else if (currentView === "memories") void refreshMemories();
@@ -2906,6 +3136,15 @@ document.addEventListener("keydown", event => {
 window.addEventListener("resize", positionModelPicker);
 aiConfigDialog.addEventListener("scroll", positionModelPicker, { passive: true });
 matchMedia("(max-width: 899px)").addEventListener("change", () => setSidebar(false, false));
+setInterval(() => {
+  if (!currentDetail?.live || currentView !== "conversations") return;
+  const label = activityLabel(currentDetail.live.activity, currentDetail.live.started_at);
+  responseStatus.textContent = label;
+  const liveState = transcript.querySelector(".live-activity-state");
+  if (liveState) liveState.textContent = label;
+  const summary = transcript.querySelector(".response-activity[open] > .response-activity-summary span");
+  if (summary) summary.textContent = label;
+}, 1000);
 setSidebar(false, false);
 renderView();
 void refreshDashboard();

@@ -14,7 +14,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -273,6 +273,45 @@ class LLMStreamTests(unittest.TestCase):
             self.assertEqual(len(errors), 1)
             self.assertIsInstance(errors[0], brain.TurnCancelled)
 
+    def test_cancellation_does_not_wait_for_response_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            response = BlockingHTTPResponse()
+            cancellation = brain.TurnCancellation()
+            opening = threading.Event()
+            release = threading.Event()
+            errors = []
+
+            def delayed_open(*_args, **_kwargs):
+                opening.set()
+                release.wait(timeout=2)
+                return response
+
+            def complete():
+                try:
+                    client.complete(
+                        [{"role": "user", "content": "test"}],
+                        lambda *_: None,
+                        cancellation=cancellation,
+                    )
+                except Exception as error:  # pragma: no cover - assertion aid
+                    errors.append(error)
+
+            try:
+                with patch.object(brain, "urlopen", side_effect=delayed_open):
+                    thread = threading.Thread(target=complete)
+                    thread.start()
+                    self.assertTrue(opening.wait(timeout=1))
+                    cancellation.cancel()
+                    thread.join(timeout=1)
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsInstance(errors[0], brain.TurnCancelled)
+                    release.set()
+                    self.assertTrue(response.closed.wait(timeout=1))
+            finally:
+                release.set()
+
     def test_discovers_models_from_base_url(self):
         response = FakeHTTPResponse([
             '{"data":[{"id":"model-b"},{"id":"model-a"},{"id":"model-b"}]}'
@@ -306,6 +345,90 @@ class LLMStreamTests(unittest.TestCase):
             self.assertTrue(first_payload["verbose"])
             self.assertNotIn("verbose", second_payload)
             self.assertEqual(client.context_window(), 131072)
+
+    def test_reads_nested_context_and_accepts_usage_only_chunk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            lines = [
+                'data: {"generation_settings":{"n_ctx":65536},'
+                '"choices":[{"delta":{"content":"ok"}}]}\n',
+                'data: {"choices":[],"usage":{"total_tokens":12}}\n',
+                "data: [DONE]\n",
+            ]
+            with patch.object(brain, "urlopen", return_value=FakeHTTPResponse(lines)):
+                assistant, _calls = client.complete(
+                    [{"role": "user", "content": "first"}], lambda *_: None
+                )
+            self.assertEqual(assistant["content"], "ok")
+            self.assertEqual(client.context_window(), 65536)
+
+    def test_context_properties_fallback_starts_after_real_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changed = threading.Event()
+            client = brain.LLMClient(config(Path(directory)), changed.set)
+            completion = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+                "data: [DONE]\n",
+            ])
+            props = FakeHTTPResponse([
+                '{"default_generation_settings":{"n_ctx":32768}}'
+            ])
+            requests = []
+
+            def respond(request, **_kwargs):
+                requests.append(request)
+                return completion if request.data is not None else props
+
+            with patch.object(brain, "urlopen", side_effect=respond):
+                client.complete(
+                    [{"role": "user", "content": "first"}], lambda *_: None
+                )
+                deadline = time.monotonic() + 2
+                while client.context_window() is None and time.monotonic() < deadline:
+                    changed.wait(.05)
+                    changed.clear()
+            self.assertEqual(client.context_window(), 32768)
+            self.assertEqual(client.context_info()["discovery"], "ready")
+            self.assertEqual(requests[1].full_url, "http://127.0.0.1:1/props?model=test-model")
+
+    def test_context_properties_fallback_has_hard_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changed = threading.Event()
+            client = brain.LLMClient(config(Path(directory)), changed.set)
+            completion = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+                "data: [DONE]\n",
+            ])
+            release = threading.Event()
+
+            def respond(request, **_kwargs):
+                if request.data is not None:
+                    return completion
+                release.wait(.5)
+                return FakeHTTPResponse([
+                    '{"default_generation_settings":{"n_ctx":32768}}'
+                ])
+
+            try:
+                with (
+                    patch.object(brain, "urlopen", side_effect=respond),
+                    patch.object(client, "CONTEXT_LOOKUP_TIMEOUT_SECONDS", .02),
+                ):
+                    client.complete(
+                        [{"role": "user", "content": "first"}], lambda *_: None
+                    )
+                    deadline = time.monotonic() + 1
+                    while (
+                        client.context_info()["discovery"] == "loading"
+                        and time.monotonic() < deadline
+                    ):
+                        changed.wait(.02)
+                        changed.clear()
+                self.assertEqual(client.context_info()["discovery"], "unknown")
+                self.assertIsNone(client.context_window())
+                self.assertFalse(client._context_lookup_running)
+            finally:
+                release.set()
 
     def test_folds_target_notices_into_leading_system_message(self):
         with tempfile.TemporaryDirectory() as directory:
