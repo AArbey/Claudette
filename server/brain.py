@@ -214,6 +214,7 @@ RUNNER_VERSION = 2
 WEB_ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/api.js": ("api.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/vendor/marked.js": ("vendor/marked.js", "text/javascript; charset=utf-8"),
     "/vendor/purify.js": ("vendor/purify.js", "text/javascript; charset=utf-8"),

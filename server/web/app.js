@@ -63,6 +63,9 @@ const contextServerPath = document.querySelector("#context-server-path");
 const contextServerAdd = document.querySelector("#context-server-add");
 const contextMemory = document.querySelector("#context-memory");
 const contextFeedback = document.querySelector("#context-feedback");
+const contextReferences = document.querySelector("#context-references");
+const contextTargetNote = document.querySelector("#context-target-note");
+const contextTargetOpen = document.querySelector("#context-target-open");
 const memoryDialog = document.querySelector("#memory-dialog");
 const memoryForm = document.querySelector("#memory-form");
 const memoryKeyInput = document.querySelector("#memory-key");
@@ -84,6 +87,12 @@ const aiServerKey = document.querySelector("#ai-server-key");
 const aiKeyNote = document.querySelector("#ai-key-note");
 const aiConfigFeedback = document.querySelector("#ai-config-feedback");
 const aiServerSave = document.querySelector("#ai-server-save");
+const confirmDialog = document.querySelector("#confirm-dialog");
+const confirmForm = document.querySelector("#confirm-form");
+const confirmTitle = document.querySelector("#confirm-title");
+const confirmDescription = document.querySelector("#confirm-description");
+const confirmFeedback = document.querySelector("#confirm-feedback");
+const confirmSubmit = document.querySelector("#confirm-submit");
 
 let conversations = [];
 let servers = [];
@@ -92,8 +101,11 @@ let memories = [];
 let aiServers = [];
 let aiConfigBusy = false;
 let aiConfigFeedbackTimer = null;
+let aiConfigRequestVersion = 0;
 let activeModelMenu = null;
 let activeModelTrigger = null;
+let confirmation = null;
+let routedHash = null;
 
 function closeModelPicker(restoreFocus = false) {
   const menu = activeModelMenu;
@@ -156,13 +168,31 @@ function openModelPicker(trigger, menu) {
     try { menu.showPopover(); } catch (_) {}
   }
   positionModelPicker();
-  requestAnimationFrame(() => {
+  setTimeout(() => {
     positionModelPicker();
     const search = menu.querySelector(".model-picker-search");
     const selected = menu.querySelector(".model-picker-option.selected");
     if (search) search.focus({ preventScroll: true });
-    else selected?.scrollIntoView({ block: "nearest" });
-  });
+    else {
+      const target = selected || menu.querySelector(".model-picker-option:not(.hidden)");
+      target?.focus({ preventScroll: true });
+      target?.scrollIntoView({ block: "nearest" });
+    }
+  }, 100);
+}
+
+function moveModelPickerFocus(menu, current, key) {
+  const options = [...menu.querySelectorAll(".model-picker-option:not(.hidden):not(:disabled)")];
+  if (!options.length) return;
+  const currentIndex = options.indexOf(current);
+  let nextIndex = currentIndex < 0 ? 0 : currentIndex;
+  if (key === "Home") nextIndex = 0;
+  else if (key === "End") nextIndex = options.length - 1;
+  else if (key === "ArrowDown" || key === "ArrowRight") nextIndex = (nextIndex + 1) % options.length;
+  else if (key === "ArrowUp" || key === "ArrowLeft") nextIndex = (nextIndex - 1 + options.length) % options.length;
+  for (const option of options) option.tabIndex = option === options[nextIndex] ? 0 : -1;
+  options[nextIndex].focus({ preventScroll: true });
+  options[nextIndex].scrollIntoView({ block: "nearest" });
 }
 let currentView = location.hash.startsWith("#servers") ? "servers"
   : location.hash.startsWith("#memories") ? "memories" : "conversations";
@@ -252,6 +282,50 @@ function loadDraft(id) {
   messageInput.value = state.draft ?? storageRead("sessionStorage", `brain.draft.${id}`);
   try { state.references = JSON.parse(storageRead("sessionStorage", `brain.refs.${id}`, "[]")) || []; } catch (_) { state.references = []; }
   resizeComposer();
+}
+
+function referenceKey(reference) {
+  return [reference.type || "", reference.id || reference.path || reference.label || ""].join(":");
+}
+
+function storeReferences(sessionId, references) {
+  const state = sessionState(sessionId);
+  state.references = references;
+  storageWrite("sessionStorage", `brain.refs.${sessionId}`, JSON.stringify(references));
+}
+
+function removeContextReference(sessionId, key) {
+  const state = sessionState(sessionId);
+  storeReferences(sessionId, (state.references || []).filter(reference => referenceKey(reference) !== key));
+  if (currentDetail?.session_id === sessionId) {
+    renderContextReferences(currentDetail);
+    renderContextMeter(currentDetail);
+  }
+}
+
+function renderReferencePills(references, removable = false, sessionId = "") {
+  const fragment = document.createDocumentFragment();
+  for (const reference of references || []) {
+    const pill = element("span", removable ? "context-reference" : "message-reference");
+    const type = reference.type === "attachment" ? "File" : reference.type === "server_file" ? "Server" : "Memory";
+    const label = element("span", "context-reference-label", `${type}: ${reference.label}`);
+    pill.append(label);
+    if (removable) {
+      const remove = element("button", "context-reference-remove", "×");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Remove ${reference.label}`);
+      remove.addEventListener("click", () => removeContextReference(sessionId, referenceKey(reference)));
+      pill.append(remove);
+    }
+    fragment.append(pill);
+  }
+  return fragment;
+}
+
+function renderContextReferences(detail) {
+  const references = sessionState(detail.session_id).references || [];
+  contextReferences.classList.toggle("hidden", !references.length);
+  contextReferences.replaceChildren(renderReferencePills(references, true, detail.session_id));
 }
 
 function resizeComposer() {
@@ -377,10 +451,12 @@ async function copyText(text, button) {
         button.title = label;
       } else button.textContent = "Copy";
     }, 1500);
+    return true;
   } catch (_) {
     if (iconName) button.title = "Clipboard unavailable";
     else button.textContent = "Select to copy";
     document.querySelector("#copy-status").textContent = "Clipboard unavailable. Select text and copy manually.";
+    return false;
   }
 }
 
@@ -477,28 +553,49 @@ async function updateMetadata(id, changes) {
   }
 }
 
-function openEdit(action) {
+function openEdit() {
   if (!currentDetail) return;
   conversationMenu.open = false;
   const id = currentDetail.session_id;
-  const deleting = action === "delete";
-  editAction = { action, id };
-  document.querySelector("#edit-title").textContent = deleting ? "Delete conversation?" : "Rename conversation";
-  document.querySelector("#edit-description").textContent = deleting
-    ? `“${currentDetail.title || shortId(id)}” will be permanently deleted. This cannot be undone.`
-    : "Choose a title you can find later.";
+  editAction = { action: "rename", id };
+  document.querySelector("#edit-title").textContent = "Rename conversation";
+  document.querySelector("#edit-description").textContent = "Choose a title you can find later.";
   const input = document.querySelector("#edit-input");
   input.value = currentDetail.title || "";
-  input.hidden = deleting;
-  input.required = !deleting;
-  document.querySelector("#edit-label").hidden = deleting;
+  input.hidden = false;
+  input.required = true;
+  document.querySelector("#edit-label").hidden = false;
   const submit = document.querySelector("#edit-submit");
-  submit.textContent = deleting ? "Delete conversation" : "Save title";
-  submit.classList.toggle("danger", deleting);
+  submit.textContent = "Save title";
+  submit.classList.remove("danger");
   document.querySelector("#edit-feedback").textContent = "";
   editDialog.showModal();
-  if (deleting) document.querySelector("#edit-cancel").focus();
-  else { input.focus(); input.select(); }
+  input.focus();
+  input.select();
+}
+
+function openConfirmation({ title, description, confirmLabel = "Delete", run, returnFocus = null }) {
+  confirmation = { run, returnFocus };
+  confirmTitle.textContent = title;
+  confirmDescription.textContent = description;
+  confirmFeedback.textContent = "";
+  confirmSubmit.textContent = confirmLabel;
+  confirmSubmit.disabled = false;
+  confirmDialog.showModal();
+  document.querySelector("#confirm-cancel").focus();
+}
+
+function confirmConversationDelete() {
+  if (!currentDetail) return;
+  const id = currentDetail.session_id;
+  conversationMenu.open = false;
+  openConfirmation({
+    title: "Delete conversation?",
+    description: `“${currentDetail.title || shortId(id)}” will be permanently deleted. This cannot be undone.`,
+    confirmLabel: "Delete conversation",
+    run: () => deleteConversation(id),
+    returnFocus: conversationMenu.querySelector("summary"),
+  });
 }
 
 function validSessionId(value) {
@@ -651,30 +748,19 @@ function newRunnerOption(runner = null) {
   return button;
 }
 
-function renderNewRunnerOptions() {
+function preferredNewRunner() {
+  const currentRunnerId = currentDetail?.runner_id || currentDetail?.runner?.runner_id || "";
+  const savedRunnerId = storageRead("localStorage", "brain.lastRunner", "");
+  return activeRunners().some(runner => runner.runner_id === currentRunnerId) ? currentRunnerId
+    : activeRunners().some(runner => runner.runner_id === savedRunnerId) ? savedRunnerId : "";
+}
+
+function renderNewRunnerOptions(preferred = preferredNewRunner()) {
   const fragment = document.createDocumentFragment();
   fragment.append(newRunnerOption());
   for (const runner of runners) fragment.append(newRunnerOption(runner));
   newRunnerOptions.replaceChildren(fragment);
-  selectNewRunner("");
-}
-
-async function getJson(path) {
-  const response = await fetch(path, { cache: "no-store" });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
-}
-
-async function aiWrite(path, body = {}, method = "POST") {
-  const response = await fetch(path, {
-    method,
-    headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
-    body: method === "DELETE" ? undefined : JSON.stringify(body),
-  });
-  if (response.status === 204) return {};
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
-  return result;
+  selectNewRunner(preferred);
 }
 
 function setAIConfigFeedback(message = "", state = "info", autoHide = false) {
@@ -720,10 +806,13 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
 
   const picker = element("div", "model-picker");
   const trigger = element("button", "model-picker-summary");
+  let ignoreKeyboardClick = false;
   trigger.type = "button";
   trigger.setAttribute("aria-label", `Choose ${label.toLowerCase()} on ${server.name}`);
   trigger.setAttribute("aria-haspopup", "listbox");
   trigger.setAttribute("aria-expanded", "false");
+  const menuId = `model-menu-${server.server_id}-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+  trigger.setAttribute("aria-controls", menuId);
   const summaryValue = element("span", "model-picker-value", selectedModel || "No models discovered");
   trigger.append(
     element("span", "model-picker-dot", ""),
@@ -732,6 +821,7 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
   );
 
   const menu = element("div", "model-picker-menu");
+  menu.id = menuId;
   menu.dataset.modelPopover = "true";
   menu.setAttribute("popover", "manual");
   menu.setAttribute("role", "listbox");
@@ -759,6 +849,11 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
         }
         noResults.classList.toggle("hidden", visible !== 0);
       });
+      search.addEventListener("keydown", event => {
+        if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        moveModelPickerFocus(menu, null, event.key === "ArrowUp" ? "End" : event.key);
+      });
     }
     for (const model of models) {
       const option = element("button", `model-picker-option${model === selectedModel ? " selected" : ""}`);
@@ -766,6 +861,7 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
       option.dataset.model = model;
       option.setAttribute("role", "option");
       option.setAttribute("aria-selected", String(model === selectedModel));
+      option.tabIndex = model === selectedModel ? 0 : -1;
       option.append(
         element("span", "model-picker-option-name", model),
         element("span", "model-picker-check", model === selectedModel ? "✓" : ""),
@@ -777,10 +873,20 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
           const chosen = item === option;
           item.classList.toggle("selected", chosen);
           item.setAttribute("aria-selected", String(chosen));
+          item.tabIndex = chosen ? 0 : -1;
           item.querySelector(".model-picker-check").textContent = chosen ? "✓" : "";
         }
         closeModelPicker(true);
         onChoose(model);
+      });
+      option.addEventListener("keydown", event => {
+        if (["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+          event.preventDefault();
+          moveModelPickerFocus(menu, option, event.key);
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          closeModelPicker(true);
+        }
       });
       optionList.append(option);
     }
@@ -791,6 +897,21 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
   menu.append(optionList);
   trigger.addEventListener("click", event => {
     event.preventDefault();
+    if (ignoreKeyboardClick) {
+      ignoreKeyboardClick = false;
+      return;
+    }
+    openModelPicker(trigger, menu);
+  });
+  trigger.addEventListener("keydown", event => {
+    if (!["Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+  });
+  trigger.addEventListener("keyup", event => {
+    if (!["Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+    ignoreKeyboardClick = true;
+    setTimeout(() => { ignoreKeyboardClick = false; }, 250);
     openModelPicker(trigger, menu);
   });
   picker.append(trigger);
@@ -825,33 +946,27 @@ function renderAIConfig() {
     refresh.addEventListener("click", () => void refreshAIModels(server.server_id, refresh));
     const remove = element("button", "ai-server-action danger", "Delete");
     remove.type = "button";
-    remove.addEventListener("click", () => void deleteAIServer(server));
+    remove.addEventListener("click", () => deleteAIServer(server, remove));
     actions.append(edit, refresh, remove);
 
     const models = Array.isArray(server.models) ? server.models : [];
     const modelRow = element("div", "ai-server-model-row");
-    let updateUseButton = () => {};
     const modelPicker = createAIModelPicker(
       server,
       models,
       server.selected_model,
       "Model",
-      "Chat",
-      () => updateUseButton(),
+      "Chat · saves automatically",
+      model => {
+        if (!server.active || model !== server.selected_model) {
+          void selectAIModel(server.server_id, model);
+        }
+      },
     );
-    const use = element("button", server.active ? "ai-model-use" : "ai-model-use primary", server.active ? "Selected" : "Use model");
-    use.type = "button";
-    updateUseButton = () => {
-      const selectedModel = modelPicker.selectedModel();
-      const isCurrent = server.active && selectedModel === server.selected_model;
-      use.disabled = !selectedModel || isCurrent;
-      use.textContent = isCurrent ? "Selected" : "Use model";
-      use.classList.toggle("primary", Boolean(selectedModel) && !isCurrent);
-    };
-    updateUseButton();
-    use.addEventListener("click", () => void selectAIModel(server.server_id, modelPicker.selectedModel(), use));
-    modelRow.append(modelPicker.field, use);
+    modelRow.append(modelPicker.field);
 
+    const advanced = element("details", "ai-server-advanced");
+    advanced.append(element("summary", "", "Advanced"));
     const supportRow = element("div", "ai-server-support-row");
     const supportPicker = createAIModelPicker(
       server,
@@ -879,8 +994,9 @@ function renderAIConfig() {
     });
     waitToggle.append(waitInput, waitCopy);
     supportRow.append(supportPicker.field, waitToggle);
+    advanced.append(supportRow);
     popovers.push(modelPicker.menu, supportPicker.menu);
-    card.append(details, actions, modelRow, supportRow);
+    card.append(details, actions, modelRow, advanced);
     fragment.append(card);
   }
   aiServerList.replaceChildren(fragment);
@@ -911,13 +1027,19 @@ function closeAIServerForm() {
 }
 
 async function refreshAIConfig(discover = false, preserveOpenDialog = false) {
+  const requestVersion = ++aiConfigRequestVersion;
   try {
     const result = await getJson("/v1/ai/config");
+    if (requestVersion !== aiConfigRequestVersion) return;
     aiServers = Array.isArray(result.servers) ? result.servers : [];
+    if (preserveOpenDialog && aiConfigDialog.open) {
+      renderAIHeader();
+      return;
+    }
     renderAIConfig();
     if (discover && !aiConfigBusy && aiServers.length) {
       aiConfigBusy = true;
-      await Promise.allSettled(aiServers.map(server => refreshAIModels(server.server_id, null, true)));
+      await Promise.allSettled(aiServers.map(server => refreshAIModels(server.server_id)));
       aiConfigBusy = false;
     }
   } catch (_) {
@@ -931,7 +1053,8 @@ async function refreshAIModels(serverId, button = null, preserveOpenDialog = fal
     const result = await aiWrite(`/v1/ai/servers/${encodeURIComponent(serverId)}/models`);
     const index = aiServers.findIndex(server => server.server_id === serverId);
     if (index >= 0) aiServers[index] = result.server;
-    renderAIConfig();
+    if (preserveOpenDialog && aiConfigDialog.open) renderAIHeader();
+    else renderAIConfig();
   } catch (error) {
     setAIConfigFeedback(error.message || "Could not query models.", "error");
   } finally {
@@ -939,16 +1062,15 @@ async function refreshAIModels(serverId, button = null, preserveOpenDialog = fal
   }
 }
 
-async function selectAIModel(serverId, model, button) {
-  button.disabled = true;
+async function selectAIModel(serverId, model) {
   setAIConfigFeedback("Updating model…", "info");
   try {
     await aiWrite("/v1/ai/selection", { server_id: serverId, model });
     await refreshAIConfig(false);
     setAIConfigFeedback("Model updated", "success", true);
   } catch (error) {
+    await refreshAIConfig(false);
     setAIConfigFeedback(error.message || "Could not select model.", "error");
-    button.disabled = false;
   }
 }
 
@@ -979,14 +1101,18 @@ async function setAISupportWait(serverId, waitForMain) {
   }
 }
 
-async function deleteAIServer(server) {
-  if (!confirm(`Delete AI server “${server.name}”?`)) return;
-  try {
+function deleteAIServer(server, returnFocus = null) {
+  openConfirmation({
+    title: "Delete AI server?",
+    description: `“${server.name}” and its saved endpoint configuration will be permanently deleted.`,
+    confirmLabel: "Delete AI server",
+    returnFocus,
+    run: async () => {
     await aiWrite(`/v1/ai/servers/${encodeURIComponent(server.server_id)}`, {}, "DELETE");
     await refreshAIConfig(false);
-  } catch (error) {
-    setAIConfigFeedback(error.message || "Could not delete AI server.", "error");
-  }
+      return true;
+    },
+  });
 }
 
 function setConnection(online) {
@@ -998,6 +1124,22 @@ function setConnection(online) {
   if (currentDetail && currentView === "conversations") renderComposer(currentDetail);
 }
 
+function sidebarItem({ id, selected, title, time = "", preview = "", state = "", live = false, onClick }) {
+  const button = element("button", "conversation-item");
+  button.type = "button";
+  button.dataset.focus = id;
+  button.classList.toggle("selected", selected);
+  if (selected) button.setAttribute("aria-current", "page");
+  button.addEventListener("click", onClick);
+  const top = element("div", "item-top");
+  if (live) top.append(element("span", "live-dot"));
+  top.append(element("span", "item-id", title));
+  if (time !== "") top.append(element("span", "item-time", time));
+  button.append(top, element("div", "item-preview", preview));
+  if (state) button.append(element("span", "item-state", state));
+  return button;
+}
+
 function renderConversationList() {
   const fragment = document.createDocumentFragment();
   const query = queries.conversations.trim().toLowerCase();
@@ -1007,21 +1149,17 @@ function renderConversationList() {
   for (const conversation of visible) {
     const nextGroup = conversation.pinned ? "Pinned" : "Conversations";
     if (nextGroup !== group) { fragment.append(element("p", "list-heading", nextGroup)); group = nextGroup; }
-    const button = element("button", "conversation-item");
-    button.type = "button";
-    button.dataset.focus = conversation.session_id;
-    button.classList.toggle("selected", conversation.session_id === selectedId);
-    if (conversation.session_id === selectedId) button.setAttribute("aria-current", "page");
-    button.addEventListener("click", () => selectConversation(conversation.session_id));
-    const top = element("div", "item-top");
-    if (conversation.active) top.append(element("span", "live-dot"));
-    top.append(element("span", "item-id", conversation.title || shortId(conversation.session_id)));
-    top.append(element("span", "item-time", timeAgo(conversation.updated_at)));
-    button.append(top, element("div", "item-preview", conversation.preview));
-    if (["continuation_pending", "awaiting_tool_results"].includes(conversation.status)) {
-      button.append(element("span", "item-state", conversation.status === "continuation_pending" ? "Needs resume" : "Command pending"));
-    }
-    fragment.append(button);
+    fragment.append(sidebarItem({
+      id: conversation.session_id,
+      selected: conversation.session_id === selectedId,
+      title: conversation.title || shortId(conversation.session_id),
+      time: timeAgo(conversation.updated_at),
+      preview: conversation.preview,
+      live: conversation.active,
+      state: conversation.status === "continuation_pending" ? "Needs resume"
+        : conversation.status === "awaiting_tool_results" ? "Command pending" : "",
+      onClick: () => selectConversation(conversation.session_id),
+    }));
   }
   if (!visible.length) fragment.append(element("p", "list-empty", query ? "No matching conversations. Try another search." : "No conversations in this view."));
   replaceList(listElement, fragment);
@@ -1031,18 +1169,14 @@ function renderConversationList() {
 function renderServerList() {
   const fragment = document.createDocumentFragment();
   for (const server of servers.filter(item => `${item.name} ${item.server_ip}`.toLowerCase().includes(queries.servers.trim().toLowerCase()))) {
-    const button = element("button", "conversation-item server-item");
-    button.type = "button";
-    button.dataset.focus = server.server_ip;
-    if (server.server_ip === selectedServerIp) button.setAttribute("aria-current", "page");
-    button.classList.toggle("selected", server.server_ip === selectedServerIp);
-    button.addEventListener("click", () => selectServer(server.server_ip));
-    const top = element("div", "item-top");
-    top.append(element("span", "item-id", server.name || server.server_ip));
-    top.append(element("span", "item-time", timeAgo(server.last_seen_at)));
-    const details = server.name ? server.server_ip : "Unnamed server";
-    button.append(top, element("div", "item-preview", details));
-    fragment.append(button);
+    fragment.append(sidebarItem({
+      id: server.server_ip,
+      selected: server.server_ip === selectedServerIp,
+      title: server.name || server.server_ip,
+      time: timeAgo(server.last_seen_at),
+      preview: server.name ? server.server_ip : "Unnamed server",
+      onClick: () => selectServer(server.server_ip),
+    }));
   }
   if (!fragment.childNodes.length) fragment.append(element("p", "list-empty", "No matching servers. Connect a client to get started."));
   replaceList(serverListElement, fragment);
@@ -1063,29 +1197,23 @@ function renderMemoryRunnerList() {
   });
   const globalMemories = memories.filter((memory) => memory.runner_id == null);
   if (!query || `global ${globalMemories.map((m) => `${m.key} ${m.value}`).join(" ")}`.toLowerCase().includes(query)) {
-    const button = element("button", "conversation-item server-item");
-    button.type = "button"; button.dataset.focus = "global"; button.classList.toggle("selected", selectedMemoryRunnerId === "global");
-    button.addEventListener("click", () => selectMemoryRunner("global"));
-    const top = element("div", "item-top"); top.append(element("span", "item-id", "Global"), element("span", "item-time", String(globalMemories.length)));
-    button.append(top, element("div", "item-preview", "Available in every chat"));
-    fragment.append(button);
+    fragment.append(sidebarItem({
+      id: "global", selected: selectedMemoryRunnerId === "global", title: "Global",
+      time: String(globalMemories.length), preview: "Available in every chat",
+      onClick: () => selectMemoryRunner("global"),
+    }));
   }
   for (const runner of visible) {
-    const button = element("button", "conversation-item server-item");
-    button.type = "button";
-    button.dataset.focus = runner.runner_id;
-    button.classList.toggle("selected", runner.runner_id === selectedMemoryRunnerId);
-    if (runner.runner_id === selectedMemoryRunnerId) button.setAttribute("aria-current", "page");
-    button.addEventListener("click", () => selectMemoryRunner(runner.runner_id));
-    const top = element("div", "item-top");
-    top.append(
-      element("span", "item-id", runner.client_name),
-      element("span", "item-time", String(memoryCountForRunner(runner.runner_id))),
-    );
-    button.append(top, element("div", "item-preview", `${runner.server_ip}:${runner.port}`));
-    fragment.append(button);
+    fragment.append(sidebarItem({
+      id: runner.runner_id,
+      selected: runner.runner_id === selectedMemoryRunnerId,
+      title: runner.client_name,
+      time: String(memoryCountForRunner(runner.runner_id)),
+      preview: `${runner.server_ip}:${runner.port}`,
+      onClick: () => selectMemoryRunner(runner.runner_id),
+    }));
   }
-  if (!visible.length) {
+  if (!fragment.childNodes.length) {
     fragment.append(element("p", "list-empty", query
       ? "No runner or memory matches this search."
       : "No runners are installed yet."));
@@ -1106,55 +1234,42 @@ function visibleConversations() {
   return conversations.filter((item) => !item.archived);
 }
 
+function routeUrl(hash) {
+  return hash ? `#${hash}` : location.pathname;
+}
+
+function navigateRoute(hash, replace = false) {
+  const next = hash ? `#${hash}` : "";
+  if (!replace && location.hash === next) {
+    setSidebar(false);
+    return;
+  }
+  if (replace) history.replaceState(null, "", routeUrl(hash));
+  else if (location.hash !== next) history.pushState(null, "", routeUrl(hash));
+  applyRoute(true);
+}
+
 function selectConversation(sessionId) {
-  saveDraft();
-  currentView = "conversations";
-  selectedId = sessionId;
-  location.hash = sessionId;
-  setSidebar(false);
-  renderView();
-  renderConversationList();
-  refreshDetail();
+  navigateRoute(sessionId);
 }
 
 function selectServer(serverIp) {
-  selectedServerIp = serverIp;
-  location.hash = `servers/${encodeURIComponent(serverIp)}`;
-  setSidebar(false);
-  renderServerList();
-  renderServers();
+  navigateRoute(`servers/${encodeURIComponent(serverIp)}`);
 }
 
 function selectMemoryRunner(runnerId) {
-  selectedMemoryRunnerId = runnerId;
-  location.hash = `memories/${encodeURIComponent(runnerId)}`;
-  setSidebar(false);
-  renderMemoryRunnerList();
-  renderMemories();
+  navigateRoute(`memories/${encodeURIComponent(runnerId)}`);
 }
 
 function showServers(serverIp = null) {
-  saveDraft();
-  currentView = "servers";
   if (typeof serverIp === "string") selectedServerIp = serverIp;
-  location.hash = selectedServerIp ? `servers/${encodeURIComponent(selectedServerIp)}` : "servers";
-  closeConversationStream();
-  setSidebar(false);
-  renderView();
-  void refreshServers();
+  navigateRoute(selectedServerIp ? `servers/${encodeURIComponent(selectedServerIp)}` : "servers");
 }
 
 function showMemories(runnerId = null) {
-  saveDraft();
-  currentView = "memories";
   if (typeof runnerId === "string") selectedMemoryRunnerId = runnerId;
-  location.hash = selectedMemoryRunnerId
-    ? `memories/${encodeURIComponent(selectedMemoryRunnerId)}`
-    : "memories";
-  closeConversationStream();
-  setSidebar(false);
-  renderView();
-  void refreshMemories();
+  navigateRoute(selectedMemoryRunnerId
+    ? `memories/${encodeURIComponent(selectedMemoryRunnerId)}` : "memories");
 }
 
 async function openAddServer() {
@@ -1237,14 +1352,14 @@ function renderView() {
   }
 }
 
-function emptyState(title, text) {
+function emptyState(title, text, showStart = false) {
   const wrapper = element("div", "empty-state");
   wrapper.append(
     element("div", "empty-icon", "⌁"),
     element("h3", "", title),
     element("p", "", text),
   );
-  if (currentView === "conversations" && !title.startsWith("Loading")) {
+  if (showStart) {
     const start = element("button", "primary", "New conversation");
     start.type = "button";
     start.addEventListener("click", () => void openNewConversation());
@@ -1318,7 +1433,7 @@ function renderMemoryTool(call, result, key) {
     recall_memory: "Recall memory",
     delete_memory: "Delete memory",
   };
-  const card = disclosure("tool-card memory-tool-call", key, false);
+  const card = disclosure("tool-card", key, false);
   const summary = element("summary", "tool-summary");
   const target = typeof args.key === "string" ? args.key
     : typeof args.query === "string" && args.query ? `“${args.query}”` : "runner memory";
@@ -1502,7 +1617,7 @@ function renderMessage(message, index, results = [], options = {}) {
     ? message.ui.display_content : message.content;
   if (typeof content === "string" && content.length) {
     if (role === "tool") {
-      const output = disclosure("tool-output standalone", `message:${index}:output`);
+      const output = disclosure("tool-output", `message:${index}:output`);
       output.append(element("summary", "", "Output"), element("pre", "tool-body", content), copyButton(content, "Copy output"));
       stack.append(output);
     } else {
@@ -1543,6 +1658,11 @@ function renderMessage(message, index, results = [], options = {}) {
         bubble.append(editor);
       } else {
         bubble.append(role === "assistant" ? markdownContent(content) : element("pre", "message-content", content));
+        if (role === "user" && Array.isArray(message.references) && message.references.length) {
+          const referenceList = element("div", "message-reference-list");
+          referenceList.append(renderReferencePills(message.references));
+          bubble.append(referenceList);
+        }
         if (role !== "user") bubble.append(copyButton(content, "Copy message", true));
       }
       stack.append(bubble);
@@ -1706,7 +1826,7 @@ async function branchFromMessage(index, content) {
   }
 }
 
-function renderLive(live, index) {
+function renderLive(live) {
   const row = element("article", "message-row assistant");
   row.dataset.live = "true";
   const stack = element("div", "message-stack");
@@ -2135,7 +2255,7 @@ function renderMemories() {
       edit.addEventListener("click", () => openMemoryDialog(memory));
       const remove = element("button", "memory-action danger", "Delete");
       remove.type = "button";
-      remove.addEventListener("click", () => void deleteMemoryItem(memory));
+      remove.addEventListener("click", () => deleteMemoryItem(memory, remove));
       actions.append(edit, remove);
       head.append(key, actions);
       const value = element("div", "memory-value", memory.value);
@@ -2199,22 +2319,27 @@ async function saveMemoryFromDialog() {
   }
 }
 
-async function deleteMemoryItem(memory) {
-  if (!window.confirm(`Delete memory “${memory.key}” from this runner?`)) return;
-  try {
-    const response = await fetch(`/v1/memories/${encodeURIComponent(memory.memory_id)}`, {
-      method: "DELETE",
-      headers: { "X-Brain-UI": "1" },
-    });
-    if (!response.ok) {
-      let message = `HTTP ${response.status}`;
-      try { message = (await response.json()).error || message; } catch (_) {}
-      throw new Error(message);
-    }
-    await refreshMemories();
-  } catch (error) {
-    showFeedback(error.message || "Could not delete memory.");
-  }
+function deleteMemoryItem(memory, returnFocus = null) {
+  const scope = memory.runner_id == null ? "global memory" : "runner memory";
+  openConfirmation({
+    title: "Delete memory?",
+    description: `Delete ${scope} “${memory.key}”? This cannot be undone.`,
+    confirmLabel: "Delete memory",
+    returnFocus,
+    run: async () => {
+      const response = await fetch(`/v1/memories/${encodeURIComponent(memory.memory_id)}`, {
+        method: "DELETE",
+        headers: { "X-Brain-UI": "1" },
+      });
+      if (!response.ok) {
+        let message = `HTTP ${response.status}`;
+        try { message = (await response.json()).error || message; } catch (_) {}
+        throw new Error(message);
+      }
+      await refreshMemories();
+      return true;
+    },
+  });
 }
 
 const activityLabels = {
@@ -2350,7 +2475,7 @@ function renderResponseGroup(detail, group, position, isLast) {
   if (finalEntry) {
     section.append(renderMessage(finalEntry.message, finalEntry.index, [], { reasoning: false, tools: false }));
   }
-  if (live?.content) section.append(renderLive(live, group.entries.length));
+  if (live?.content) section.append(renderLive(live));
   if (!finalEntry && !live && group.user && activityCount && !pendingIds.size) {
     section.append(element(
       "p",
@@ -2396,13 +2521,14 @@ function renderDetail(detail) {
   updateJump();
 
   titleElement.textContent = detail.title || `Conversation ${shortId(detail.session_id)}`;
+  titleElement.title = titleElement.textContent;
   conversationInfo.textContent = `Started ${fullTime(detail.created_at)} · ${detail.message_count} messages`;
   metaElement.replaceChildren();
   if (detail.client?.server_ip) {
     const link = element("button", "server-link", `Server ${detail.client.server_ip}`);
     link.type = "button";
     link.addEventListener("click", () => showServers(detail.client.server_ip));
-    metaElement.append(document.createTextNode(" · "), link);
+    metaElement.append(link);
   }
   statusBadge.classList.remove("hidden", "live");
   statusBadge.classList.toggle("live", detail.active);
@@ -2465,23 +2591,32 @@ function renderComposer(detail) {
   messageSend.classList.toggle("hidden", detail.active);
   messageStop.classList.toggle("hidden", !detail.active);
   messageStop.disabled = state.stopBusy || !connected;
-  messageSend.disabled = unavailable || !messageInput.value.trim();
+  messageSend.disabled = unavailable || (!messageInput.value.trim() && !(state.references || []).length);
   messageSend.textContent = state.messageBusy ? "Sending…"
     : state.branchBusy ? "Switching…" : state.commandBusy ? "Working…" : "Send";
   messageHint.classList.toggle("error", Boolean(state.failure));
-  if (state.failure) messageHint.textContent = state.failure;
-  else if (state.notice && !detail.active) messageHint.textContent = state.notice;
-  else if (detail.archived) messageHint.textContent = "Restore conversation before replying.";
-  else if (!connected) messageHint.textContent = "Reconnecting. Your draft is kept here.";
-  else if (detail.active) messageHint.textContent = state.stopBusy
+  messageHint.replaceChildren();
+  let hint = "";
+  if (state.failure) hint = state.failure;
+  else if (state.notice && !detail.active) hint = state.notice;
+  else if (detail.archived) hint = "Restore conversation before replying.";
+  else if (!connected) hint = "Reconnecting. Your draft is kept here.";
+  else if (detail.active) hint = state.stopBusy
     ? "Stopping generation…" : "Brain is replying. You can draft your next message.";
-  else if (detail.status === "awaiting_tool_results") messageHint.textContent = detail.pending_tool_calls?.some(call => call.ui?.remote)
+  else if (detail.status === "awaiting_tool_results") hint = detail.pending_tool_calls?.some(call => call.ui?.remote)
     ? "Review command above, or send a new instruction to cancel it." : "Sending cancels pending terminal commands.";
-  else if (detail.status === "continuation_pending") messageHint.textContent = "Send an instruction to resume this interrupted conversation.";
-  else if (!aiReady) messageHint.textContent = "Configure AI model before sending messages.";
-  else messageHint.textContent = detail.runner
+  else if (detail.status === "continuation_pending") hint = "Send an instruction to resume this interrupted conversation.";
+  else if (!aiReady) {
+    hint = "Configure AI model before sending messages.";
+    const configure = element("button", "composer-hint-action", "Configure AI");
+    configure.type = "button";
+    configure.addEventListener("click", openAIConfig);
+    messageHint.append(document.createTextNode(`${hint} `), configure);
+  } else hint = detail.runner
     ? `Commands run on ${detail.runner.client_name} after approval or a trusted-prefix match.`
     : "Chat only · Select a target to enable commands.";
+  if (!messageHint.childNodes.length) messageHint.textContent = hint;
+  renderContextReferences(detail);
   renderContextMeter(detail);
 }
 
@@ -2520,26 +2655,27 @@ async function openNewConversation() {
   setSidebar(false, false);
   if (!newConversationDialog.open) newConversationDialog.showModal();
   const feedback = document.querySelector("#new-conversation-feedback");
+  const preferred = preferredNewRunner();
+  renderNewRunnerOptions(preferred);
+  createConversationButton.disabled = false;
+  showFeedback(activeRunners().length ? "" : "No available runners. Chat only remains available.", null, feedback);
   newRunnerLoading = true;
-  createConversationButton.disabled = true;
-  newRunnerOptions.replaceChildren();
-  showFeedback("Loading execution targets…", null, feedback);
   try {
     const result = await getJson("/v1/runners");
     runners = Array.isArray(result.runners) ? result.runners : [];
+    const selected = newRunnerSelect.value;
+    const stillValid = !selected || activeRunners().some(runner => runner.runner_id === selected);
+    renderNewRunnerOptions(stillValid ? selected : preferredNewRunner());
     showFeedback(activeRunners().length ? "" : "No available runners. Continue with chat only, or open Manage runners to set one up.", null, feedback);
   } catch (_) {
-    runners = [];
-    showFeedback("Could not load runners. Chat only is available.", () => void openNewConversation(), feedback);
+    showFeedback("Could not refresh runners. Cached targets remain available.", () => void openNewConversation(), feedback);
   } finally {
-    renderNewRunnerOptions();
-    createConversationButton.disabled = false;
     newRunnerLoading = false;
   }
 }
 
 async function createConversation() {
-  if (newConversationBusy || newRunnerLoading) return;
+  if (newConversationBusy) return;
   newConversationBusy = true;
   const runnerId = newRunnerSelect.value || null;
   createConversationButton.disabled = true;
@@ -2551,6 +2687,7 @@ async function createConversation() {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    storageWrite("localStorage", "brain.lastRunner", runnerId || "");
     newConversationDialog.close();
     selectConversation(result.session_id);
     await refreshList();
@@ -2587,7 +2724,7 @@ async function sendWebMessage() {
   if (state.messageBusy || state.branchBusy || state.commandBusy
     || currentDetail.active || currentDetail.archived || !connected) return;
   const content = messageInput.value;
-  if (!content.trim()) return;
+  if (!content.trim() && !(state.references || []).length) return;
   let references = state.references || [];
   if (!references.length) {
     try { references = JSON.parse(storageRead("sessionStorage", `brain.refs.${sessionId}`, "[]")) || []; }
@@ -2663,7 +2800,7 @@ async function refreshList() {
     if (currentView !== "conversations") return;
     setConnection(!selectedId || conversationStream?.readyState === EventSource.OPEN);
     const visible = visibleConversations();
-    if (selectedId && !conversations.some((item) => item.session_id === selectedId)) {
+    if (selectedId && !visibleConversations().some((item) => item.session_id === selectedId)) {
       selectedId = null;
       closeConversationStream();
       history.replaceState(null, "", location.pathname);
@@ -2681,7 +2818,7 @@ async function refreshList() {
       statusBadge.classList.add("hidden");
       actionsElement.classList.add("hidden");
       messageForm.classList.add("hidden");
-      transcript.replaceChildren(emptyState("No conversations", "Client sessions appear here automatically."));
+      transcript.replaceChildren(emptyState("No conversations", "Client sessions appear here automatically.", true));
     }
     renderView();
   } catch (_error) {
@@ -2832,15 +2969,16 @@ async function deleteConversation(id) {
     await refreshList();
     return true;
   } catch (error) {
-    document.querySelector("#edit-feedback").textContent = error.message || "Could not delete conversation. Try again.";
-    return false;
+    throw new Error(error.message || "Could not delete conversation. Try again.");
   } finally { state.actionBusy = false; }
 }
 
 menuButton.addEventListener("click", () => setSidebar(true));
 sidebarShade.addEventListener("click", () => setSidebar(false));
 document.querySelector("#sidebar-close").addEventListener("click", () => setSidebar(false));
-window.addEventListener("hashchange", () => {
+function applyRoute(force = false) {
+  if (!force && routedHash === location.hash) return;
+  routedHash = location.hash;
   saveDraft();
   const value = location.hash.slice(1);
   if (value === "servers" || value.startsWith("servers/")) {
@@ -2865,7 +3003,9 @@ window.addEventListener("hashchange", () => {
     void refreshList();
   }
   setSidebar(false, false);
-});
+}
+window.addEventListener("hashchange", () => applyRoute());
+window.addEventListener("popstate", () => applyRoute());
 
 async function refreshServers() {
   try {
@@ -2908,20 +3048,18 @@ async function refreshMemories() {
 }
 
 async function refreshDashboard() {
-  void refreshAIConfig(false, true);
-  if (currentView === "servers") await refreshServers();
-  else if (currentView === "memories") await refreshMemories();
-  else await refreshList();
-  window.setTimeout(refreshDashboard, 3000);
+  try {
+    await refreshAIConfig(false, true);
+    if (currentView === "servers") await refreshServers();
+    else if (currentView === "memories") await refreshMemories();
+    else await refreshList();
+  } finally {
+    window.setTimeout(refreshDashboard, 3000);
+  }
 }
 
 conversationsViewButton.addEventListener("click", () => {
-  currentView = "conversations";
-  if (selectedId) location.hash = selectedId;
-  else history.replaceState(null, "", location.pathname);
-  renderView();
-  if (selectedId) void refreshDetail();
-  void refreshList();
+  navigateRoute(selectedId || "");
 });
 serversViewButton.addEventListener("click", () => showServers());
 memoriesViewButton.addEventListener("click", () => showMemories());
@@ -2937,15 +3075,16 @@ filterElement.addEventListener("change", () => {
   void refreshList();
 });
 archiveButton.addEventListener("click", () => void changeConversationArchive());
-deleteButton.addEventListener("click", () => openEdit("delete"));
+deleteButton.addEventListener("click", confirmConversationDelete);
 newConversationButton.addEventListener("click", () => void openNewConversation());
 addServerButton.addEventListener("click", () => void openAddServer());
 newMemoryButton.addEventListener("click", () => openMemoryDialog());
-aiConfigButton.addEventListener("click", () => {
+function openAIConfig() {
   closeAIServerForm();
-  aiConfigDialog.showModal();
+  if (!aiConfigDialog.open) aiConfigDialog.showModal();
   void refreshAIConfig(true);
-});
+}
+aiConfigButton.addEventListener("click", openAIConfig);
 aiConfigClose.addEventListener("click", () => aiConfigDialog.close());
 aiServerAdd.addEventListener("click", () => openAIServerForm());
 document.querySelector("#ai-server-cancel").addEventListener("click", closeAIServerForm);
@@ -3081,34 +3220,104 @@ function addContextReference(ref) {
   if (!currentDetail) return;
   const sessionId = currentDetail.session_id;
   const state = sessionState(sessionId);
-  state.references = [...(state.references || []), ref];
-  const label = `[${ref.label}]`;
-  const start = messageInput.selectionStart ?? messageInput.value.length;
-  messageInput.value = `${messageInput.value.slice(0, start)}${label}${messageInput.value.slice(messageInput.selectionEnd ?? start)}`;
-  messageInput.focus(); messageInput.selectionStart = messageInput.selectionEnd = start + label.length;
-  state.draft = messageInput.value;
-  draftSessionId = sessionId;
-  storageWrite("sessionStorage", `brain.draft.${sessionId}`, messageInput.value);
-  storageWrite("sessionStorage", `brain.refs.${sessionId}`, JSON.stringify(state.references));
-  resizeComposer(); renderComposer(currentDetail); contextDialog.close();
-}
-contextAdd.addEventListener("click", () => {
-  if (!currentDetail) return;
-  contextFeedback.textContent = ""; contextFile.value = "";
-  contextMemory.replaceChildren();
-  for (const memory of memories) {
-    const button = element("button", "context-memory-item", `${memory.key} · ${memory.runner_id ? (memory.server_name || memory.server_ip || "runner") : "Global"}`);
-    button.type = "button"; button.addEventListener("click", () => addContextReference({type:"memory", id:memory.memory_id, label:memory.key, snapshot: memory.value})); contextMemory.append(button);
+  const references = state.references || [];
+  if (references.some(item => referenceKey(item) === referenceKey(ref))) {
+    contextFeedback.textContent = `${ref.label} is already attached.`;
+    return;
   }
+  if (references.length >= 32) {
+    contextFeedback.textContent = "Maximum 32 context items.";
+    return;
+  }
+  storeReferences(sessionId, [...references, ref]);
+  renderComposer(currentDetail);
+  contextDialog.close();
+  messageInput.focus({ preventScroll: true });
+}
+
+function setContextTab(name, focus = false) {
+  const tabs = [...document.querySelectorAll("[data-context-tab]")];
+  for (const tab of tabs) {
+    const selected = tab.dataset.contextTab === name;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    if (selected && focus) tab.focus({ preventScroll: true });
+  }
+  for (const panel of document.querySelectorAll(".context-panel")) {
+    panel.classList.toggle("hidden", panel.id !== `context-${name}`);
+  }
+}
+
+function renderContextMemoryChoices() {
+  if (!currentDetail) return;
+  const runnerId = currentDetail.runner_id || currentDetail.runner?.runner_id || null;
+  const available = memories.filter(memory => memory.runner_id == null || memory.runner_id === runnerId);
+  const fragment = document.createDocumentFragment();
+  for (const memory of available) {
+    const scope = memory.runner_id == null ? "Global" : currentDetail.runner?.client_name || "Selected runner";
+    const button = element("button", "context-memory-item", `${memory.key} · ${scope}`);
+    button.type = "button";
+    button.addEventListener("click", () => addContextReference({
+      type: "memory", id: memory.memory_id, label: memory.key, snapshot: memory.value,
+    }));
+    fragment.append(button);
+  }
+  if (!available.length) fragment.append(element("p", "context-empty", "No memories available for this conversation."));
+  contextMemory.replaceChildren(fragment);
+}
+
+async function openContextDialog() {
+  if (!currentDetail) return;
+  contextFeedback.textContent = "";
+  contextFile.value = "";
+  contextServerPath.value = "";
+  setContextTab("upload");
+  const hasRunner = Boolean(currentDetail.runner_id || currentDetail.runner?.runner_id);
+  const serverTab = document.querySelector("#context-tab-server");
+  serverTab.disabled = !hasRunner;
+  serverTab.title = hasRunner ? "" : "Select execution target first";
+  contextTargetNote.classList.toggle("hidden", hasRunner);
+  contextMemory.replaceChildren(element("p", "context-empty", "Loading memories…"));
   contextDialog.showModal();
-});
+  try {
+    const result = await getJson("/v1/memories");
+    memories = Array.isArray(result.memories) ? result.memories : [];
+    if (Array.isArray(result.runners)) runners = result.runners;
+    renderContextMemoryChoices();
+  } catch (error) {
+    contextMemory.replaceChildren(element("p", "context-empty error", "Could not load memories."));
+    contextFeedback.textContent = error.message || "Could not load memories.";
+  }
+}
+
+contextAdd.addEventListener("click", () => void openContextDialog());
 contextClose.addEventListener("click", () => contextDialog.close());
-document.querySelectorAll("[data-context-tab]").forEach(button => button.addEventListener("click", () => {
-  document.querySelectorAll(".context-panel").forEach(panel => panel.classList.toggle("hidden", panel.id !== `context-${button.dataset.contextTab}`));
-}));
+document.querySelectorAll("[data-context-tab]").forEach(button => {
+  button.addEventListener("click", () => setContextTab(button.dataset.contextTab));
+  button.addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = [...document.querySelectorAll("[data-context-tab]:not(:disabled)")];
+    const index = tabs.indexOf(button);
+    if (index < 0) return;
+    event.preventDefault();
+    let next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+      : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    setContextTab(tabs[next].dataset.contextTab, true);
+  });
+});
+contextTargetOpen.addEventListener("click", () => {
+  contextDialog.close();
+  runnerPicker.open = true;
+  runnerPickerSummary.focus({ preventScroll: true });
+});
 contextServerAdd.addEventListener("click", () => {
   const path = contextServerPath.value.trim(); if (!path) return;
-  addContextReference({type:"server_file", label:path, path, runner_id:currentDetail?.runner?.runner_id || null});
+  const runnerId = currentDetail?.runner_id || currentDetail?.runner?.runner_id;
+  if (!runnerId) {
+    contextFeedback.textContent = "Select execution target before adding server path.";
+    return;
+  }
+  addContextReference({type:"server_file", label:path, path, runner_id:runnerId});
 });
 contextUploadButton.addEventListener("click", async () => {
   const file = contextFile.files?.[0]; if (!file || !currentDetail) return;
@@ -3141,7 +3350,7 @@ document.querySelector("#connection-retry").addEventListener("click", () => {
   else if (currentView === "memories") void refreshMemories();
   else { closeConversationStream(); refreshDetail(); void refreshList(); }
 });
-document.querySelector("#rename-button").addEventListener("click", () => openEdit("rename"));
+document.querySelector("#rename-button").addEventListener("click", openEdit);
 document.querySelector("#pin-button").addEventListener("click", () => {
   conversationMenu.open = false;
   if (currentDetail) void updateMetadata(currentDetail.session_id, { pinned: !currentDetail.pinned });
@@ -3154,12 +3363,31 @@ document.querySelector("#edit-form").addEventListener("submit", async event => {
   const button = document.querySelector("#edit-submit");
   if (button.disabled) return;
   button.disabled = true;
-  const ok = action.action === "delete" ? await deleteConversation(action.id)
-    : await updateMetadata(action.id, { title: document.querySelector("#edit-input").value });
+  const ok = await updateMetadata(action.id, { title: document.querySelector("#edit-input").value });
   button.disabled = false;
   if (ok) editDialog.close();
 });
 editDialog.addEventListener("close", () => { editAction = null; conversationMenu.querySelector("summary").focus(); });
+document.querySelector("#confirm-cancel").addEventListener("click", () => confirmDialog.close());
+confirmForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!confirmation || confirmSubmit.disabled) return;
+  confirmSubmit.disabled = true;
+  confirmFeedback.textContent = "";
+  try {
+    const done = await confirmation.run();
+    if (done !== false) confirmDialog.close();
+  } catch (error) {
+    confirmFeedback.textContent = error.message || "Could not complete action.";
+  } finally {
+    confirmSubmit.disabled = false;
+  }
+});
+confirmDialog.addEventListener("close", () => {
+  const returnFocus = confirmation?.returnFocus;
+  confirmation = null;
+  if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+});
 newConversationDialog.addEventListener("close", () => {
   if (!newConversationBusy) {
     if (matchMedia("(max-width: 899px)").matches) menuButton.focus(); else newConversationButton.focus();

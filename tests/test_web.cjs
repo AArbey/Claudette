@@ -54,19 +54,23 @@ async function noOverflow(page) {
     await page.getByRole('button', { name: 'Configure AI' }).click();
     await waitText(page, '#ai-server-list', 'Configured AI');
     const chatPicker = page.getByRole('button', { name: 'Choose model on Configured AI' });
-    const supportPicker = page.getByRole('button', { name: 'Choose support model on Configured AI' });
     assert.equal(await chatPicker.locator('.model-picker-value').innerText(), 'test-model');
-    assert.equal(await supportPicker.locator('.model-picker-value').innerText(), 'test-model');
-    await chatPicker.click();
-    await page.getByRole('listbox', { name: 'Model options on Configured AI' })
-      .getByRole('option', { name: 'alternate-model' }).click();
-    await page.getByRole('button', { name: 'Use model', exact: true }).click();
+    await chatPicker.press('Enter');
+    await page.getByRole('listbox', { name: 'Model options on Configured AI' }).waitFor();
+    assert.equal(await page.getByRole('option', { name: 'test-model' }).evaluate(node => node === document.activeElement), true);
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await page.getByRole('option', { name: 'alternate-model' }).evaluate(node => node === document.activeElement), true);
+    await page.keyboard.press('Enter');
     await waitText(page, '#ai-model-value', 'alternate-model');
     await waitText(page, '#ai-config-feedback', 'Model updated');
+    await page.getByText('Advanced', { exact: true }).click();
+    const supportPicker = page.getByRole('button', { name: 'Choose support model on Configured AI' });
+    assert.equal(await supportPicker.locator('.model-picker-value').innerText(), 'test-model');
     await page.getByRole('button', { name: 'Choose support model on Configured AI' }).click();
     await page.getByRole('listbox', { name: 'Support model options on Configured AI' })
       .getByRole('option', { name: 'alternate-model' }).click();
     await waitText(page, '#ai-config-feedback', 'Support model updated');
+    await page.getByText('Advanced', { exact: true }).click();
     const waitForMain = page.getByRole('checkbox', { name: 'Wait for main LLM completion on Configured AI' });
     assert.equal(await waitForMain.isChecked(), false);
     await waitForMain.check();
@@ -74,6 +78,20 @@ async function noOverflow(page) {
     assert.equal(await page.getByRole('checkbox', { name: 'Wait for main LLM completion on Configured AI' }).isChecked(), true);
     await noOverflow(page);
     await page.getByRole('button', { name: 'Close', exact: true }).click();
+
+    // Context opens with fresh memories, explicit references, and unavailable host paths in chat-only mode.
+    await page.getByRole('button', { name: 'Add context' }).click();
+    await page.getByRole('tab', { name: 'Memories' }).click();
+    await page.getByRole('button', { name: /workspace.owner/ }).waitFor();
+    assert.equal(await page.getByRole('button', { name: /workspace.root/ }).count(), 0);
+    assert.equal(await page.getByRole('tab', { name: 'Server files' }).isDisabled(), true);
+    await page.getByRole('button', { name: /workspace.owner/ }).click();
+    await page.getByRole('button', { name: 'Remove workspace.owner' }).waitFor();
+    assert.equal(await page.locator('#message-input').inputValue(), '');
+    await page.getByRole('button', { name: 'Remove workspace.owner' }).click();
+    assert.equal(await page.locator('#context-references').isVisible(), false);
+    console.log('Context memories, chips, and chat-only host guard passed');
+
     const mobilePage = await context.newPage();
     await mobilePage.setViewportSize({ width: 390, height: 844 });
     await openChat(mobilePage, fixture, 'main');

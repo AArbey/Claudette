@@ -48,6 +48,8 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
         runner_id, success=True, runner_version=brain.RUNNER_VERSION
     )
     service.store.record_runner_probe("s" * 32, success=False, error="offline: Connection refused. Check the service and firewall.")
+    service.store.save_memory(None, "workspace.owner", "operations")
+    service.store.save_memory(runner_id, "workspace.root", "/srv/production")
 
     def probe(ident):
         service.store.record_runner_probe(
