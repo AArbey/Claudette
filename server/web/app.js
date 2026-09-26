@@ -87,6 +87,21 @@ const aiServerKey = document.querySelector("#ai-server-key");
 const aiKeyNote = document.querySelector("#ai-key-note");
 const aiConfigFeedback = document.querySelector("#ai-config-feedback");
 const aiServerSave = document.querySelector("#ai-server-save");
+const webToolsForm = document.querySelector("#web-tools-form");
+const searxngUrl = document.querySelector("#searxng-url");
+const searxngResults = document.querySelector("#searxng-results");
+const researchModel = document.querySelector("#research-model");
+const researchModelNote = document.querySelector("#research-model-note");
+const webToolsFeedback = document.querySelector("#web-tools-feedback");
+const searxngTest = document.querySelector("#searxng-test");
+const webToolsSave = document.querySelector("#web-tools-save");
+const researchDialog = document.querySelector("#research-dialog");
+const researchDialogBody = document.querySelector("#research-dialog-body");
+const researchDialogQuestion = document.querySelector("#research-dialog-question");
+const researchDismissed = new Set();
+const researchAutoOpened = new Set();
+let webToolsConfig = null;
+
 const confirmDialog = document.querySelector("#confirm-dialog");
 const confirmForm = document.querySelector("#confirm-form");
 const confirmTitle = document.querySelector("#confirm-title");
@@ -919,7 +934,47 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
   return { field, menu, selectedModel: () => selectedModel };
 }
 
+function renderResearchModelOptions(preserveSelection = false) {
+  const current = preserveSelection ? researchModel.value : null;
+  const saved = webToolsConfig?.research_server_id && webToolsConfig?.research_model
+    ? JSON.stringify([webToolsConfig.research_server_id, webToolsConfig.research_model]) : "";
+  const fragment = document.createDocumentFragment();
+  fragment.append(element("option", "", "Active chat model"));
+  fragment.firstChild.value = "";
+  for (const server of aiServers) {
+    for (const model of server.models || []) {
+      const option = element("option", "", `${server.name} · ${model}`);
+      option.value = JSON.stringify([server.server_id, model]);
+      fragment.append(option);
+    }
+  }
+  researchModel.replaceChildren(fragment);
+  const selection = current === null ? saved : current;
+  researchModel.value = selection;
+  if (researchModel.value !== selection) researchModel.value = "";
+  researchModelNote.textContent = webToolsConfig?.research_model_fallback
+    ? "Selected research model unavailable. Active chat model used."
+    : "Research runs independently from main chat model.";
+}
+
+async function refreshWebToolsConfig() {
+  try {
+    webToolsConfig = await getJson("/v1/web-tools/config");
+    searxngUrl.value = webToolsConfig.searxng_url || "";
+    searxngResults.value = webToolsConfig.default_results || 8;
+    renderResearchModelOptions();
+    webToolsFeedback.textContent = webToolsConfig.searxng_url
+      ? "SearXNG configured. Test connection to check JSON search."
+      : "Set SearXNG URL to enable Web tools.";
+  } catch (error) {
+    webToolsFeedback.textContent = error.message || "Web settings unavailable.";
+  }
+}
+
 function renderAIConfig() {
+  const openAdvanced = new Set([...aiServerList.querySelectorAll(".ai-server-card")]
+    .filter(card => card.querySelector(".ai-server-advanced")?.open)
+    .map(card => card.dataset.serverId));
   closeModelPicker(false);
   document.querySelectorAll('.model-picker-menu[data-model-popover="true"]').forEach(node => node.remove());
   const fragment = document.createDocumentFragment();
@@ -931,6 +986,7 @@ function renderAIConfig() {
   }
   for (const server of aiServers) {
     const card = element("section", `ai-server-card${server.active ? " active" : ""}`);
+    card.dataset.serverId = server.server_id;
     const details = element("div", "ai-server-details");
     const title = element("div", "ai-server-title");
     title.append(element("strong", "", server.name));
@@ -966,6 +1022,7 @@ function renderAIConfig() {
     modelRow.append(modelPicker.field);
 
     const advanced = element("details", "ai-server-advanced");
+    advanced.open = openAdvanced.has(server.server_id);
     advanced.append(element("summary", "", "Advanced"));
     const supportRow = element("div", "ai-server-support-row");
     const supportPicker = createAIModelPicker(
@@ -1006,6 +1063,7 @@ function renderAIConfig() {
   // rendering still lifts the menu out of the dialog's clipping/scrolling region.
   for (const menu of popovers) aiConfigDialog.append(menu);
   renderAIHeader();
+  renderResearchModelOptions(true);
 }
 
 function openAIServerForm(server = null) {
@@ -1463,6 +1521,141 @@ function renderMemoryTool(call, result, key) {
   return card;
 }
 
+function webToolArguments(call) {
+  if (!["search_searxng", "load_web_page", "deep_research"].includes(call.function?.name)) return null;
+  try {
+    const args = JSON.parse(call.function.arguments);
+    return args && typeof args === "object" ? args : {};
+  } catch (_) { return {}; }
+}
+
+function safeWebLink(url, label) {
+  try {
+    const parsed = new URL(url);
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password)
+      return element("span", "", label);
+    const link = element("a", "web-source-link", label);
+    link.href = parsed.href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    return link;
+  } catch (_) { return element("span", "", label); }
+}
+
+function renderWebTool(call, result, key) {
+  const args = webToolArguments(call) || {};
+  const name = call.function?.name;
+  const title = {search_searxng: "Search Web", load_web_page: "Read page", deep_research: "Deep research"}[name];
+  const target = args.query || args.url || args.question || "";
+  const card = disclosure("tool-card web-tool-card", key, false);
+  let data = {};
+  try { data = JSON.parse(result?.content || "{}"); } catch (_) {}
+  const stopped = Boolean(result?.ui?.stopped || result?.ui?.research?.status === "stopped");
+  const failed = !stopped && (data.ok === false || result?.ui?.research?.status === "failed");
+  const state = !result ? ["pending", "Working"] : stopped ? ["failed", "Stopped"]
+    : failed ? ["failed", "Failed"] : ["success", "Finished"];
+  const summary = element("summary", "tool-summary");
+  summary.append(element("span", "command-line", `${title} · ${target}`),
+    element("span", `command-badge ${state[0]}`, state[1]));
+  card.append(summary);
+  const body = element("div", "tool-details");
+  if (stopped) body.append(element("p", "command-note", "Request stopped."));
+  if (data.ok === false) body.append(element("p", "command-note error", data.error || "Web request failed."));
+  if (name === "search_searxng") {
+    for (const item of data.results || []) {
+      const row = element("div", "web-result");
+      row.append(safeWebLink(item.url, item.title || item.url));
+      if (item.snippet) row.append(element("p", "command-note", item.snippet));
+      body.append(row);
+    }
+    if (data.ok && !data.results?.length) body.append(element("p", "command-note", "No results."));
+  } else if (name === "load_web_page") {
+    if (data.url) body.append(safeWebLink(data.url, data.title || data.url));
+    if (data.text) body.append(element("pre", "tool-body", data.text));
+    if (data.truncated) body.append(element("p", "command-note", "Text truncated at 100,000 characters."));
+  } else if (name === "deep_research") {
+    const trace = result?.ui?.research;
+    if (trace) {
+      body.append(element("p", "command-note", `${trace.steps?.length || 0} steps · ${trace.sources?.length || 0} sources`));
+      const button = element("button", "research-open-button", "Open research chat");
+      button.type = "button";
+      button.addEventListener("click", () => openResearchDialog(trace, call.id));
+      body.append(button);
+    }
+    if (data.answer) body.append(element("pre", "tool-body", data.answer));
+    for (const [index, source] of (data.sources || []).entries()) {
+      body.append(safeWebLink(source.url, `[${index + 1}] ${source.title || source.url}`));
+    }
+  }
+  card.append(body);
+  return card;
+}
+
+function renderResearchDialog(trace) {
+  if (!trace) return;
+  const nearBottom = researchDialogBody.scrollHeight - researchDialogBody.scrollTop - researchDialogBody.clientHeight < 30;
+  const oldScroll = researchDialogBody.scrollTop;
+  researchDialogQuestion.textContent = trace.question || "";
+  document.querySelector("#research-stop").classList.toggle("hidden", trace.status !== "running");
+  const fragment = document.createDocumentFragment();
+  fragment.append(element("p", `research-state ${trace.status || "running"}`,
+    trace.status === "completed" ? "Completed" : trace.status === "failed" ? "Failed" : trace.status === "stopped" ? "Stopped" : trace.status === "interrupted" ? "Interrupted" : "Researching…"));
+  const steps = element("ol", "research-steps");
+  for (const step of trace.steps || []) {
+    steps.append(element("li", "", `${step.kind === "search_searxng" ? "Search" : "Read"}: ${step.target} · ${step.status}`));
+  }
+  fragment.append(steps);
+  if (trace.error) fragment.append(element("p", "command-note error", trace.error));
+  const chat = element("details", "research-full-chat");
+  chat.open = researchDialogBody.querySelector(".research-full-chat")?.open || false;
+  chat.append(element("summary", "", "Full research chat"));
+  for (const message of trace.messages || []) {
+    const row = element("div", "research-message");
+    row.append(element("strong", "", message.role === "tool" ? `Tool · ${message.name}` : message.role === "user" ? "Question" : "Research model"));
+    if (message.content) row.append(element("pre", "", message.content));
+    for (const call of message.tool_calls || []) row.append(element("p", "command-note", `${call.name}: ${call.arguments}`));
+    chat.append(row);
+  }
+  fragment.append(chat);
+  if (trace.sources?.length) {
+    const sources = element("div", "research-sources");
+    sources.append(element("strong", "", "Sources"));
+    trace.sources.forEach((source, index) => sources.append(safeWebLink(source.url, `[${index + 1}] ${source.title || source.url}`)));
+    fragment.append(sources);
+  }
+  researchDialogBody.replaceChildren(fragment);
+  researchDialogBody.scrollTop = nearBottom ? researchDialogBody.scrollHeight : oldScroll;
+}
+
+function openResearchDialog(trace, callId) {
+  researchDialog.dataset.callId = callId;
+  researchDialog.dataset.sessionId = currentDetail?.session_id || "";
+  renderResearchDialog(trace);
+  if (!researchDialog.open) researchDialog.showModal();
+}
+
+function syncResearchDialog(detail) {
+  const live = detail.live?.research;
+  if (researchDialog.open && (researchDialog.dataset.sessionId !== detail.session_id ||
+      detail.session_id !== selectedId || currentView !== "conversations")) {
+    researchDismissed.add(`${researchDialog.dataset.sessionId}:${researchDialog.dataset.callId}`);
+    researchDialog.close();
+  }
+  if (detail.session_id !== selectedId) return;
+  if (live && currentView === "conversations") {
+    const key = `${detail.session_id}:${live.call_id}`;
+    if (!researchDialog.open && !researchDismissed.has(key) && !researchAutoOpened.has(key)) {
+      researchAutoOpened.add(key);
+      openResearchDialog(live, live.call_id);
+    } else if (researchDialog.open && researchDialog.dataset.callId === live.call_id) renderResearchDialog(live);
+    return;
+  }
+  if (!researchDialog.open) return;
+  const saved = [...detail.messages].reverse().find(message =>
+    message.role === "tool" && message.tool_call_id === researchDialog.dataset.callId && message.ui?.research);
+  if (saved) renderResearchDialog(saved.ui.research);
+}
+
 function approvalBadge(approval) {
   const labels = {
     trusted: "Trusted", trusted_now: "Trust saved", allowed_once: "Allowed once",
@@ -1516,6 +1709,7 @@ async function remoteCommandAction(callId, decision) {
 }
 
 function renderTool(call, result, key) {
+  if (webToolArguments(call)) return renderWebTool(call, result, key);
   if (memoryToolArguments(call)) return renderMemoryTool(call, result, key);
   const uiState = sessionState();
   const args = commandArguments(call);
@@ -1711,7 +1905,7 @@ function renderMessage(message, index, results = [], options = {}) {
     const commandGroup = element("div", message.tool_calls.length > 1 ? "command-group" : "");
     if (message.tool_calls.length > 1) {
       const ids = new Set(message.tool_calls.map(call => call.id));
-      const hasMemoryCalls = message.tool_calls.some(call => memoryToolArguments(call));
+      const hasMemoryCalls = message.tool_calls.some(call => memoryToolArguments(call) || webToolArguments(call));
       const reviewCount = currentDetail?.pending_tool_calls?.filter(
         call => ids.has(call.id) && call.ui?.remote
       ).length || 0;
@@ -2562,6 +2756,7 @@ function renderDetail(detail) {
   // Header/composer height may change after rendering a snapshot.
   if (wasNearBottom) transcript.scrollTop = transcript.scrollHeight;
   updateJump();
+  syncResearchDialog(detail);
 }
 
 function renderResponseStatus(detail) {
@@ -3083,6 +3278,7 @@ function openAIConfig() {
   closeAIServerForm();
   if (!aiConfigDialog.open) aiConfigDialog.showModal();
   void refreshAIConfig(true);
+  void refreshWebToolsConfig();
 }
 aiConfigButton.addEventListener("click", openAIConfig);
 aiConfigClose.addEventListener("click", () => aiConfigDialog.close());
@@ -3109,6 +3305,44 @@ aiServerForm.addEventListener("submit", async event => {
   } finally {
     aiServerSave.disabled = false;
   }
+});
+document.querySelector("#research-dialog-close").addEventListener("click", () => researchDialog.close());
+document.querySelector("#research-stop").addEventListener("click", () => messageStop.click());
+researchDialog.addEventListener("close", () => {
+  if (researchDialog.dataset.callId && researchDialog.dataset.sessionId) {
+    researchDismissed.add(`${researchDialog.dataset.sessionId}:${researchDialog.dataset.callId}`);
+  }
+});
+webToolsForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  if (webToolsSave.disabled) return;
+  webToolsSave.disabled = true;
+  webToolsFeedback.textContent = "Saving…";
+  let serverId = null, model = null;
+  if (researchModel.value) [serverId, model] = JSON.parse(researchModel.value);
+  try {
+    webToolsConfig = await aiWrite("/v1/web-tools/config", {
+      searxng_url: searxngUrl.value.trim(),
+      default_results: Number(searxngResults.value),
+      research_server_id: serverId,
+      research_model: model,
+    });
+    webToolsFeedback.textContent = "Web settings saved.";
+    renderResearchModelOptions();
+  } catch (error) {
+    webToolsFeedback.textContent = error.message || "Could not save Web settings.";
+  } finally { webToolsSave.disabled = false; }
+});
+searxngTest.addEventListener("click", async () => {
+  if (searxngTest.disabled) return;
+  searxngTest.disabled = true;
+  webToolsFeedback.textContent = "Testing SearXNG…";
+  try {
+    await aiWrite("/v1/web-tools/test", { searxng_url: searxngUrl.value.trim() });
+    webToolsFeedback.textContent = "SearXNG JSON search available.";
+  } catch (error) {
+    webToolsFeedback.textContent = error.message || "SearXNG test failed.";
+  } finally { searxngTest.disabled = false; }
 });
 addServerClose.addEventListener("click", () => addServerDialog.close());
 addServerDone.addEventListener("click", () => addServerDialog.close());

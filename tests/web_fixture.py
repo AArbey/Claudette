@@ -89,6 +89,36 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
         service.store.save(session["session_id"], messages, status, pending, 0)
         service.store.set_metadata(session["session_id"], {"title": title, "pinned": key == "main"})
         if key == "archived": service.store.set_archived(session["session_id"], True)
+    research_session = service.store.create()
+    sessions["research"] = research_session["session_id"]
+    research_call = {"id": "research_call", "type": "function", "function": {
+        "name": "deep_research", "arguments": json.dumps({"question": "What changed?"})}}
+    research_trace = {"question": "What changed?", "status": "completed", "model": "test-model",
+        "steps": [{"kind": "search_searxng", "target": "release notes", "status": "completed"},
+                  {"kind": "load_web_page", "target": "https://example.org/release", "status": "completed"}],
+        "messages": [{"role": "user", "content": "What changed?"},
+                     {"role": "assistant", "content": "Read release notes [1].", "tool_calls": []}],
+        "sources": [{"title": "Release notes", "url": "https://example.org/release"}]}
+    research_messages = research_session["messages"] + [
+        {"role": "user", "content": "What changed?"},
+        {"role": "assistant", "content": None, "tool_calls": [research_call]},
+        {"role": "tool", "tool_call_id": research_call["id"],
+         "content": json.dumps({"ok": True, "answer": "New feature [1].", "sources": research_trace["sources"]}),
+         "ui": {"web_tool": "deep_research", "research": research_trace}},
+        {"role": "assistant", "content": "New feature [1]."},
+    ]
+    service.store.save(research_session["session_id"], research_messages, "ready", [], 0)
+    service.store.set_metadata(research_session["session_id"], {"title": "Research example"})
+    service.store.set_archived(research_session["session_id"], True)
+    live_research = service.store.create()
+    sessions["research_live"] = live_research["session_id"]
+    service.store.save(live_research["session_id"], live_research["messages"] + [
+        {"role": "user", "content": "Investigate release"}], "continuation_pending", [], 0)
+    service.store.set_metadata(live_research["session_id"], {"title": "Live research example"})
+    service.store.set_archived(live_research["session_id"], True)
+    service.live_turns.start(live_research["session_id"], [])
+    service.live_turns.append(live_research["session_id"], "research",
+        {"call_id": "live_research_call", **{**research_trace, "status": "running"}})
     server = brain.BrainHTTPServer(("127.0.0.1", 0), service, web=True)
     print(json.dumps({"base": f"http://127.0.0.1:{server.server_port}", "sessions": sessions}), flush=True)
     try:

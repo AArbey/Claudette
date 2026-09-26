@@ -11,7 +11,7 @@ RUN addgroup -S aihelper && \
 COPY server/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY --chown=aihelper:aihelper server/brain.py /app/brain.py
+COPY --chown=aihelper:aihelper server/brain.py server/web_tools.py /app/
 COPY --chown=aihelper:aihelper client/ /client/
 COPY --chown=aihelper:aihelper server/config/ /config/
 COPY --chown=aihelper:aihelper server/knowledge/ /knowledge/

@@ -18,6 +18,7 @@ async function openChat(page, fixture, name) {
   await page.goto(`${fixture.base}/#${fixture.sessions[name]}`);
   await page.locator('#message-input').waitFor();
   await waitText(page, '#connection-text', 'Connected');
+  await page.waitForFunction(id => currentDetail?.session_id === id, fixture.sessions[name]);
 }
 async function noOverflow(page) {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'page overflow');
@@ -53,13 +54,15 @@ async function noOverflow(page) {
     await waitText(page, '#ai-model-value', 'test-model');
     await page.getByRole('button', { name: 'Configure AI' }).click();
     await waitText(page, '#ai-server-list', 'Configured AI');
+    await page.waitForFunction(() => !aiConfigBusy);
     const chatPicker = page.getByRole('button', { name: 'Choose model on Configured AI' });
     assert.equal(await chatPicker.locator('.model-picker-value').innerText(), 'test-model');
     await chatPicker.press('Enter');
     await page.getByRole('listbox', { name: 'Model options on Configured AI' }).waitFor();
-    assert.equal(await page.getByRole('option', { name: 'test-model' }).evaluate(node => node === document.activeElement), true);
+    await page.waitForFunction(() => document.activeElement?.classList.contains('model-picker-option'));
+    assert.equal(await page.getByRole('listbox', { name: 'Model options on Configured AI' }).getByRole('option', { name: 'test-model' }).evaluate(node => node === document.activeElement), true);
     await page.keyboard.press('ArrowDown');
-    assert.equal(await page.getByRole('option', { name: 'alternate-model' }).evaluate(node => node === document.activeElement), true);
+    assert.equal(await page.getByRole('listbox', { name: 'Model options on Configured AI' }).getByRole('option', { name: 'alternate-model' }).evaluate(node => node === document.activeElement), true);
     await page.keyboard.press('Enter');
     await waitText(page, '#ai-model-value', 'alternate-model');
     await waitText(page, '#ai-config-feedback', 'Model updated');
@@ -70,7 +73,6 @@ async function noOverflow(page) {
     await page.getByRole('listbox', { name: 'Support model options on Configured AI' })
       .getByRole('option', { name: 'alternate-model' }).click();
     await waitText(page, '#ai-config-feedback', 'Support model updated');
-    await page.getByText('Advanced', { exact: true }).click();
     const waitForMain = page.getByRole('checkbox', { name: 'Wait for main LLM completion on Configured AI' });
     assert.equal(await waitForMain.isChecked(), false);
     await waitForMain.check();
@@ -78,6 +80,49 @@ async function noOverflow(page) {
     assert.equal(await page.getByRole('checkbox', { name: 'Wait for main LLM completion on Configured AI' }).isChecked(), true);
     await noOverflow(page);
     await page.getByRole('button', { name: 'Close', exact: true }).click();
+
+    // Web settings, saved research card, live modal, and mobile layout.
+    await page.getByRole('button', { name: 'Configure AI' }).click();
+    await page.locator('#searxng-url').fill('http://search.example:8888');
+    await page.locator('#searxng-results').fill('12');
+    const researchChoice = await page.evaluate(() => JSON.stringify([aiServers[0].server_id, 'alternate-model']));
+    await page.locator('#research-model').selectOption(researchChoice);
+    await page.evaluate(() => renderAIConfig()); // Dashboard refresh must preserve unsaved choice.
+    assert.equal(await page.locator('#research-model').inputValue(), researchChoice);
+    await page.locator('#web-tools-save').click();
+    await waitText(page, '#web-tools-feedback', 'saved');
+    await page.locator('#ai-config-close').click();
+    await page.locator('#conversation-filter').selectOption('all');
+    await openChat(page, fixture, 'research');
+    await page.locator('.response-activity summary').first().click();
+    await page.locator('.web-tool-card').getByText('Deep research').waitFor();
+    await page.locator('.web-tool-card summary').click();
+    await page.getByRole('button', { name: 'Open research chat' }).click();
+    await waitText(page, '#research-dialog', 'release notes');
+    assert.equal(await page.locator('.research-full-chat').getAttribute('open'), null);
+    await page.locator('.research-full-chat summary').click();
+    await waitText(page, '.research-full-chat', 'Read release notes');
+    assert.equal(await page.locator('.research-sources a').getAttribute('rel'), 'noopener noreferrer');
+    await noOverflow(page);
+    await page.locator('#research-dialog-close').click();
+    await openChat(page, fixture, 'research_live');
+    await page.locator('#research-dialog[open]').waitFor();
+    await page.locator('#research-stop').waitFor();
+    await page.locator('#research-dialog-close').click();
+    assert.equal(await page.locator('#research-dialog[open]').count(), 0);
+    const researchMobile = await context.newPage();
+    await researchMobile.setViewportSize({ width: 390, height: 844 });
+    await researchMobile.goto(fixture.base);
+    await researchMobile.locator('#conversation-filter').selectOption('all');
+    await openChat(researchMobile, fixture, 'research');
+    await researchMobile.locator('.response-activity summary').first().click();
+    await researchMobile.locator('.web-tool-card summary').click();
+    await researchMobile.getByRole('button', { name: 'Open research chat' }).click();
+    await noOverflow(researchMobile);
+    await researchMobile.close();
+    console.log('Web research settings and popup desktop/mobile passed');
+    await page.locator('#conversation-filter').selectOption('current');
+    await openChat(page, fixture, 'main');
 
     // Context opens with fresh memories, explicit references, and unavailable host paths in chat-only mode.
     await page.getByRole('button', { name: 'Add context' }).click();
@@ -297,26 +342,29 @@ async function noOverflow(page) {
     await openChat(page, fixture, 'other');
     await page.locator('#conversation-menu summary').click();
     await page.locator('#archive-button').click();
+    await page.locator('#conversation-filter').selectOption('all');
+    await openChat(page, fixture, 'other');
     await waitText(page, '#status-badge', 'Archived');
     assert.equal(await page.locator('#message-input').isDisabled(), true);
     await page.locator('#conversation-menu summary').click();
     await page.locator('#archive-button').click();
-    await page.waitForFunction(() => currentDetail && !currentDetail.archived);
+    await page.waitForFunction(id => currentDetail?.session_id === id && !currentDetail.archived && !sessionState().actionBusy, fixture.sessions.other);
     await page.locator('#conversation-menu summary').click();
     await page.locator('#delete-button').click();
-    assert.equal(await page.locator('#edit-cancel').evaluate(node => node === document.activeElement), true);
+    assert.equal(await page.locator('#confirm-cancel').evaluate(node => node === document.activeElement), true);
     await page.keyboard.press('Escape');
     await page.locator('#conversation-menu summary').click();
     await page.locator('#delete-button').click();
-    await page.locator('#edit-submit').click();
-    await page.locator('#edit-dialog').waitFor({ state: 'hidden' });
+    await page.locator('#confirm-submit').click();
+    await page.locator('#confirm-dialog').waitFor({ state: 'hidden' });
     await page.waitForFunction(id => currentDetail && currentDetail.session_id !== id, fixture.sessions.other);
+    await page.locator('#conversation-filter').selectOption('current');
     console.log('Archive, restore, delete confirmation passed');
 
     // Target-loading failure must remain visible; chat-only creation still works.
     await page.route('**/v1/runners', route => route.fulfill({ status: 503, body: '{}' }));
     await page.locator('#new-conversation').click();
-    await waitText(page, '#new-conversation-feedback', 'Could not load runners');
+    await waitText(page, '#new-conversation-feedback', 'Could not refresh runners');
     await page.unroute('**/v1/runners');
     await page.locator('#new-conversation-feedback button').click();
     await page.getByRole('radio', { name: /deploy@production/ }).waitFor();

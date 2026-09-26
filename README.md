@@ -55,6 +55,19 @@ select **Model**, add one or more OpenAI-compatible servers, then choose global
 model. Brain queries each server's `/v1/models` endpoint automatically. Selected
 model applies immediately to Web UI conversations and CLI conversations.
 
+### Web research
+
+Open **Model → Web research** to enter SearXNG base URL, choose default result count
+(1–20), and select optional dedicated research model from saved AI servers. Use
+**Test SearXNG** to check JSON search. SearXNG must enable `json` in
+`search.formats`; HTML-only instances return HTTP 403 for JSON requests.
+
+Brain exposes `search_searxng`, `load_web_page`, and `deep_research` to Web and
+CLI chats after SearXNG is configured. Deep research opens a read-only popup in
+Web; its steps and sources remain in the conversation. Stop cancels active
+research. Page loading extracts readable HTML text and allows intranet pages,
+but blocks localhost, link-local addresses, and Brain's own service ports.
+
 Set `BRAIN_URL` to stable private Brain address used by clients and runner
 installers, for example `http://192.168.1.115:8080`.
 

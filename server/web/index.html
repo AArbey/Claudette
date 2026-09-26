@@ -276,6 +276,18 @@
         <button id="ai-server-add" class="primary" type="button">+ Add AI server</button>
         <p id="ai-config-feedback" class="dialog-feedback ai-config-feedback" role="status"></p>
       </div>
+      <form id="web-tools-form" class="web-tools-form">
+        <div class="web-tools-heading"><h3>Web research</h3><p>SearXNG search and page reading for Web and CLI chats.</p></div>
+        <label for="searxng-url">SearXNG base URL</label>
+        <input id="searxng-url" type="url" maxlength="2048" placeholder="http://192.168.1.10:8888" autocomplete="off">
+        <label for="searxng-results">Default search results</label>
+        <input id="searxng-results" type="number" min="1" max="20" value="8" required>
+        <label for="research-model">Deep research model</label>
+        <select id="research-model"><option value="">Active chat model</option></select>
+        <p id="research-model-note" class="command-note"></p>
+        <p id="web-tools-feedback" class="dialog-feedback" role="status"></p>
+        <div class="dialog-actions"><button id="searxng-test" type="button">Test SearXNG</button><button id="web-tools-save" class="primary" type="submit">Save Web settings</button></div>
+      </form>
       <form id="ai-server-form" class="ai-server-form hidden">
         <input id="ai-server-id" type="hidden">
         <label for="ai-server-name">Name</label>
@@ -290,6 +302,10 @@
         </div>
       </form>
     </div>
+  </dialog>
+  <dialog id="research-dialog" class="dialog research-dialog" aria-labelledby="research-dialog-title">
+    <header class="new-conversation-header"><div><h2 id="research-dialog-title">Deep research</h2><p id="research-dialog-question"></p></div><div class="research-dialog-actions"><button id="research-stop" type="button" class="message-stop hidden">Stop</button><button id="research-dialog-close" class="dialog-close" type="button" aria-label="Close research">&times;</button></div></header>
+    <div id="research-dialog-body" class="research-dialog-body"></div>
   </dialog>
   <div id="copy-status" class="sr-only" role="status"></div>
   <script src="/vendor/marked.js" defer></script>
