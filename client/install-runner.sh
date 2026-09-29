@@ -24,7 +24,7 @@ resolve_user() {
 install_dependencies() {
     local name
     local -a packages=()
-    for name in jq timeout sha256sum; do
+    for name in jq timeout sha256sum python3; do
         command -v "$name" >/dev/null 2>&1 && continue
         case "$name" in
             timeout|sha256sum) packages+=(coreutils) ;;
@@ -79,11 +79,16 @@ enroll() {
 
 download_runner() {
     RUNNER_DOWNLOAD=$(mktemp)
-    trap 'rm -f -- "${RUNNER_DOWNLOAD:-}"' EXIT
+    trap 'rm -f -- "${RUNNER_DOWNLOAD:-}" "${FILE_TOOL_DOWNLOAD:-}"' EXIT
     curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
         "$BRAIN_URL/runner.sh" -o "$RUNNER_DOWNLOAD" || die "runner download failed"
     [[ "$(head -n 1 "$RUNNER_DOWNLOAD")" == '#!/usr/bin/env bash' ]] || \
         die "Brain returned invalid runner script"
+    FILE_TOOL_DOWNLOAD=$(mktemp)
+    curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+        "$BRAIN_URL/file-tool.py" -o "$FILE_TOOL_DOWNLOAD" || die "file editor download failed"
+    [[ "$(head -n 1 "$FILE_TOOL_DOWNLOAD")" == '#!/usr/bin/env python3' ]] || \
+        die "Brain returned invalid file editor"
 }
 
 install_files() {
@@ -91,6 +96,7 @@ install_files() {
     unit_base="ai-helper-runner-$CLIENT_ID"
     install -d -m 0755 /usr/local/libexec /etc/ai-helper-runner
     install -m 0755 "$RUNNER_DOWNLOAD" /usr/local/libexec/ai-helper-runner
+    install -m 0755 "$FILE_TOOL_DOWNLOAD" /usr/local/libexec/ai-helper-file-tool.py
     token_hash=$(printf '%s' "$CREDENTIAL" | sha256sum | awk '{print $1}')
     install -d -m 0700 -o "$RUNNER_USER" -g "$RUNNER_GROUP" \
         "/var/lib/$unit_base"
@@ -99,6 +105,7 @@ install_files() {
         printf 'RUNNER_PORT=%s\n' "$RUNNER_PORT"
         printf 'RUNNER_USER=%s\n' "$RUNNER_USER"
         printf 'RUNNER_HOME=%s\n' "$RUNNER_HOME"
+        printf 'RUNNER_FILE_TOOL=/usr/local/libexec/ai-helper-file-tool.py\n'
         printf 'RUNNER_STATE_DIR=/var/lib/%s\n' "$unit_base"
         printf 'RUNNER_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
         printf 'TRUSTED_BRAIN_IP=%s\n' "$TRUSTED_BRAIN_IP"
@@ -139,7 +146,7 @@ main() {
     download_runner
     enroll
     install_files
-    rm -f -- "$RUNNER_DOWNLOAD"
+    rm -f -- "$RUNNER_DOWNLOAD" "$FILE_TOOL_DOWNLOAD"
     trap - EXIT
     printf 'Runner installed for %s on port %s. Return to Brain and press Check now.\n' \
         "$RUNNER_USER" "$RUNNER_PORT"

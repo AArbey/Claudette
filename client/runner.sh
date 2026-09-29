@@ -3,10 +3,10 @@
 set -Eeuo pipefail
 
 readonly MAX_HEADER_BYTES=16384
-readonly MAX_BODY_BYTES=262144
+readonly MAX_BODY_BYTES=2097152
 readonly READ_TIMEOUT_SECONDS=10
 readonly RUNNER_PROTOCOL_VERSION=1
-readonly RUNNER_VERSION=2
+readonly RUNNER_VERSION=3
 
 respond_json() {
     local status="$1" reason="$2" payload="$3" length
@@ -201,6 +201,22 @@ execute_request() {
     respond_json 200 OK "$(<"$result_file")"
 }
 
+execute_file_request() {
+    local result_file result
+    [[ -f "$RUNNER_FILE_TOOL" ]] || fail_json 503 Unavailable "file editor is not installed"
+    result_file=$(mktemp "$RUNNER_STATE_DIR/file-result.XXXXXX")
+    if ! python3 "$RUNNER_FILE_TOOL" --state-dir "${RUNNER_FILE_STATE_DIR:-$RUNNER_HOME/.local/state/ai-helper/file-edits}" \
+        <"$BODY_FILE" >"$result_file"; then
+        rm -f -- "$result_file"
+        fail_json 500 Internal "file editor failed"
+    fi
+    result=$(<"$result_file")
+    rm -f -- "$result_file"
+    jq -e 'type == "object" and (.ok | type == "boolean")' <<<"$result" >/dev/null || \
+        fail_json 500 Internal "invalid file editor response"
+    respond_json 200 OK "$result"
+}
+
 main() {
     umask 077
     mkdir -p -- "$RUNNER_STATE_DIR/requests"
@@ -216,7 +232,7 @@ main() {
                 '{runner_id: $id, status: "ready", home: $home,
                   protocol_version: $protocol, runner_version: $runner_version}')"
             ;;
-        'POST /v1/execute HTTP/1.1')
+        'POST /v1/execute HTTP/1.1'|'POST /v1/file HTTP/1.1')
             [[ "${CONTENT_TYPE_VALUE:-}" == application/json* ]] || \
                 fail_json 415 Unsupported "application/json required"
             [[ "${CONTENT_LENGTH_VALUE:-}" =~ ^[0-9]+$ ]] || \
@@ -230,7 +246,11 @@ main() {
                 fail_json 408 Timeout "request body timeout"
             [[ "$(wc -c <"$BODY_FILE")" == "$CONTENT_LENGTH_VALUE" ]] || \
                 fail_json 400 BadRequest "incomplete request body"
-            execute_request
+            if [[ "$REQUEST_LINE" == 'POST /v1/file HTTP/1.1' ]]; then
+                execute_file_request
+            else
+                execute_request
+            fi
             rm -f -- "$BODY_FILE"
             trap - EXIT
             ;;

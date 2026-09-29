@@ -15,6 +15,8 @@ run_raw() {
     RUNNER_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     RUNNER_USER=test RUNNER_HOME=/tmp RUNNER_STATE_DIR="$RUNNER_STATE_DIR" \
     RUNNER_PATH=/usr/bin:/bin TRUSTED_BRAIN_IP=192.0.2.1 \
+    RUNNER_FILE_TOOL="$ROOT/client/file_tool.py" \
+    RUNNER_FILE_STATE_DIR="$RUNNER_STATE_DIR/file-edits" \
     TOKEN_SHA256="$EXPECTED_TOKEN_HASH" bash "$ROOT/client/runner.sh"
 }
 
@@ -29,7 +31,7 @@ body_from_response() { printf '%s' "${1#*$'\r\n\r\n'}"; }
 
 health=$(request GET /healthz)
 [[ "$health" == HTTP/1.1\ 200* ]]
-jq -e '.status == "ready" and .home == "/tmp" and .protocol_version == 1 and .runner_version == 1' \
+jq -e '.status == "ready" and .home == "/tmp" and .protocol_version == 1 and .runner_version == 3' \
     <<<"$(body_from_response "$health")" >/dev/null
 
 bad_source=$(REMOTE_ADDR_OVERRIDE=192.0.2.99 request GET /healthz)
@@ -87,6 +89,18 @@ cd_payload=$(jq -cn '{
 }')
 cd_response=$(request POST /v1/execute "$cd_payload")
 jq -e '.exit_code == 0 and .cwd == "/"' <<<"$(body_from_response "$cd_response")" >/dev/null
+
+file_payload=$(jq -cn --arg cwd "$RUNNER_STATE_DIR" '{action:"apply",request_id:("f" * 32),
+    cwd:$cwd,path:"target.txt",operation:"create",old_text:"",new_text:"hello\n",reason:"test"}')
+file_response=$(request POST /v1/file "$file_payload")
+jq -e '.ok == true and .edit.operation == "create" and (.edit.diff | contains("+hello"))' \
+    <<<"$(body_from_response "$file_response")" >/dev/null
+[[ $(<"$RUNNER_STATE_DIR/target.txt") == hello ]]
+restore_payload=$(jq -cn --arg hash "$(jq -r '.edit.after_hash' <<<"$(body_from_response "$file_response")")" \
+    '{action:"restore",edit_id:("f" * 32),request_id:("g" * 32),expected_hash:$hash}')
+restored=$(request POST /v1/file "$restore_payload")
+jq -e '.ok == true and .edit.status == "restored"' <<<"$(body_from_response "$restored")" >/dev/null
+[[ ! -e "$RUNNER_STATE_DIR/target.txt" ]]
 
 chunked=$(printf 'POST /v1/execute HTTP/1.1\r\nAuthorization: Bearer %s\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n' "$TOKEN" | run_raw)
 [[ "$chunked" == HTTP/1.1\ 400* ]]

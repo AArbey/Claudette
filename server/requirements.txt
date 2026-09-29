@@ -1,1 +1,2 @@
 pypdf==6.12.0
+trafilatura==2.2.0

@@ -151,4 +151,36 @@ jq -e '.instruction == "inspect only" and (.results | length == 2) and
     all(.results[]; .approval == {decision: "cancelled", prefix: []})' \
     "$test_dir/submitted.json" >/dev/null
 
+# Local terminal edit works without installed runner and sends Web diff metadata.
+FILE_TOOL_STATE_DIR="$test_dir/file-edits"
+BRAIN_URL=http://brain.test
+BRAIN_CONNECT_TIMEOUT_SECONDS=1
+BRAIN_REQUEST_TIMEOUT_SECONDS=1
+SESSION_ID=ssssssssssssssssssssssssssssssss
+curl() {
+    local output=''
+    while (( $# )); do
+        if [[ "$1" == -o ]]; then output="$2"; shift 2; else shift; fi
+    done
+    cp -- "$repo_dir/client/file_tool.py" "$output"
+}
+local_path="$test_dir/local.txt"
+local_args=$(jq -cn --arg path "$local_path" '{path:$path,operation:"create",old_text:"",new_text:"created\n",reason:"test"}')
+execute_file_edit "$local_args" local_call
+[[ $(<"$local_path") == created ]]
+[[ $(jq -r '.operation' <<<"$TOOL_FILE_EDIT") == create ]]
+[[ $(jq -r '.decision' <<<"$TOOL_APPROVAL") == automatic ]]
+
+# Large edit arguments and diff must not exceed shell argv limits during submission.
+large_args=$(jq -cn --arg path "$test_dir/large.txt" \
+    --rawfile content <(python3 -c 'print("x\n" * 45000, end="")') \
+    '{path:$path,operation:"create",old_text:"",new_text:$content,reason:"large diff"}')
+large_call=$(jq -cn --slurpfile args <(printf '%s' "$large_args") \
+    '{id:"large_call",function:{name:"edit_file",arguments:($args[0] | tojson)}}')
+submit_tool_results "[$large_call]"
+jq -e '.results[0].file_edit.added == 45000 and
+    (.results[0].file_edit.diff | length > 128000) and
+    .results[0].approval.decision == "automatic"' "$test_dir/submitted.json" >/dev/null
+unset -f curl
+
 printf 'client tests: ok\n'
