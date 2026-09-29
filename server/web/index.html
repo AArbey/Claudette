@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>Brain workspace</title>
+  <title>Brain · Chat</title>
   <script>
     try { document.documentElement.dataset.theme = localStorage.getItem("brain.theme") || "system"; } catch (_) {}
   </script>
@@ -17,14 +17,14 @@
         <div class="brain-mark" aria-hidden="true">B</div>
         <div>
           <h1>Brain</h1>
-          <p>Your server workspace</p>
+          <p>Your AI workspace</p>
         </div>
       </header>
 
       <div class="view-nav" aria-label="Views">
-        <button id="conversations-view" class="view-button selected" type="button">Conversations</button>
-        <button id="servers-view" class="view-button" type="button">Servers</button>
-        <button id="memories-view" class="view-button" type="button">Memories</button>
+        <button id="conversations-view" class="view-button selected" type="button"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-2 2v-9.5a7.5 7.5 0 0 1 7.5-7.5h2A7.5 7.5 0 0 1 20 11.5Z"/><path d="M8 10h8M8 14h5"/></svg><span>Chats</span></button>
+        <button id="servers-view" class="view-button" type="button"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="6" rx="2"/><rect x="4" y="14" width="16" height="6" rx="2"/><path d="M8 7h.01M8 17h.01M12 7h5M12 17h5"/></svg><span>Servers</span></button>
+        <button id="memories-view" class="view-button" type="button"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4.5h12a1.5 1.5 0 0 1 1.5 1.5v14L12 16l-7.5 4V6A1.5 1.5 0 0 1 6 4.5Z"/></svg><span>Memories</span></button>
       </div>
 
       <button id="sidebar-close" class="sidebar-close" type="button" aria-label="Close navigation">×</button>
@@ -53,36 +53,29 @@
       <nav id="server-list" class="conversation-list hidden" aria-label="Servers"></nav>
       <nav id="memory-runner-list" class="conversation-list hidden" aria-label="Memory runners"></nav>
       <footer class="sidebar-footer">
-        <details id="theme-picker" class="theme-picker">
-          <summary id="theme-picker-summary" aria-label="Change appearance. Current: System">
-            <span id="theme-picker-icon" class="theme-picker-icon" aria-hidden="true">◐</span>
-            <span class="theme-picker-copy">
-              <span>Appearance</span>
-              <strong id="theme-picker-value">System</strong>
-            </span>
-            <span class="theme-picker-chevron" aria-hidden="true">⌃</span>
-          </summary>
-          <div id="theme-menu" class="theme-menu" aria-label="Appearance options"></div>
-        </details>
+        <button id="settings-button" class="settings-button" type="button" aria-haspopup="dialog" aria-controls="ai-config-dialog"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3.5h4l.6 2.1 1.6.9 2.1-.6 2 3.5-1.5 1.6v2l1.5 1.6-2 3.5-2.1-.6-1.6.9-.6 2.1h-4l-.6-2.1-1.6-.9-2.1.6-2-3.5L5.2 13v-2L3.7 9.4l2-3.5 2.1.6 1.6-.9L10 3.5Z"/><circle cx="12" cy="12" r="2.5"/></svg><span>Settings</span></button>
       </footer>
     </aside>
 
     <main class="main">
       <header class="topbar">
+        <div class="topbar-primary">
         <button id="menu-button" class="menu-button" type="button" aria-label="Show navigation" aria-controls="sidebar" aria-expanded="false">☰</button>
         <div class="conversation-heading">
           <div class="heading-line">
-            <h2 id="conversation-title">Conversations</h2>
+            <h2 id="conversation-title">Chats</h2>
             <span id="status-badge" class="status-badge hidden"></span>
           </div>
           <p id="conversation-meta">Select conversation to inspect it.</p>
         </div>
+        <button id="header-new-conversation" class="header-new-conversation" type="button" aria-label="New conversation" title="New conversation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>New chat</span></button>
+        </div>
+        <div class="topbar-context">
         <button id="ai-config-button" class="ai-config-button" type="button" aria-label="Configure AI">
           <span class="ai-config-icon" aria-hidden="true">AI</span>
           <span class="ai-config-copy"><span>Model</span><strong id="ai-model-value">Not configured</strong></span>
         </button>
         <div id="conversation-actions" class="conversation-actions hidden">
-          <button id="answers-only" class="answers-only" type="button" aria-pressed="false">Answers only</button>
           <details id="runner-picker" class="runner-picker">
             <summary id="runner-picker-summary" aria-label="Change execution target">
               <span id="runner-picker-icon" class="runner-picker-icon" aria-hidden="true">◇</span>
@@ -97,6 +90,7 @@
           <details id="conversation-menu" class="action-menu"><summary aria-label="Conversation actions">•••</summary>
             <div class="action-menu-items">
               <p id="conversation-info" class="conversation-info"></p>
+              <button id="answers-only" class="answers-only" type="button" aria-pressed="false">Show answers only</button>
               <button id="rename-button" type="button">Rename</button>
               <button id="pin-button" type="button">Pin conversation</button>
               <button id="archive-button" type="button">Archive</button>
@@ -104,19 +98,25 @@
             </div>
           </details>
         </div>
+        </div>
       </header>
       <div id="page-feedback" class="feedback hidden" role="alert"></div>
       <button id="connection-retry" class="connection-retry hidden" type="button">Connection lost · Retry</button>
       <button id="approval-banner" class="approval-banner hidden" type="button"></button>
+      <button id="research-progress" class="research-progress hidden" type="button" aria-haspopup="dialog" aria-controls="research-dialog" aria-label="Open deep research progress">
+        <span class="research-progress-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5M8 10.5h5M10.5 8v5"/></svg></span>
+        <span class="research-progress-copy"><strong id="research-progress-title">Deep research</strong><small id="research-progress-meta"></small></span>
+        <span class="research-progress-action">View progress <span aria-hidden="true">→</span></span>
+      </button>
 
       <section id="servers" class="servers hidden" aria-label="Server command policies"></section>
       <section id="memories" class="memories hidden" aria-label="Runner memories"></section>
 
       <section id="transcript" class="transcript" aria-label="Conversation transcript">
         <div class="empty-state">
-          <div class="empty-icon">⌁</div>
-          <h3>No conversation selected</h3>
-          <p>Start a conversation or connect a client.</p>
+          <div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-2 2v-9.5a7.5 7.5 0 0 1 7.5-7.5h2A7.5 7.5 0 0 1 20 11.5Z"/><path d="M8 10h8M8 14h5"/></svg></div>
+          <h3>Start a conversation</h3>
+          <p>Ask Brain a question, or choose a server for approved commands.</p>
         </div>
       </section>
 
@@ -264,48 +264,82 @@
       </div>
     </form>
   </dialog>
-  <dialog id="ai-config-dialog" class="dialog ai-config-dialog" aria-labelledby="ai-config-title">
-    <div>
-      <header class="new-conversation-header">
-        <div class="ai-config-icon" aria-hidden="true">AI</div>
-        <div><h2 id="ai-config-title">AI configuration</h2><p>Add OpenAI-compatible servers and choose global model.</p></div>
-        <button id="ai-config-close" class="dialog-close" type="button" aria-label="Close">&times;</button>
+  <dialog id="ai-config-dialog" class="dialog ai-config-dialog settings-dialog" aria-labelledby="ai-config-title">
+    <div class="settings-shell">
+      <header class="new-conversation-header settings-header">
+        <div class="settings-header-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3.5h4l.6 2.1 1.6.9 2.1-.6 2 3.5-1.5 1.6v2l1.5 1.6-2 3.5-2.1-.6-1.6.9-.6 2.1h-4l-.6-2.1-1.6-.9-2.1.6-2-3.5L5.2 13v-2L3.7 9.4l2-3.5 2.1.6 1.6-.9L10 3.5Z"/><circle cx="12" cy="12" r="2.5"/></svg></div>
+        <div><h2 id="ai-config-title">Settings</h2><p>Manage models, research, appearance, and access.</p></div>
+        <button id="ai-config-close" class="dialog-close" type="button" aria-label="Close settings">&times;</button>
       </header>
-      <div id="ai-server-list" class="ai-server-list"></div>
-      <div class="ai-config-footer">
-        <button id="ai-server-add" class="primary" type="button">+ Add AI server</button>
-        <p id="ai-config-feedback" class="dialog-feedback ai-config-feedback" role="status"></p>
-      </div>
-      <form id="web-tools-form" class="web-tools-form">
-        <div class="web-tools-heading"><h3>Web research</h3><p>SearXNG search and page reading for Web and CLI chats.</p></div>
-        <label for="searxng-url">SearXNG base URL</label>
-        <input id="searxng-url" type="url" maxlength="2048" placeholder="http://192.168.1.10:8888" autocomplete="off">
-        <label for="searxng-results">Default search results</label>
-        <input id="searxng-results" type="number" min="1" max="20" value="8" required>
-        <label for="research-model">Deep research model</label>
-        <select id="research-model"><option value="">Active chat model</option></select>
-        <p id="research-model-note" class="command-note"></p>
-        <p id="web-tools-feedback" class="dialog-feedback" role="status"></p>
-        <div class="dialog-actions"><button id="searxng-test" type="button">Test SearXNG</button><button id="web-tools-save" class="primary" type="submit">Save Web settings</button></div>
-      </form>
-      <form id="ai-server-form" class="ai-server-form hidden">
-        <input id="ai-server-id" type="hidden">
-        <label for="ai-server-name">Name</label>
-        <input id="ai-server-name" maxlength="100" required placeholder="Local llama.cpp" autocomplete="off">
-        <label for="ai-server-endpoint">Endpoint or API base URL</label>
-        <input id="ai-server-endpoint" type="url" maxlength="2048" required placeholder="http://192.168.1.111:8080/v1" autocomplete="off">
-        <label for="ai-server-key">API key <span id="ai-key-note">(optional)</span></label>
-        <input id="ai-server-key" type="password" maxlength="8192" placeholder="Not required for most local servers" autocomplete="new-password">
-        <div class="dialog-actions">
-          <button id="ai-server-cancel" type="button">Cancel</button>
-          <button id="ai-server-save" type="submit">Query models and save</button>
+      <div class="settings-layout">
+        <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button id="settings-tab-models" class="settings-tab selected" type="button" role="tab" aria-selected="true" aria-controls="settings-panel-models" tabindex="0" data-settings-tab="models">LLM &amp; models</button>
+          <button id="settings-tab-web" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-web" tabindex="-1" data-settings-tab="web">Web research</button>
+          <button id="settings-tab-appearance" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-appearance" tabindex="-1" data-settings-tab="appearance">Appearance</button>
+          <button id="settings-tab-access" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-panel-access" tabindex="-1" data-settings-tab="access">Servers &amp; access</button>
         </div>
-      </form>
+        <div class="settings-content">
+          <section id="settings-panel-models" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-models" tabindex="0">
+            <div class="settings-section-heading"><h3>LLM server</h3><p>OpenAI-compatible endpoint shared by Web and terminal chats.</p></div>
+            <form id="ai-server-form" class="ai-server-form">
+              <input id="ai-server-id" type="hidden">
+              <label for="ai-server-endpoint">Endpoint or API base URL</label>
+              <input id="ai-server-endpoint" type="url" maxlength="2048" required placeholder="http://192.168.1.111:8080/v1" autocomplete="off">
+              <label for="ai-server-key">API key <span id="ai-key-note">(optional)</span></label>
+              <input id="ai-server-key" type="password" maxlength="8192" placeholder="Not required for most local servers" autocomplete="new-password">
+              <div class="dialog-actions">
+                <button id="ai-server-refresh" type="button">Refresh models</button>
+                <button id="ai-server-save" class="primary" type="submit">Save server</button>
+              </div>
+            </form>
+            <div class="settings-section-heading settings-model-heading"><h3>Models</h3><p>Choose model for each task. Changes save automatically.</p></div>
+            <div id="ai-server-list" class="ai-server-list"></div>
+            <p id="ai-config-feedback" class="dialog-feedback ai-config-feedback" role="status"></p>
+          </section>
+          <section id="settings-panel-web" class="settings-panel hidden" role="tabpanel" aria-labelledby="settings-tab-web" tabindex="0">
+            <form id="web-tools-form" class="web-tools-form">
+              <div class="web-tools-heading"><h3>Web research</h3><p>SearXNG search and page reading for Web and terminal chats.</p></div>
+              <label for="searxng-url">SearXNG base URL</label>
+              <input id="searxng-url" type="url" maxlength="2048" placeholder="http://192.168.1.10:8888" autocomplete="off">
+              <label for="searxng-results">Default search results</label>
+              <input id="searxng-results" type="number" min="1" max="20" value="8" required>
+              <p id="web-tools-feedback" class="dialog-feedback" role="status"></p>
+              <div class="dialog-actions"><button id="searxng-test" type="button">Test SearXNG</button><button id="web-tools-save" class="primary" type="submit">Save Web settings</button></div>
+            </form>
+          </section>
+          <section id="settings-panel-appearance" class="settings-panel hidden" role="tabpanel" aria-labelledby="settings-tab-appearance" tabindex="0">
+            <div class="settings-section-heading"><h3>Appearance</h3><p>Choose how Brain looks on this device.</p></div>
+            <details id="theme-picker" class="theme-picker">
+              <summary id="theme-picker-summary" aria-label="Change appearance. Current: System">
+                <span id="theme-picker-icon" class="theme-picker-icon" aria-hidden="true">◐</span>
+                <span class="theme-picker-copy"><span>Theme</span><strong id="theme-picker-value">System</strong></span>
+                <span class="theme-picker-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div id="theme-menu" class="theme-menu" aria-label="Appearance options"></div>
+            </details>
+          </section>
+          <section id="settings-panel-access" class="settings-panel hidden" role="tabpanel" aria-labelledby="settings-tab-access" tabindex="0">
+            <div class="settings-section-heading"><h3>Servers &amp; access</h3><p>Manage execution targets and command approvals.</p></div>
+            <div class="settings-link-list">
+              <button id="settings-open-servers" class="settings-link" type="button"><span><strong>Manage servers</strong><small>Runner health, setup, names, and trusted commands</small></span><span aria-hidden="true">→</span></button>
+              <button id="settings-open-memories" class="settings-link" type="button"><span><strong>Manage memories</strong><small>Global and runner facts used in chats</small></span><span aria-hidden="true">→</span></button>
+            </div>
+          </section>
+        </div>
+      </div>
     </div>
   </dialog>
   <dialog id="research-dialog" class="dialog research-dialog" aria-labelledby="research-dialog-title">
-    <header class="new-conversation-header"><div><h2 id="research-dialog-title">Deep research</h2><p id="research-dialog-question"></p></div><div class="research-dialog-actions"><button id="research-stop" type="button" class="message-stop hidden">Stop</button><button id="research-dialog-close" class="dialog-close" type="button" aria-label="Close research">&times;</button></div></header>
+    <header class="new-conversation-header"><div class="research-dialog-heading"><span class="research-dialog-eyebrow">Research activity</span><h2 id="research-dialog-title">Deep research</h2><p id="research-dialog-question"></p></div><div class="research-dialog-actions"><button id="research-stop" type="button" class="research-stop hidden">Stop research</button><button id="research-dialog-close" class="dialog-close" type="button" aria-label="Close research">&times;</button></div></header>
     <div id="research-dialog-body" class="research-dialog-body"></div>
+  </dialog>
+  <dialog id="file-editor-dialog" class="dialog file-editor-dialog" aria-labelledby="file-editor-title">
+    <form id="file-editor-form">
+      <header class="file-editor-header"><div><h2 id="file-editor-title">Edit file</h2><p id="file-editor-path"></p></div><button id="file-editor-close" class="dialog-close" type="button" aria-label="Close file editor">&times;</button></header>
+      <textarea id="file-editor-content" spellcheck="false" aria-label="File contents"></textarea>
+      <p id="file-editor-feedback" class="error" role="alert"></p>
+      <div class="dialog-actions"><button id="file-editor-cancel" type="button">Cancel</button><button id="file-editor-save" class="primary" type="submit">Save file</button></div>
+    </form>
   </dialog>
   <div id="copy-status" class="sr-only" role="status"></div>
   <script src="/vendor/marked.js" defer></script>

@@ -3,6 +3,7 @@
 set -Eeuo pipefail
 
 TOOL_RESULT=''
+TOOL_FILE_EDIT=''
 TOOL_APPROVAL='{"decision":"invalid","prefix":[]}'
 COMMAND_PERMISSION_ACTION=''
 PENDING_USER_INSTRUCTION=''
@@ -72,7 +73,7 @@ require_commands() {
     for name in "$@"; do
         if ! command -v "$name" >/dev/null 2>&1; then
             case "$name" in
-                timeout) packages+=(coreutils) ;;
+                timeout|sha256sum) packages+=(coreutils) ;;
                 *) packages+=("$name") ;;
             esac
         fi
@@ -295,9 +296,43 @@ execute_approved_command() {
         "$program" "${arguments[@]}"
 }
 
+execute_file_edit() {
+    local arguments_json="$1" call_id="$2" edit_id payload helper_file response
+    [[ -n "${SESSION_ID:-}" ]] || { TOOL_RESULT="File edit failed: no session"; return; }
+    edit_id=$(printf '%s' "$SESSION_ID:$call_id" | sha256sum | awk '{print $1}')
+    payload=$(jq -cn --slurpfile args <(printf '%s' "$arguments_json") --arg id "$edit_id" --arg cwd "$PWD" \
+        '$args[0] + {action:"apply",request_id:$id,cwd:$cwd}') || {
+        TOOL_RESULT="File edit failed: invalid arguments"; return;
+    }
+    helper_file=$(mktemp)
+    if ! curl --fail --silent --show-error --connect-timeout "$BRAIN_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$BRAIN_REQUEST_TIMEOUT_SECONDS" "$BRAIN_URL/file-tool.py" -o "$helper_file"; then
+        rm -f -- "$helper_file"
+        TOOL_RESULT="File edit failed: could not download editor"
+        return
+    fi
+    if [[ "$(head -n 1 "$helper_file")" != '#!/usr/bin/env python3' ]]; then
+        rm -f -- "$helper_file"
+        TOOL_RESULT="File edit failed: invalid editor download"
+        return
+    fi
+    response=$(python3 "$helper_file" --state-dir "${FILE_TOOL_STATE_DIR:-$HOME/.local/state/ai-helper/file-edits}" \
+        <<<"$payload") || response='{"ok":false,"error":"editor failed"}'
+    rm -f -- "$helper_file"
+    if ! jq -e '.ok == true and (.edit | type == "object")' <<<"$response" >/dev/null 2>&1; then
+        TOOL_RESULT="File edit failed: $(jq -r '.error // "invalid editor response"' <<<"$response" 2>/dev/null)"
+        return
+    fi
+    TOOL_FILE_EDIT=$(jq -c '.edit' <<<"$response")
+    TOOL_APPROVAL='{"decision":"automatic","prefix":[]}'
+    TOOL_RESULT=$(jq -r '.edit | "Edited " + .path + " (+" + (.added|tostring) + " / -" + (.removed|tostring) + "). Diff and restore available in Web UI."' <<<"$response")
+    print_status "$TOOL_RESULT"
+}
+
 execute_tool_call() {
     local call="$1" name arguments_text arguments_json
     TOOL_APPROVAL='{"decision":"invalid","prefix":[]}'
+    TOOL_FILE_EDIT=''
     name=$(jq -r '.function.name // empty' <<<"$call")
     printf '%sAI requested function: %q%s\n' "$COLOR_STATUS" "${name:-unknown}" "$COLOR_RESET"
     arguments_text=$(jq -r '.function.arguments // "{}"' <<<"$call")
@@ -308,6 +343,7 @@ execute_tool_call() {
     fi
     case "$name" in
         run_command) execute_approved_command "$arguments_json" ;;
+        edit_file) execute_file_edit "$arguments_json" "$(jq -r '.id' <<<"$call")" ;;
         *) printf -v TOOL_RESULT 'Tool error: unknown tool %q.' "$name" ;;
     esac
 }
@@ -668,24 +704,27 @@ submit_tool_results() {
         call=$(jq -c ".[$index]" <<<"$calls")
         id=$(jq -r '.id' <<<"$call")
         TOOL_RESULT=''
+        TOOL_FILE_EDIT=''
         if [[ -n "$PENDING_USER_INSTRUCTION" ]]; then
             TOOL_RESULT="Tool call cancelled because user provided new instructions."
             TOOL_APPROVAL='{"decision":"cancelled","prefix":[]}'
         else
             execute_tool_call "$call"
         fi
-        results=$(jq -cn --argjson current "$results" --arg id "$id" \
+        results=$(jq -cn --slurpfile current <(printf '%s' "$results") --arg id "$id" \
             --arg content "$TOOL_RESULT" --argjson approval "$TOOL_APPROVAL" \
-            '$current + [{tool_call_id: $id, content: $content, approval: $approval}]')
+            --slurpfile file_edit <(printf '%s' "${TOOL_FILE_EDIT:-null}") \
+            '$current[0] + [{tool_call_id: $id, content: $content, approval: $approval}
+              + (if $file_edit[0] == null then {} else {file_edit: $file_edit[0]} end)]')
     done
     if [[ -n "$PENDING_USER_INSTRUCTION" ]]; then
-        payload=$(jq -cn --argjson results "$results" \
+        payload=$(jq -cn --slurpfile results <(printf '%s' "$results") \
             --arg instruction "$PENDING_USER_INSTRUCTION" --arg cwd "$PWD" \
-            '{type: "tool_results", results: $results, instruction: $instruction, cwd: $cwd}')
+            '{type: "tool_results", results: $results[0], instruction: $instruction, cwd: $cwd}')
         PENDING_USER_INSTRUCTION=''
     else
-        payload=$(jq -cn --argjson results "$results" --arg cwd "$PWD" \
-            '{type: "tool_results", results: $results, cwd: $cwd}')
+        payload=$(jq -cn --slurpfile results <(printf '%s' "$results") --arg cwd "$PWD" \
+            '{type: "tool_results", results: $results[0], cwd: $cwd}')
     fi
     stream_turn_with_recovery "$payload"
 }
@@ -778,7 +817,7 @@ run_conversation() {
 }
 
 main() {
-    require_commands curl jq timeout
+    require_commands curl jq timeout sha256sum python3
     initialize_configuration
     initialize_state_file "$SESSION_FILE"
     check_brain_ready

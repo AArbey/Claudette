@@ -23,7 +23,7 @@ Brain host:
 Client machines:
 
 - Bash 4+
-- `curl`, `jq`, `timeout`, and standard GNU utilities
+- `curl`, `jq`, `timeout`, `python3`, and standard GNU utilities
 
 Command to add the ai-helper command to the .bashrc :
 
@@ -246,10 +246,10 @@ Direct root installation is supported. When already logged in as root, either
 `| bash` or `| sudo bash` installs runner for root. With `sudo` from another
 account, runner stays assigned to that account through `SUDO_USER`.
 
-Installer verifies existing stable client ID, installs only missing `jq` or
-`coreutils`, installs Bash worker and per-user systemd units, then enables socket.
-It does not install Python, edit firewall, modify shell files, or replace system
-packages. Commands run as installing user with `NoNewPrivileges=yes`.
+Installer verifies existing stable client ID, installs missing `jq`, `coreutils`,
+or `python3`, installs Bash worker and file editor plus per-user systemd units,
+then enables socket. It does not edit firewall or shell files. Commands and
+file edits run as installing user with `NoNewPrivileges=yes`.
 
 systemd listens without persistent worker. `Accept=yes` starts one Bash process
 for each health or execution HTTP connection; process exits after response.
@@ -258,6 +258,17 @@ separate ports selected from `8766-8865`.
 
 Brain dispatches trusted tool calls from one model response concurrently.
 Untrusted calls remain pending until each receives an approval or denial.
+
+`edit_file` creates, changes, or deletes one UTF-8 text file up to 256 KiB.
+The edit applies immediately. Web shows file path and diff outside collapsed
+activity, with **Edit file** and **Restore original** actions. Created files
+show **Delete file** instead. Restore uses backup saved on target host and
+refuses to overwrite a file changed elsewhere.
+Web edits use selected runner. Terminal edits run on terminal host. Web review
+of a terminal edit works from conversation history; Web editing and restore
+require installing runner for that same user and host. Backups live under
+`~/.local/state/ai-helper/file-edits`. Update existing runners to version 3
+through **Install / repair** before Web file editing.
 
 Runner accepts only authenticated HTTP/1.1 from configured Brain source IP.
 Protocol requires `Content-Length` and `Connection: close`; chunking, malformed
@@ -431,6 +442,7 @@ Brain exposes:
 - `GET /readyz`
 - `GET /client.sh`
 - `GET /runner.sh`
+- `GET /file-tool.py`
 - `GET /runner/install/{single_use_token}`
 - `GET /v1/conversations`
 - `POST /v1/conversations` with `{"runner_id":null}` (web dashboard)
@@ -442,6 +454,8 @@ Brain exposes:
 - `POST /v1/conversations/{id}/branches/{branch_id}` with `{}` (web dashboard)
 - `POST /v1/conversations/{id}/runner` with `{"runner_id":null}`
 - `POST /v1/conversations/{id}/commands/{tool_call_id}` with approval decision
+- `GET /v1/conversations/{id}/file-edits/{tool_call_id}` for current text and hash
+- `POST /v1/conversations/{id}/file-edits/{tool_call_id}` with `{"action":"save","expected_hash":"...","content":"..."}` or `{"action":"restore","expected_hash":"..."}`
 - `GET /v1/conversations/{id}/events` (web SSE: snapshot, reasoning/content deltas, deleted)
 - `GET /v1/servers` (web port)
 - `GET /v1/runners` (web port)

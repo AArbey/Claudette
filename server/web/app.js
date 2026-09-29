@@ -74,14 +74,16 @@ const memoryScopeInput = document.querySelector("#memory-scope");
 const memoryFeedback = document.querySelector("#memory-feedback");
 const memorySaveButton = document.querySelector("#memory-save");
 const aiConfigButton = document.querySelector("#ai-config-button");
+const settingsButton = document.querySelector("#settings-button");
+const headerNewConversationButton = document.querySelector("#header-new-conversation");
+const settingsTabs = [...document.querySelectorAll("[data-settings-tab]")];
 const aiModelValue = document.querySelector("#ai-model-value");
 const aiConfigDialog = document.querySelector("#ai-config-dialog");
 const aiConfigClose = document.querySelector("#ai-config-close");
 const aiServerList = document.querySelector("#ai-server-list");
-const aiServerAdd = document.querySelector("#ai-server-add");
+const aiServerRefresh = document.querySelector("#ai-server-refresh");
 const aiServerForm = document.querySelector("#ai-server-form");
 const aiServerId = document.querySelector("#ai-server-id");
-const aiServerName = document.querySelector("#ai-server-name");
 const aiServerEndpoint = document.querySelector("#ai-server-endpoint");
 const aiServerKey = document.querySelector("#ai-server-key");
 const aiKeyNote = document.querySelector("#ai-key-note");
@@ -90,14 +92,22 @@ const aiServerSave = document.querySelector("#ai-server-save");
 const webToolsForm = document.querySelector("#web-tools-form");
 const searxngUrl = document.querySelector("#searxng-url");
 const searxngResults = document.querySelector("#searxng-results");
-const researchModel = document.querySelector("#research-model");
-const researchModelNote = document.querySelector("#research-model-note");
 const webToolsFeedback = document.querySelector("#web-tools-feedback");
 const searxngTest = document.querySelector("#searxng-test");
 const webToolsSave = document.querySelector("#web-tools-save");
+const fileEditorDialog = document.querySelector("#file-editor-dialog");
+const fileEditorForm = document.querySelector("#file-editor-form");
+const fileEditorContent = document.querySelector("#file-editor-content");
+const fileEditorFeedback = document.querySelector("#file-editor-feedback");
+const fileEditorSave = document.querySelector("#file-editor-save");
+let fileEditorState = null;
 const researchDialog = document.querySelector("#research-dialog");
 const researchDialogBody = document.querySelector("#research-dialog-body");
 const researchDialogQuestion = document.querySelector("#research-dialog-question");
+const researchProgress = document.querySelector("#research-progress");
+const researchProgressTitle = document.querySelector("#research-progress-title");
+const researchProgressMeta = document.querySelector("#research-progress-meta");
+let visibleResearch = null;
 const researchDismissed = new Set();
 const researchAutoOpened = new Set();
 let webToolsConfig = null;
@@ -117,6 +127,8 @@ let aiServers = [];
 let aiConfigBusy = false;
 let aiConfigFeedbackTimer = null;
 let aiConfigRequestVersion = 0;
+let settingsActiveTab = "models";
+let settingsReturnFocus = null;
 let activeModelMenu = null;
 let activeModelTrigger = null;
 let confirmation = null;
@@ -244,7 +256,7 @@ const enrollmentEditors = new Map();
 
 function sessionState(id = selectedId) {
   if (!sessionStates.has(id)) sessionStates.set(id, {
-    messageBusy: false, stopBusy: false, branchBusy: false, commandBusy: false, actionBusy: false,
+    messageBusy: false, stopBusy: false, branchBusy: false, commandBusy: false, actionBusy: false, fileBusy: false,
     failure: "", feedback: "", notice: "", nextCommandId: "", editingMessageIndex: null,
     editingMessageDraft: "", references: [], answersOnly: null, answersKey: "",
   });
@@ -481,6 +493,7 @@ function actionIcon(name) {
     copy: '<rect width="13" height="13" x="9" y="9" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
     edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4Z"/>',
     resend: '<path d="M20 11a8.1 8.1 0 1 0 1 4"/><path d="M20 4v7h-7"/>',
+    chat: '<path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-2 2v-9.5a7.5 7.5 0 0 1 7.5-7.5h2A7.5 7.5 0 0 1 20 11.5Z"/><path d="M8 10h8M8 14h5"/>',
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
@@ -811,8 +824,11 @@ function renderAIHeader() {
   if (currentDetail && currentView === "conversations") renderComposer(currentDetail);
 }
 
-function createAIModelPicker(server, models, initialModel, label, note, onChoose) {
-  let selectedModel = models.includes(initialModel) ? initialModel : (models[0] || "");
+function createAIModelPicker(server, models, initialModel, label, note, onChoose, sameAsMain = false, sameAsMainValue = null) {
+  let selectedModel = models.includes(initialModel) ? initialModel
+    : sameAsMain && initialModel === sameAsMainValue ? sameAsMainValue
+    : sameAsMain && sameAsMainValue === "" && initialModel === null ? null
+    : sameAsMain ? sameAsMainValue : models[0] || "";
   const field = element("div", "ai-model-field");
   const labelRow = element("div", "ai-model-label-row");
   labelRow.append(element("span", "ai-model-label", label));
@@ -828,9 +844,11 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
   trigger.setAttribute("aria-expanded", "false");
   const menuId = `model-menu-${server.server_id}-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
   trigger.setAttribute("aria-controls", menuId);
-  const summaryValue = element("span", "model-picker-value", selectedModel || "No models discovered");
+  const summaryValue = element("span", "model-picker-value",
+    sameAsMain && selectedModel === sameAsMainValue ? "Same as main"
+      : selectedModel === null ? "Not configured" : selectedModel || "No models discovered");
   trigger.append(
-    element("span", "model-picker-dot", ""),
+    element("span", `model-picker-dot${(selectedModel === null && sameAsMainValue !== null) || (selectedModel === "" && !sameAsMain) ? " inactive" : ""}`, ""),
     summaryValue,
     element("span", "model-picker-chevron", "⌄"),
   );
@@ -844,6 +862,7 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
   const optionList = element("div", "model-picker-options");
   let noResults = null;
   if (models.length) {
+    const choices = sameAsMain ? [sameAsMainValue, ...models] : models;
     if (models.length > 8) {
       const searchWrap = element("div", "model-picker-search-wrap");
       const search = element("input", "model-picker-search");
@@ -870,20 +889,20 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
         moveModelPickerFocus(menu, null, event.key === "ArrowUp" ? "End" : event.key);
       });
     }
-    for (const model of models) {
+    for (const model of choices) {
       const option = element("button", `model-picker-option${model === selectedModel ? " selected" : ""}`);
       option.type = "button";
-      option.dataset.model = model;
+      option.dataset.model = model ?? "";
       option.setAttribute("role", "option");
       option.setAttribute("aria-selected", String(model === selectedModel));
       option.tabIndex = model === selectedModel ? 0 : -1;
       option.append(
-        element("span", "model-picker-option-name", model),
+        element("span", "model-picker-option-name", sameAsMain && model === sameAsMainValue ? "Same as main" : model),
         element("span", "model-picker-check", model === selectedModel ? "✓" : ""),
       );
       option.addEventListener("click", () => {
         selectedModel = model;
-        summaryValue.textContent = model;
+        summaryValue.textContent = sameAsMain && model === sameAsMainValue ? "Same as main" : model;
         for (const item of optionList.querySelectorAll(".model-picker-option")) {
           const chosen = item === option;
           item.classList.toggle("selected", chosen);
@@ -934,35 +953,12 @@ function createAIModelPicker(server, models, initialModel, label, note, onChoose
   return { field, menu, selectedModel: () => selectedModel };
 }
 
-function renderResearchModelOptions(preserveSelection = false) {
-  const current = preserveSelection ? researchModel.value : null;
-  const saved = webToolsConfig?.research_server_id && webToolsConfig?.research_model
-    ? JSON.stringify([webToolsConfig.research_server_id, webToolsConfig.research_model]) : "";
-  const fragment = document.createDocumentFragment();
-  fragment.append(element("option", "", "Active chat model"));
-  fragment.firstChild.value = "";
-  for (const server of aiServers) {
-    for (const model of server.models || []) {
-      const option = element("option", "", `${server.name} · ${model}`);
-      option.value = JSON.stringify([server.server_id, model]);
-      fragment.append(option);
-    }
-  }
-  researchModel.replaceChildren(fragment);
-  const selection = current === null ? saved : current;
-  researchModel.value = selection;
-  if (researchModel.value !== selection) researchModel.value = "";
-  researchModelNote.textContent = webToolsConfig?.research_model_fallback
-    ? "Selected research model unavailable. Active chat model used."
-    : "Research runs independently from main chat model.";
-}
-
 async function refreshWebToolsConfig() {
   try {
     webToolsConfig = await getJson("/v1/web-tools/config");
     searxngUrl.value = webToolsConfig.searxng_url || "";
     searxngResults.value = webToolsConfig.default_results || 8;
-    renderResearchModelOptions();
+    if (aiConfigDialog.open) renderAIConfig();
     webToolsFeedback.textContent = webToolsConfig.searxng_url
       ? "SearXNG configured. Test connection to check JSON search."
       : "Set SearXNG URL to enable Web tools.";
@@ -971,117 +967,76 @@ async function refreshWebToolsConfig() {
   }
 }
 
+function configuredAIServer() {
+  return aiServers.find(server => server.active) || aiServers[0] || null;
+}
+
+function populateAIServerForm(server) {
+  const serverId = server?.server_id || "";
+  if (aiServerForm.dataset.serverId === serverId) return;
+  aiServerForm.dataset.serverId = serverId;
+  aiServerId.value = serverId;
+  aiServerEndpoint.value = server?.endpoint_url || "";
+  aiServerKey.value = "";
+  aiKeyNote.textContent = server?.has_api_key ? "(leave blank to keep saved key)" : "(optional)";
+  aiServerRefresh.disabled = !server;
+}
+
 function renderAIConfig() {
-  const openAdvanced = new Set([...aiServerList.querySelectorAll(".ai-server-card")]
-    .filter(card => card.querySelector(".ai-server-advanced")?.open)
-    .map(card => card.dataset.serverId));
   closeModelPicker(false);
   document.querySelectorAll('.model-picker-menu[data-model-popover="true"]').forEach(node => node.remove());
+  const server = configuredAIServer();
+  populateAIServerForm(server);
   const fragment = document.createDocumentFragment();
   const popovers = [];
-  if (!aiServers.length) {
+  if (!server) {
     const empty = element("div", "ai-server-empty");
-    empty.append(element("strong", "", "No AI server"), element("p", "", "Add endpoint to discover models."));
+    empty.append(element("strong", "", "No models yet"), element("p", "", "Save LLM server to discover models."));
     fragment.append(empty);
-  }
-  for (const server of aiServers) {
-    const card = element("section", `ai-server-card${server.active ? " active" : ""}`);
-    card.dataset.serverId = server.server_id;
-    const details = element("div", "ai-server-details");
-    const title = element("div", "ai-server-title");
-    title.append(element("strong", "", server.name));
-    if (server.active) title.append(element("span", "ai-server-active-badge", "Active"));
-    details.append(title, element("span", "ai-server-endpoint", server.endpoint_url));
-
-    const actions = element("div", "ai-server-actions");
-    const edit = element("button", "ai-server-action", "Edit");
-    edit.type = "button";
-    edit.addEventListener("click", () => openAIServerForm(server));
-    const refresh = element("button", "ai-server-action", "Refresh");
-    refresh.type = "button";
-    refresh.addEventListener("click", () => void refreshAIModels(server.server_id, refresh));
-    const remove = element("button", "ai-server-action danger", "Delete");
-    remove.type = "button";
-    remove.addEventListener("click", () => deleteAIServer(server, remove));
-    actions.append(edit, refresh, remove);
-
+  } else {
     const models = Array.isArray(server.models) ? server.models : [];
-    const modelRow = element("div", "ai-server-model-row");
-    const modelPicker = createAIModelPicker(
-      server,
-      models,
-      server.selected_model,
-      "Model",
-      "Chat · saves automatically",
+    const mainPicker = createAIModelPicker(
+      server, models, server.selected_model, "Main model", "Conversations",
       model => {
-        if (!server.active || model !== server.selected_model) {
-          void selectAIModel(server.server_id, model);
-        }
+        if (!server.active || model !== server.selected_model) void selectAIModel(server.server_id, model);
       },
     );
-    modelRow.append(modelPicker.field);
-
-    const advanced = element("details", "ai-server-advanced");
-    advanced.open = openAdvanced.has(server.server_id);
-    advanced.append(element("summary", "", "Advanced"));
-    const supportRow = element("div", "ai-server-support-row");
     const supportPicker = createAIModelPicker(
-      server,
-      models,
-      server.support_model || server.selected_model,
-      "Support model",
-      "Conversation names",
+      server, models, server.support_model, "Support model", "Conversation names",
       model => {
         if (model !== server.support_model) void selectAISupportModel(server.server_id, model);
-      },
+      }, true, "",
     );
+    const researchSelection = webToolsConfig?.research_server_id === server.server_id
+      && models.includes(webToolsConfig?.research_model) ? webToolsConfig.research_model : null;
+    const researchPicker = createAIModelPicker(
+      server, models, researchSelection, "Web research model", "Deep research",
+      model => {
+        if (model !== researchSelection) void selectAIResearchModel(server.server_id, model);
+      }, true,
+    );
+    fragment.append(mainPicker.field, supportPicker.field, researchPicker.field);
+    popovers.push(mainPicker.menu, supportPicker.menu, researchPicker.menu);
     const waitToggle = element("label", "ai-support-wait");
     const waitInput = element("input", "ai-support-wait-input");
     waitInput.type = "checkbox";
     waitInput.checked = Boolean(server.support_wait_for_main);
-    waitInput.setAttribute("aria-label", `Wait for main LLM completion on ${server.name}`);
+    waitInput.setAttribute("aria-label", "Wait for main LLM completion");
     const waitCopy = element("span", "ai-support-wait-copy");
     waitCopy.append(
       element("strong", "", "Wait for main LLM completion"),
-      element("span", "", "Generate title after first answer finishes"),
+      element("span", "", "Generate conversation name after first answer finishes"),
     );
     waitInput.addEventListener("change", () => {
       waitInput.disabled = true;
       void setAISupportWait(server.server_id, waitInput.checked);
     });
     waitToggle.append(waitInput, waitCopy);
-    supportRow.append(supportPicker.field, waitToggle);
-    advanced.append(supportRow);
-    popovers.push(modelPicker.menu, supportPicker.menu);
-    card.append(details, actions, modelRow, advanced);
-    fragment.append(card);
+    fragment.append(waitToggle);
   }
   aiServerList.replaceChildren(fragment);
-  // Keep model popovers as DOM descendants of the modal dialog. A modal <dialog>
-  // makes everything outside itself inert; appending these to document.body made
-  // the top-layer menu visible but unable to receive pointer interaction. Popover
-  // rendering still lifts the menu out of the dialog's clipping/scrolling region.
   for (const menu of popovers) aiConfigDialog.append(menu);
   renderAIHeader();
-  renderResearchModelOptions(true);
-}
-
-function openAIServerForm(server = null) {
-  aiServerId.value = server?.server_id || "";
-  aiServerName.value = server?.name || "";
-  aiServerEndpoint.value = server?.endpoint_url || "";
-  aiServerKey.value = "";
-  aiKeyNote.textContent = server?.has_api_key ? "(leave blank to keep saved key)" : "(optional)";
-  setAIConfigFeedback();
-  aiServerForm.classList.remove("hidden");
-  aiServerAdd.classList.add("hidden");
-  aiServerName.focus();
-}
-
-function closeAIServerForm() {
-  aiServerForm.classList.add("hidden");
-  aiServerAdd.classList.remove("hidden");
-  setAIConfigFeedback();
 }
 
 async function refreshAIConfig(discover = false, preserveOpenDialog = false) {
@@ -1095,9 +1050,9 @@ async function refreshAIConfig(discover = false, preserveOpenDialog = false) {
       return;
     }
     renderAIConfig();
-    if (discover && !aiConfigBusy && aiServers.length) {
+    if (discover && !aiConfigBusy && configuredAIServer()) {
       aiConfigBusy = true;
-      await Promise.allSettled(aiServers.map(server => refreshAIModels(server.server_id)));
+      await refreshAIModels(configuredAIServer().server_id);
       aiConfigBusy = false;
     }
   } catch (_) {
@@ -1159,18 +1114,21 @@ async function setAISupportWait(serverId, waitForMain) {
   }
 }
 
-function deleteAIServer(server, returnFocus = null) {
-  openConfirmation({
-    title: "Delete AI server?",
-    description: `“${server.name}” and its saved endpoint configuration will be permanently deleted.`,
-    confirmLabel: "Delete AI server",
-    returnFocus,
-    run: async () => {
-    await aiWrite(`/v1/ai/servers/${encodeURIComponent(server.server_id)}`, {}, "DELETE");
-    await refreshAIConfig(false);
-      return true;
-    },
-  });
+async function selectAIResearchModel(serverId, model) {
+  setAIConfigFeedback("Updating web research model…", "info");
+  try {
+    webToolsConfig = await aiWrite("/v1/web-tools/config", {
+      searxng_url: webToolsConfig?.searxng_url || "",
+      default_results: webToolsConfig?.default_results || 8,
+      research_server_id: model === null ? null : serverId,
+      research_model: model,
+    });
+    renderAIConfig();
+    setAIConfigFeedback("Web research model updated", "success", true);
+  } catch (error) {
+    renderAIConfig();
+    setAIConfigFeedback(error.message || "Could not select web research model.", "error");
+  }
 }
 
 function setConnection(online) {
@@ -1380,6 +1338,15 @@ function renderView() {
   memoriesViewButton.setAttribute("aria-pressed", String(showMemories));
   showFeedback(showConversations ? sessionState().feedback : "");
   approvalBanner.classList.toggle("hidden", !showConversations || !currentDetail?.pending_tool_calls?.some(call => call.ui?.remote));
+  researchProgress.classList.toggle("hidden", !showConversations || !visibleResearch);
+  if (!showConversations) {
+    responseStatus.classList.add("hidden");
+    responseStatus.textContent = "";
+  }
+  const createLabel = showServerPolicies ? "Add server" : showMemories ? "New memory" : "New conversation";
+  headerNewConversationButton.setAttribute("aria-label", createLabel);
+  headerNewConversationButton.title = createLabel;
+  headerNewConversationButton.querySelector("span").textContent = createLabel;
   updateJump();
   conversationsViewButton.classList.toggle("selected", showConversations);
   serversViewButton.classList.toggle("selected", showServerPolicies);
@@ -1412,11 +1379,9 @@ function renderView() {
 
 function emptyState(title, text, showStart = false) {
   const wrapper = element("div", "empty-state");
-  wrapper.append(
-    element("div", "empty-icon", "⌁"),
-    element("h3", "", title),
-    element("p", "", text),
-  );
+  const icon = element("div", "empty-icon");
+  icon.append(actionIcon("chat"));
+  wrapper.append(icon, element("h3", "", title), element("p", "", text));
   if (showStart) {
     const start = element("button", "primary", "New conversation");
     start.type = "button";
@@ -1592,68 +1557,102 @@ function renderWebTool(call, result, key) {
 }
 
 function renderResearchDialog(trace) {
-  if (!trace) return;
   const nearBottom = researchDialogBody.scrollHeight - researchDialogBody.scrollTop - researchDialogBody.clientHeight < 30;
   const oldScroll = researchDialogBody.scrollTop;
+  const chatOpen = researchDialogBody.querySelector(".research-full-chat")?.open || false;
   researchDialogQuestion.textContent = trace.question || "";
   document.querySelector("#research-stop").classList.toggle("hidden", trace.status !== "running");
   const fragment = document.createDocumentFragment();
-  fragment.append(element("p", `research-state ${trace.status || "running"}`,
-    trace.status === "completed" ? "Completed" : trace.status === "failed" ? "Failed" : trace.status === "stopped" ? "Stopped" : trace.status === "interrupted" ? "Interrupted" : "Researching…"));
+  const statusLabels = {running: "In progress", completed: "Completed", failed: "Failed",
+    stopped: "Stopped", interrupted: "Interrupted"};
+  const overview = element("div", "research-overview");
+  overview.append(
+    element("span", `research-state ${trace.status || "running"}`, statusLabels[trace.status] || "In progress"),
+    element("span", "research-overview-count", `${trace.steps?.length || 0} steps · ${trace.sources?.length || 0} sources`),
+  );
+  fragment.append(overview);
+
+  const stepsSection = element("section", "research-section");
+  stepsSection.append(element("h3", "research-section-title", "Research steps"));
   const steps = element("ol", "research-steps");
-  for (const step of trace.steps || []) {
-    steps.append(element("li", "", `${step.kind === "search_searxng" ? "Search" : "Read"}: ${step.target} · ${step.status}`));
+  for (const [index, step] of (trace.steps || []).entries()) {
+    const row = element("li", "research-step");
+    row.append(element("span", "research-step-number", String(index + 1)));
+    const copy = element("div", "research-step-copy");
+    copy.append(element("strong", "", step.kind === "search_searxng" ? "Search web" : "Read page"),
+      element("span", "", step.target || "Waiting for result"));
+    row.append(copy, element("span", `research-step-status ${step.status || "running"}`,
+      statusLabels[step.status] || "In progress"));
+    steps.append(row);
   }
-  fragment.append(steps);
-  if (trace.error) fragment.append(element("p", "command-note error", trace.error));
+  if (steps.childElementCount) stepsSection.append(steps);
+  else stepsSection.append(element("p", "research-empty", "Research model preparing next step…"));
+  fragment.append(stepsSection);
+  if (trace.error) fragment.append(element("p", "research-error", trace.error));
+
   const chat = element("details", "research-full-chat");
-  chat.open = researchDialogBody.querySelector(".research-full-chat")?.open || false;
-  chat.append(element("summary", "", "Full research chat"));
+  chat.open = chatOpen;
+  const chatSummary = element("summary", "");
+  chatSummary.append(element("span", "", "Full research chat"),
+    element("span", "research-chat-count", `${trace.messages?.length || 0} messages`));
+  chat.append(chatSummary);
+  const chatList = element("div", "research-chat-list");
   for (const message of trace.messages || []) {
-    const row = element("div", "research-message");
+    const row = element("div", `research-message ${message.role || ""}`);
     row.append(element("strong", "", message.role === "tool" ? `Tool · ${message.name}` : message.role === "user" ? "Question" : "Research model"));
     if (message.content) row.append(element("pre", "", message.content));
-    for (const call of message.tool_calls || []) row.append(element("p", "command-note", `${call.name}: ${call.arguments}`));
-    chat.append(row);
+    for (const call of message.tool_calls || []) row.append(element("p", "research-tool-call", `${call.name}: ${call.arguments}`));
+    chatList.append(row);
   }
+  if (!chatList.childElementCount) chatList.append(element("p", "research-empty", "Conversation starting…"));
+  chat.append(chatList);
   fragment.append(chat);
   if (trace.sources?.length) {
-    const sources = element("div", "research-sources");
-    sources.append(element("strong", "", "Sources"));
-    trace.sources.forEach((source, index) => sources.append(safeWebLink(source.url, `[${index + 1}] ${source.title || source.url}`)));
+    const sources = element("section", "research-section research-sources");
+    sources.append(element("h3", "research-section-title", "Sources"));
+    trace.sources.forEach((source, index) => {
+      const row = element("div", "research-source");
+      row.append(element("span", "research-source-number", String(index + 1)),
+        safeWebLink(source.url, source.title || source.url));
+      sources.append(row);
+    });
     fragment.append(sources);
   }
   researchDialogBody.replaceChildren(fragment);
   researchDialogBody.scrollTop = nearBottom ? researchDialogBody.scrollHeight : oldScroll;
 }
 
-function openResearchDialog(trace, callId) {
+function openResearchDialog(trace, callId, sessionId = currentDetail?.session_id) {
+  if (researchDialog.dataset.callId !== callId || researchDialog.dataset.sessionId !== sessionId)
+    researchDialogBody.replaceChildren();
   researchDialog.dataset.callId = callId;
-  researchDialog.dataset.sessionId = currentDetail?.session_id || "";
+  researchDialog.dataset.sessionId = sessionId || "";
   renderResearchDialog(trace);
   if (!researchDialog.open) researchDialog.showModal();
 }
 
 function syncResearchDialog(detail) {
+  if (detail.session_id !== selectedId || currentView !== "conversations") return;
   const live = detail.live?.research;
-  if (researchDialog.open && (researchDialog.dataset.sessionId !== detail.session_id ||
-      detail.session_id !== selectedId || currentView !== "conversations")) {
-    researchDismissed.add(`${researchDialog.dataset.sessionId}:${researchDialog.dataset.callId}`);
-    researchDialog.close();
-  }
-  if (detail.session_id !== selectedId) return;
-  if (live && currentView === "conversations") {
-    const key = `${detail.session_id}:${live.call_id}`;
-    if (!researchDialog.open && !researchDismissed.has(key) && !researchAutoOpened.has(key)) {
-      researchAutoOpened.add(key);
-      openResearchDialog(live, live.call_id);
-    } else if (researchDialog.open && researchDialog.dataset.callId === live.call_id) renderResearchDialog(live);
-    return;
-  }
-  if (!researchDialog.open) return;
   const saved = [...detail.messages].reverse().find(message =>
-    message.role === "tool" && message.tool_call_id === researchDialog.dataset.callId && message.ui?.research);
-  if (saved) renderResearchDialog(saved.ui.research);
+    message.role === "tool" && message.ui?.research);
+  const trace = live || saved?.ui.research;
+  const callId = live?.call_id || saved?.tool_call_id;
+  visibleResearch = trace && callId ? {trace, callId, sessionId: detail.session_id} : null;
+  researchProgress.classList.toggle("hidden", !visibleResearch);
+  if (visibleResearch) {
+    researchProgressTitle.textContent = live ? "Deep research in progress" : "Deep research";
+    researchProgressMeta.textContent = `${trace.steps?.length || 0} steps · ${trace.sources?.length || 0} sources`;
+    researchProgress.classList.toggle("running", trace.status === "running");
+  }
+  if (researchDialog.open && (researchDialog.dataset.sessionId !== detail.session_id ||
+      researchDialog.dataset.callId !== callId)) researchDialog.close();
+  if (!visibleResearch) return;
+  const key = `${detail.session_id}:${callId}`;
+  if (live && !researchDialog.open && !researchDismissed.has(key) && !researchAutoOpened.has(key)) {
+    researchAutoOpened.add(key);
+    openResearchDialog(trace, callId, detail.session_id);
+  } else if (researchDialog.open) renderResearchDialog(trace);
 }
 
 function approvalBadge(approval) {
@@ -1708,7 +1707,134 @@ async function remoteCommandAction(callId, decision) {
   }
 }
 
+function fileToolArguments(call) {
+  if (call.function?.name !== "edit_file") return null;
+  try {
+    const args = JSON.parse(call.function.arguments);
+    return args && typeof args.path === "string" ? args : null;
+  } catch (_error) { return null; }
+}
+
+function fileEditPath(sessionId, callId) {
+  return `/v1/conversations/${encodeURIComponent(sessionId)}/file-edits/${encodeURIComponent(callId)}`;
+}
+
+async function refreshFileConversation(sessionId) {
+  const detail = await getJson(`/v1/conversations/${encodeURIComponent(sessionId)}`);
+  if (currentDetail?.session_id === sessionId) {
+    currentDetail = detail;
+    renderDetail(detail);
+  }
+}
+
+async function openFileEditor(callId, edit) {
+  if (!currentDetail || currentDetail.active || currentDetail.archived) return;
+  const sessionId = currentDetail.session_id;
+  const state = sessionState(sessionId);
+  if (state.fileBusy) return;
+  state.fileBusy = true;
+  renderDetail(currentDetail);
+  try {
+    const result = await getJson(fileEditPath(sessionId, callId));
+    fileEditorState = { sessionId, callId, hash: result.hash, initial: result.content ?? "",
+      expected: edit.after_hash };
+    fileEditorContent.value = result.content ?? "";
+    document.querySelector("#file-editor-path").textContent = edit.path;
+    fileEditorFeedback.textContent = result.hash !== edit.after_hash
+      ? "File changed outside this edit. Review current content; save and restore are blocked until a new edit."
+      : "";
+    fileEditorSave.disabled = true;
+    fileEditorDialog.showModal();
+    fileEditorContent.focus();
+  } catch (error) { showSessionError(sessionId, error.message || "Could not open file."); }
+  finally { state.fileBusy = false; if (currentDetail?.session_id === sessionId) renderDetail(currentDetail); }
+}
+
+async function applyFileAction(sessionId, callId, body) {
+  const state = sessionState(sessionId);
+  if (state.fileBusy) return false;
+  state.fileBusy = true;
+  if (currentDetail?.session_id === sessionId) renderDetail(currentDetail);
+  try {
+    await requestJson(fileEditPath(sessionId, callId), { method: "POST", body, ui: true });
+    await refreshFileConversation(sessionId);
+    return true;
+  } finally {
+    state.fileBusy = false;
+    if (currentDetail?.session_id === sessionId) renderDetail(currentDetail);
+  }
+}
+
+function confirmFileRestore(callId, edit, returnFocus) {
+  const sessionId = currentDetail?.session_id;
+  if (!sessionId) return;
+  const created = edit.operation === "create";
+  openConfirmation({
+    title: created ? "Delete file?" : "Restore original file?",
+    description: created
+      ? `Delete ${edit.path}, created by this edit?`
+      : `Restore puts ${edit.path} back as it was before this edit.`,
+    confirmLabel: created ? "Delete file" : "Restore original",
+    returnFocus,
+    run: () => applyFileAction(sessionId, callId, {
+      action: "restore", expected_hash: edit.after_hash,
+    }),
+  });
+}
+
+function renderFileTool(call, result, key) {
+  const args = fileToolArguments(call) || {};
+  const edit = result?.ui?.file_edit;
+  const path = edit?.path || args.path || "File unavailable";
+  const card = disclosure("tool-card file-edit-card", key, Boolean(edit));
+  card.dataset.callId = call.id;
+  const summary = element("summary", "tool-summary");
+  const action = edit?.status === "restored" ? (edit.operation === "create" ? "Deleted" : "Restored")
+    : edit?.manually_edited ? "Edited by you"
+    : edit?.operation === "create" ? "Created" : edit?.operation === "delete" ? "Deleted" : "Edited";
+  summary.append(element("code", "command-line", path),
+    element("span", `command-badge ${edit ? "success" : result ? "failed" : "pending"}`,
+      edit ? action : result ? "Failed" : "Awaiting client"));
+  card.append(summary);
+  const body = element("div", "tool-details file-edit-details");
+  if (args.reason) body.append(element("p", "command-reason", args.reason));
+  if (edit) {
+    const counts = element("p", "file-diff-counts", `+${edit.added}  −${edit.removed}`);
+    body.append(counts);
+    if (edit.diff) {
+      const diff = element("pre", "file-diff");
+      const lines = edit.diff.split("\n");
+      if (lines.length <= 5000) {
+        const fragment = document.createDocumentFragment();
+        lines.forEach((line, index) => {
+          const className = index < 2 ? "header" : line.startsWith("+") ? "add"
+            : line.startsWith("-") ? "remove" : line.startsWith("@@") ? "hunk" : "";
+          fragment.append(element("span", className, line + "\n"));
+        });
+        diff.append(fragment);
+      } else diff.textContent = edit.diff;
+      body.append(diff, copyButton(edit.diff, "Copy diff"));
+    } else body.append(element("p", "command-note", edit.operation === "create" && edit.status === "restored"
+      ? "File deleted." : "File matches original version."));
+    const actions = element("div", "file-edit-actions");
+    const editButton = element("button", "", "Edit file");
+    editButton.type = "button";
+    editButton.disabled = Boolean(currentDetail?.active || currentDetail?.archived || sessionState().fileBusy);
+    editButton.addEventListener("click", () => void openFileEditor(call.id, edit));
+    const restoreButton = element("button", "danger", edit.operation === "create" ? "Delete file" : "Restore original");
+    restoreButton.type = "button";
+    restoreButton.disabled = edit.status === "restored" || Boolean(currentDetail?.active || currentDetail?.archived || sessionState().fileBusy);
+    restoreButton.addEventListener("click", () => confirmFileRestore(call.id, edit, restoreButton));
+    actions.append(editButton, restoreButton);
+    body.append(actions);
+  } else if (result) body.append(element("p", "command-note error", result.content || "File edit failed."));
+  else body.append(element("p", "command-note", "File edit pending in terminal."));
+  card.append(body);
+  return card;
+}
+
 function renderTool(call, result, key) {
+  if (fileToolArguments(call)) return renderFileTool(call, result, key);
   if (webToolArguments(call)) return renderWebTool(call, result, key);
   if (memoryToolArguments(call)) return renderMemoryTool(call, result, key);
   const uiState = sessionState();
@@ -2607,6 +2733,7 @@ function renderResponseGroup(detail, group, position, isLast) {
   const results = group.entries.filter(entry => entry.message.role === "tool").map(entry => entry.message);
   const pendingIds = new Set((detail.pending_tool_calls || []).filter(call => call.ui?.remote).map(call => call.id));
   const activityBody = element("div", "response-activity-body");
+  const fileCards = element("div", "file-edit-list");
   let activityCount = 0;
 
   for (const entry of assistants) {
@@ -2623,6 +2750,11 @@ function renderResponseGroup(detail, group, position, isLast) {
     }
     const completedCalls = (message.tool_calls || []).filter(call => !pendingIds.has(call.id));
     for (const [callIndex, call] of completedCalls.entries()) {
+      if (call.function?.name === "edit_file") {
+        fileCards.append(renderFileTool(call, results.find(result => result.tool_call_id === call.id),
+          `${key}:file:${entry.index}:${callIndex}`));
+        continue;
+      }
       activityBody.append(renderTool(
         call,
         results.find(result => result.tool_call_id === call.id),
@@ -2655,6 +2787,8 @@ function renderResponseGroup(detail, group, position, isLast) {
     activity.classList.toggle("answers-only-hidden", answersOnlyEnabled(detail));
     section.append(activity);
   }
+
+  if (fileCards.childNodes.length) section.append(fileCards);
 
   for (const entry of group.entries.filter(entry => entry.message.role === "system")) {
     section.append(renderMessage(entry.message, entry.index));
@@ -2702,7 +2836,7 @@ function renderDetail(detail) {
     fragment.append(renderResponseGroup(detail, { user: null, entries: [] }, 0, true));
   }
   if (!messages.length && !detail.live) {
-    fragment.append(emptyState("Empty conversation", "No client messages yet."));
+    fragment.append(emptyState("Start here", "Send a message below. Choose a target above to enable approved commands."));
   }
   transcript.replaceChildren(fragment);
   if (focusedKey) {
@@ -2805,7 +2939,7 @@ function renderComposer(detail) {
     hint = "Configure AI model before sending messages.";
     const configure = element("button", "composer-hint-action", "Configure AI");
     configure.type = "button";
-    configure.addEventListener("click", openAIConfig);
+    configure.addEventListener("click", () => openAIConfig("models", configure));
     messageHint.append(document.createTextNode(`${hint} `), configure);
   } else hint = detail.runner
     ? `Commands run on ${detail.runner.client_name} after approval or a trusted-prefix match.`
@@ -3008,12 +3142,12 @@ async function refreshList() {
     if (selectedId && currentView === "conversations") await refreshDetail();
     if (!selectedId && currentView === "conversations") {
       closeConversationStream();
-      titleElement.textContent = "Conversations";
-      metaElement.textContent = "Client sessions appear here automatically.";
+      titleElement.textContent = "Chats";
+      metaElement.textContent = "Start a conversation or connect a server.";
       statusBadge.classList.add("hidden");
       actionsElement.classList.add("hidden");
       messageForm.classList.add("hidden");
-      transcript.replaceChildren(emptyState("No conversations", "Client sessions appear here automatically.", true));
+      transcript.replaceChildren(emptyState("Your next conversation starts here", "Ask a question, or connect a server to work with approved commands.", true));
     }
     renderView();
   } catch (_error) {
@@ -3032,6 +3166,9 @@ function closeConversationStream() {
   if (conversationStream) conversationStream.close();
   conversationStream = null;
   streamedSessionId = null;
+  if (researchDialog.open) researchDialog.close();
+  researchProgress.classList.add("hidden");
+  visibleResearch = null;
   currentDetail = null;
 }
 
@@ -3097,6 +3234,11 @@ function refreshDetail() {
     if (liveState) liveState.textContent = label;
     const summary = transcript.querySelector(".response-group:last-child .response-activity-summary span");
     if (summary) summary.textContent = label;
+  });
+  stream.addEventListener("research", event => {
+    if (conversationStream !== stream || !currentDetail?.live) return;
+    currentDetail.live.research = JSON.parse(event.data);
+    syncResearchDialog(currentDetail);
   });
   stream.addEventListener("context", event => {
     if (conversationStream !== stream || !currentDetail) return;
@@ -3272,18 +3414,68 @@ filterElement.addEventListener("change", () => {
 archiveButton.addEventListener("click", () => void changeConversationArchive());
 deleteButton.addEventListener("click", confirmConversationDelete);
 newConversationButton.addEventListener("click", () => void openNewConversation());
+headerNewConversationButton.addEventListener("click", () => {
+  if (currentView === "servers") void openAddServer();
+  else if (currentView === "memories") openMemoryDialog();
+  else void openNewConversation();
+});
 addServerButton.addEventListener("click", () => void openAddServer());
 newMemoryButton.addEventListener("click", () => openMemoryDialog());
-function openAIConfig() {
-  closeAIServerForm();
-  if (!aiConfigDialog.open) aiConfigDialog.showModal();
-  void refreshAIConfig(true);
-  void refreshWebToolsConfig();
+function selectSettingsTab(name, focus = false) {
+  if (!settingsTabs.some(tab => tab.dataset.settingsTab === name)) return;
+  closeModelPicker(false);
+  if (name !== "appearance") themePicker.open = false;
+  settingsActiveTab = name;
+  aiConfigDialog.dataset.activeTab = name;
+  for (const tab of settingsTabs) {
+    const selected = tab.dataset.settingsTab === name;
+    tab.classList.toggle("selected", selected);
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    document.querySelector('#' + tab.getAttribute("aria-controls")).classList.toggle("hidden", !selected);
+    if (selected && focus) tab.focus({ preventScroll: true });
+  }
+  positionModelPicker();
 }
-aiConfigButton.addEventListener("click", openAIConfig);
+
+function openAIConfig(tab = settingsActiveTab, trigger = aiConfigButton) {
+  if (!aiConfigDialog.open) {
+    settingsReturnFocus = trigger?.isConnected ? trigger : aiConfigButton;
+    if (document.body.classList.contains("sidebar-open")) {
+      setSidebar(false);
+      settingsReturnFocus = menuButton;
+    }
+    aiConfigDialog.showModal();
+    void refreshAIConfig(true);
+    void refreshWebToolsConfig();
+  }
+  selectSettingsTab(tab, true);
+}
+aiConfigButton.addEventListener("click", () => openAIConfig("models", aiConfigButton));
+settingsButton.addEventListener("click", () => openAIConfig(settingsActiveTab, settingsButton));
+settingsTabs.forEach((tab, index) => {
+  tab.addEventListener("click", () => selectSettingsTab(tab.dataset.settingsTab, true));
+  tab.addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? 0 : event.key === "End" ? settingsTabs.length - 1
+      : (index + (["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1) + settingsTabs.length) % settingsTabs.length;
+    selectSettingsTab(settingsTabs[next].dataset.settingsTab, true);
+  });
+});
+document.querySelector("#settings-open-servers").addEventListener("click", () => {
+  aiConfigDialog.close();
+  showServers();
+});
+document.querySelector("#settings-open-memories").addEventListener("click", () => {
+  aiConfigDialog.close();
+  showMemories();
+});
 aiConfigClose.addEventListener("click", () => aiConfigDialog.close());
-aiServerAdd.addEventListener("click", () => openAIServerForm());
-document.querySelector("#ai-server-cancel").addEventListener("click", closeAIServerForm);
+aiServerRefresh.addEventListener("click", () => {
+  const server = configuredAIServer();
+  if (server) void refreshAIModels(server.server_id, aiServerRefresh);
+});
 aiServerForm.addEventListener("submit", async event => {
   event.preventDefault();
   if (aiServerSave.disabled) return;
@@ -3291,20 +3483,30 @@ aiServerForm.addEventListener("submit", async event => {
   setAIConfigFeedback("Checking models…", "info");
   const id = aiServerId.value;
   const payload = {
-    name: aiServerName.value,
+    name: configuredAIServer()?.name || "LLM server",
     endpoint_url: aiServerEndpoint.value,
   };
   if (!id || aiServerKey.value) payload.api_key = aiServerKey.value;
   try {
-    await aiWrite(id ? `/v1/ai/servers/${encodeURIComponent(id)}` : "/v1/ai/servers", payload);
-    closeAIServerForm();
+    const result = await aiWrite(id ? `/v1/ai/servers/${encodeURIComponent(id)}` : "/v1/ai/servers", payload);
+    aiServerKey.value = "";
+    if (!result.server.active && result.server.models.length) {
+      await aiWrite("/v1/ai/selection", {
+        server_id: result.server.server_id,
+        model: result.server.selected_model || result.server.models[0],
+      });
+    }
     await refreshAIConfig(false);
-    setAIConfigFeedback(id ? "Server updated" : "Server added", "success", true);
+    setAIConfigFeedback("Server saved", "success", true);
   } catch (error) {
     setAIConfigFeedback(error.message || "Could not save AI server.", "error");
   } finally {
     aiServerSave.disabled = false;
   }
+});
+researchProgress.addEventListener("click", () => {
+  if (visibleResearch && currentDetail?.session_id === visibleResearch.sessionId)
+    openResearchDialog(visibleResearch.trace, visibleResearch.callId, visibleResearch.sessionId);
 });
 document.querySelector("#research-dialog-close").addEventListener("click", () => researchDialog.close());
 document.querySelector("#research-stop").addEventListener("click", () => messageStop.click());
@@ -3318,17 +3520,17 @@ webToolsForm.addEventListener("submit", async event => {
   if (webToolsSave.disabled) return;
   webToolsSave.disabled = true;
   webToolsFeedback.textContent = "Saving…";
-  let serverId = null, model = null;
-  if (researchModel.value) [serverId, model] = JSON.parse(researchModel.value);
   try {
     webToolsConfig = await aiWrite("/v1/web-tools/config", {
       searxng_url: searxngUrl.value.trim(),
       default_results: Number(searxngResults.value),
-      research_server_id: serverId,
-      research_model: model,
+      research_server_id: webToolsConfig?.research_server_id === configuredAIServer()?.server_id
+        ? webToolsConfig.research_server_id : null,
+      research_model: webToolsConfig?.research_server_id === configuredAIServer()?.server_id
+        ? webToolsConfig.research_model : null,
     });
     webToolsFeedback.textContent = "Web settings saved.";
-    renderResearchModelOptions();
+    renderAIConfig();
   } catch (error) {
     webToolsFeedback.textContent = error.message || "Could not save Web settings.";
   } finally { webToolsSave.disabled = false; }
@@ -3577,7 +3779,8 @@ answersOnlyButton.addEventListener("click", () => {
   state.answersOnly = !answersOnlyEnabled(currentDetail);
   storageWrite("sessionStorage", answersOnlyKey(currentDetail), state.answersOnly ? "1" : "");
   renderDetail(currentDetail);
-  answersOnlyButton.focus({ preventScroll: true });
+  conversationMenu.open = false;
+  conversationMenu.querySelector("summary").focus({ preventScroll: true });
 });
 document.querySelector("#connection-retry").addEventListener("click", () => {
   if (currentView === "servers") void refreshServers();
@@ -3602,6 +3805,27 @@ document.querySelector("#edit-form").addEventListener("submit", async event => {
   if (ok) editDialog.close();
 });
 editDialog.addEventListener("close", () => { editAction = null; conversationMenu.querySelector("summary").focus(); });
+document.querySelector("#file-editor-close").addEventListener("click", () => fileEditorDialog.close());
+document.querySelector("#file-editor-cancel").addEventListener("click", () => fileEditorDialog.close());
+fileEditorDialog.addEventListener("close", () => { fileEditorState = null; });
+fileEditorContent.addEventListener("input", () => {
+  fileEditorSave.disabled = !fileEditorState || fileEditorState.hash !== fileEditorState.expected
+    || fileEditorContent.value === fileEditorState.initial;
+});
+fileEditorForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!fileEditorState || fileEditorSave.disabled) return;
+  const { sessionId, callId, hash } = fileEditorState;
+  fileEditorSave.disabled = true;
+  fileEditorFeedback.textContent = "";
+  try {
+    if (await applyFileAction(sessionId, callId, {
+      action: "save", expected_hash: hash, content: fileEditorContent.value,
+    })) fileEditorDialog.close();
+  } catch (error) {
+    fileEditorFeedback.textContent = error.message || "Could not save file.";
+  } finally { if (fileEditorState) fileEditorSave.disabled = false; }
+});
 document.querySelector("#confirm-cancel").addEventListener("click", () => confirmDialog.close());
 confirmForm.addEventListener("submit", async event => {
   event.preventDefault();
@@ -3632,7 +3856,13 @@ addServerDialog.addEventListener("close", () => {
     addServerButton.focus();
   }
 });
-aiConfigDialog.addEventListener("close", () => { closeModelPicker(false); aiConfigButton.focus(); });
+aiConfigDialog.addEventListener("close", () => {
+  closeModelPicker(false);
+  themePicker.open = false;
+  const target = settingsReturnFocus?.isConnected ? settingsReturnFocus : aiConfigButton;
+  settingsReturnFocus = null;
+  target.focus({ preventScroll: true });
+});
 document.addEventListener("click", event => {
   if (!conversationMenu.contains(event.target)) conversationMenu.open = false;
   if (!runnerPicker.contains(event.target)) runnerPicker.open = false;
@@ -3645,6 +3875,12 @@ document.addEventListener("keydown", event => {
   if (event.key === "Escape" && activeModelMenu) {
     event.preventDefault();
     closeModelPicker(true);
+    return;
+  }
+  if (event.key === "Escape" && aiConfigDialog.open && themePicker.open) {
+    event.preventDefault();
+    themePicker.open = false;
+    themePickerSummary.focus({ preventScroll: true });
     return;
   }
   if (event.key === "Escape") {

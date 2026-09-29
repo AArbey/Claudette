@@ -53,44 +53,57 @@ async function noOverflow(page) {
     await openChat(page, fixture, 'main');
     await waitText(page, '#ai-model-value', 'test-model');
     await page.getByRole('button', { name: 'Configure AI' }).click();
-    await waitText(page, '#ai-server-list', 'Configured AI');
+    await waitText(page, '#ai-server-list', 'Main model');
     await page.waitForFunction(() => !aiConfigBusy);
-    const chatPicker = page.getByRole('button', { name: 'Choose model on Configured AI' });
+    assert.equal(await page.locator('#ai-server-form').count(), 1);
+    assert.equal(await page.locator('#ai-server-add, #ai-server-name').count(), 0);
+    await page.locator('#ai-server-save').click();
+    await waitText(page, '#ai-config-feedback', 'Server saved');
+    const chatPicker = page.getByRole('button', { name: 'Choose main model on Configured AI' });
     assert.equal(await chatPicker.locator('.model-picker-value').innerText(), 'test-model');
     await chatPicker.press('Enter');
-    await page.getByRole('listbox', { name: 'Model options on Configured AI' }).waitFor();
+    await page.getByRole('listbox', { name: 'Main model options on Configured AI' }).waitFor();
     await page.waitForFunction(() => document.activeElement?.classList.contains('model-picker-option'));
-    assert.equal(await page.getByRole('listbox', { name: 'Model options on Configured AI' }).getByRole('option', { name: 'test-model' }).evaluate(node => node === document.activeElement), true);
+    assert.equal(await page.getByRole('listbox', { name: 'Main model options on Configured AI' }).getByRole('option', { name: 'test-model' }).evaluate(node => node === document.activeElement), true);
     await page.keyboard.press('ArrowDown');
-    assert.equal(await page.getByRole('listbox', { name: 'Model options on Configured AI' }).getByRole('option', { name: 'alternate-model' }).evaluate(node => node === document.activeElement), true);
+    assert.equal(await page.getByRole('listbox', { name: 'Main model options on Configured AI' }).getByRole('option', { name: 'alternate-model' }).evaluate(node => node === document.activeElement), true);
     await page.keyboard.press('Enter');
     await waitText(page, '#ai-model-value', 'alternate-model');
     await waitText(page, '#ai-config-feedback', 'Model updated');
-    await page.getByText('Advanced', { exact: true }).click();
     const supportPicker = page.getByRole('button', { name: 'Choose support model on Configured AI' });
-    assert.equal(await supportPicker.locator('.model-picker-value').innerText(), 'test-model');
-    await page.getByRole('button', { name: 'Choose support model on Configured AI' }).click();
+    assert.equal(await supportPicker.locator('.model-picker-value').innerText(), 'Not configured');
+    await supportPicker.click();
     await page.getByRole('listbox', { name: 'Support model options on Configured AI' })
-      .getByRole('option', { name: 'alternate-model' }).click();
+      .getByRole('option', { name: 'Same as main' }).click();
     await waitText(page, '#ai-config-feedback', 'Support model updated');
-    const waitForMain = page.getByRole('checkbox', { name: 'Wait for main LLM completion on Configured AI' });
+    assert.equal(await page.getByRole('button', { name: 'Choose support model on Configured AI' }).locator('.model-picker-value').innerText(), 'Same as main');
+    const waitForMain = page.getByRole('checkbox', { name: 'Wait for main LLM completion' });
     assert.equal(await waitForMain.isChecked(), false);
     await waitForMain.check();
     await waitText(page, '#ai-config-feedback', 'Title timing updated');
-    assert.equal(await page.getByRole('checkbox', { name: 'Wait for main LLM completion on Configured AI' }).isChecked(), true);
+    assert.equal(await page.getByRole('checkbox', { name: 'Wait for main LLM completion' }).isChecked(), true);
+    const researchPicker = page.getByRole('button', { name: 'Choose web research model on Configured AI' });
+    assert.equal(await researchPicker.locator('.model-picker-value').innerText(), 'Same as main');
+    await researchPicker.click();
+    await page.getByRole('listbox', { name: 'Web research model options on Configured AI' })
+      .getByRole('option', { name: 'alternate-model' }).click();
+    await waitText(page, '#ai-config-feedback', 'Web research model updated');
+    assert.equal(await page.getByRole('button', { name: 'Choose web research model on Configured AI' }).locator('.model-picker-value').innerText(), 'alternate-model');
     await noOverflow(page);
-    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('button', { name: 'Close settings' }).click();
 
     // Web settings, saved research card, live modal, and mobile layout.
     await page.getByRole('button', { name: 'Configure AI' }).click();
+    await page.getByRole('tab', { name: 'Web research' }).click();
     await page.locator('#searxng-url').fill('http://search.example:8888');
     await page.locator('#searxng-results').fill('12');
-    const researchChoice = await page.evaluate(() => JSON.stringify([aiServers[0].server_id, 'alternate-model']));
-    await page.locator('#research-model').selectOption(researchChoice);
-    await page.evaluate(() => renderAIConfig()); // Dashboard refresh must preserve unsaved choice.
-    assert.equal(await page.locator('#research-model').inputValue(), researchChoice);
     await page.locator('#web-tools-save').click();
     await waitText(page, '#web-tools-feedback', 'saved');
+    await page.getByRole('tab', { name: 'LLM & models' }).click();
+    await page.getByRole('button', { name: 'Choose web research model on Configured AI' }).click();
+    await page.getByRole('listbox', { name: 'Web research model options on Configured AI' })
+      .getByRole('option', { name: 'Same as main' }).click();
+    await waitText(page, '#ai-config-feedback', 'Web research model updated');
     await page.locator('#ai-config-close').click();
     await page.locator('#conversation-filter').selectOption('all');
     await openChat(page, fixture, 'research');
@@ -104,12 +117,38 @@ async function noOverflow(page) {
     await waitText(page, '.research-full-chat', 'Read release notes');
     assert.equal(await page.locator('.research-sources a').getAttribute('rel'), 'noopener noreferrer');
     await noOverflow(page);
+    await page.screenshot({ path: path.join(artifacts, 'research-desktop.png') });
+    await page.locator('#research-dialog-close').click();
+    await page.locator('#research-progress').click();
+    await page.locator('#research-dialog[open]').waitFor();
     await page.locator('#research-dialog-close').click();
     await openChat(page, fixture, 'research_live');
     await page.locator('#research-dialog[open]').waitFor();
     await page.locator('#research-stop').waitFor();
     await page.locator('#research-dialog-close').click();
     assert.equal(await page.locator('#research-dialog[open]').count(), 0);
+    await page.locator('#research-progress').click();
+    await page.locator('#research-dialog[open]').waitFor();
+    await page.locator('#research-dialog-close').click();
+    await openChat(page, fixture, 'research_pending');
+    assert.equal(await page.locator('#research-progress:visible').count(), 0);
+    await page.evaluate(() => fetch('/fixture/research-start'));
+    await page.locator('#research-dialog[open]').waitFor();
+    await page.locator('#research-dialog-close').click();
+    await page.evaluate(() => fetch('/fixture/research-update'));
+    await waitText(page, '#research-progress-meta', '3 steps');
+    assert.equal(await page.locator('#research-dialog[open]').count(), 0);
+    await page.locator('#research-progress').click();
+    await waitText(page, '#research-dialog', 'change log');
+    await page.locator('.research-full-chat summary').click();
+    const scroll = await page.locator('#research-dialog').evaluate(dialog => {
+      const body = dialog.querySelector('.research-dialog-body');
+      return { outer: dialog.scrollHeight > dialog.clientHeight + 1,
+        inner: body.scrollHeight > body.clientHeight + 1 };
+    });
+    assert.equal(scroll.outer, false, 'research dialog has second scrollbar');
+    assert.equal(scroll.inner, true, 'research content should scroll');
+    await page.locator('#research-dialog-close').click();
     const researchMobile = await context.newPage();
     await researchMobile.setViewportSize({ width: 390, height: 844 });
     await researchMobile.goto(fixture.base);
@@ -119,6 +158,9 @@ async function noOverflow(page) {
     await researchMobile.locator('.web-tool-card summary').click();
     await researchMobile.getByRole('button', { name: 'Open research chat' }).click();
     await noOverflow(researchMobile);
+    const mobileDialog = await researchMobile.locator('#research-dialog').boundingBox();
+    assert.ok(Math.abs(mobileDialog.x) < 1 && Math.abs(mobileDialog.width - 390) < 1, 'research dialog fills mobile viewport');
+    await researchMobile.screenshot({ path: path.join(artifacts, 'research-mobile.png') });
     await researchMobile.close();
     console.log('Web research settings and popup desktop/mobile passed');
     await page.locator('#conversation-filter').selectOption('current');
@@ -141,7 +183,8 @@ async function noOverflow(page) {
     await mobilePage.setViewportSize({ width: 390, height: 844 });
     await openChat(mobilePage, fixture, 'main');
     await mobilePage.getByRole('button', { name: 'Configure AI' }).click();
-    await waitText(mobilePage, '#ai-server-list', 'Configured AI');
+    await waitText(mobilePage, '#ai-server-list', 'Main model');
+    assert.equal(await mobilePage.locator('#ai-config-dialog').evaluate(node => Math.round(node.getBoundingClientRect().width)), 390);
     await noOverflow(mobilePage);
     await mobilePage.close();
     console.log('AI configuration desktop/mobile passed');
@@ -245,10 +288,11 @@ async function noOverflow(page) {
     await page.waitForFunction(() => currentDetail?.active);
     assert.equal(await page.locator('#message-input').isEnabled(), true);
     await page.locator('#message-stop').waitFor();
-    assert.deepEqual(
-      await page.locator('#message-stop').evaluate(button => [getComputedStyle(button).width, getComputedStyle(button).height]),
-      ['46px', '46px'],
-    );
+    const stopSize = await page.locator('#message-stop').evaluate(button => {
+      const style = getComputedStyle(button);
+      return [parseFloat(style.width), parseFloat(style.height)];
+    });
+    assert.ok(stopSize.every(size => size >= 44), 'stop control remains easy to tap');
     await page.locator('#message-input').fill('Next question');
     await page.locator('#message-stop').click();
     await page.waitForFunction(() => !currentDetail?.active && !sessionState().messageBusy);
@@ -261,10 +305,12 @@ async function noOverflow(page) {
     assert.equal(await page.locator('#message-input').inputValue(), 'Next question');
     assert.equal(await page.locator('.response-activity').first().getAttribute('open'), null);
     await page.locator('.response-activity summary').first().click();
-    await page.getByRole('button', { name: 'Answers only' }).click();
+    await page.locator('#conversation-menu summary').click();
+    await page.getByRole('button', { name: 'Show answers only' }).click();
     assert.equal(await page.locator('.response-activity').first().isVisible(), false);
-    assert.equal(await page.getByRole('button', { name: 'Answers only' }).getAttribute('aria-pressed'), 'true');
-    await page.getByRole('button', { name: 'Answers only' }).click();
+    await page.locator('#conversation-menu summary').click();
+    assert.equal(await page.getByRole('button', { name: 'Show answers only' }).getAttribute('aria-pressed'), 'true');
+    await page.getByRole('button', { name: 'Show answers only' }).click();
     await page.locator('#transcript').evaluate(node => { node.scrollTop = 0; });
     await page.locator('#jump-latest').waitFor();
     await page.evaluate(() => { conversationStream.close(); conversationStream.onerror(); });
@@ -313,7 +359,7 @@ async function noOverflow(page) {
 
     await page.goto(`${fixture.base}/#servers/127.0.0.1`);
     await page.locator('#server-name').waitFor();
-    await waitText(page, '.runner-version', 'v2 · Latest');
+    await waitText(page, '.runner-version', 'v3 · Latest');
     await page.locator('#server-name').fill('Production renamed');
     await page.getByRole('button', { name: 'Save name', exact: true }).click();
     await waitText(page, '#conversation-title', 'Production renamed');
@@ -379,6 +425,43 @@ async function noOverflow(page) {
     assert.equal(await page.locator('#runner-picker').getAttribute('open'), null);
     console.log('New conversation, target errors/retry, target changes passed');
 
+    await openChat(page, fixture, 'files');
+    const fileCard = page.locator('.file-edit-list .file-edit-card');
+    await fileCard.waitFor();
+    assert.equal(await fileCard.locator('.file-diff .add').count() > 0, true);
+    await fileCard.getByRole('button', { name: 'Edit file' }).click();
+    await page.locator('#file-editor-dialog[open]').waitFor();
+    assert.equal(await page.locator('#file-editor-content').inputValue(), 'value = 2\n');
+    await page.locator('#file-editor-content').fill('value = 3\n');
+    await page.locator('#file-editor-save').click();
+    await page.locator('#file-editor-dialog').waitFor({ state: 'hidden' });
+    await waitText(page, '.file-edit-card', 'Edited by you');
+    assert.equal(await fileCard.locator('.file-diff').innerText().then(text => text.includes('+value = 3')), true);
+    await fileCard.getByRole('button', { name: 'Restore original' }).click();
+    await page.locator('#confirm-submit').click();
+    await page.locator('#confirm-dialog').waitFor({ state: 'hidden' });
+    await waitText(page, '.file-edit-card', 'Restored');
+    assert.equal(await fileCard.getByRole('button', { name: 'Restore original' }).isDisabled(), true);
+    await openChat(page, fixture, 'created_file');
+    const createdCard = page.locator('.file-edit-list .file-edit-card');
+    assert.equal(await createdCard.getByRole('button', { name: 'Restore original' }).count(), 0);
+    await createdCard.getByRole('button', { name: 'Delete file' }).click();
+    assert.equal(await page.locator('#confirm-title').textContent(), 'Delete file?');
+    await page.locator('#confirm-submit').click();
+    await page.locator('#confirm-dialog').waitFor({ state: 'hidden' });
+    await waitText(page, '.file-edit-card', 'Deleted');
+    assert.equal(await createdCard.getByRole('button', { name: 'Delete file' }).isDisabled(), true);
+    await openChat(page, fixture, 'files');
+    for (const width of [320, 390]) {
+      await page.setViewportSize({ width, height: 844 });
+      await noOverflow(page);
+      await fileCard.getByRole('button', { name: 'Edit file' }).click();
+      await page.locator('#file-editor-dialog[open]').waitFor();
+      await noOverflow(page);
+      await page.locator('#file-editor-cancel').click();
+    }
+    console.log('File diff, inline edit, restore, mobile layout passed');
+
     // Visual and keyboard acceptance matrix.
     for (const width of [320, 390, 768, 1440]) {
       await page.setViewportSize({ width, height: width < 600 ? 844 : 1000 });
@@ -401,21 +484,43 @@ async function noOverflow(page) {
         await page.screenshot({ path: path.join(artifacts, `servers-${width}-${theme}.png`), animations: 'disabled' });
       }
       if (width < 900) {
+        assert.equal(await page.locator('#header-new-conversation').getAttribute('aria-label'), 'Add server');
+        await page.locator('#header-new-conversation').click();
+        await page.locator('#add-server-dialog[open]').waitFor();
+        await page.locator('#add-server-close').click();
         await page.evaluate(() => setTheme('light'));
         await page.locator('#menu-button').click();
         assert.equal(await page.locator('.main').evaluate(node => node.inert), true);
+        await page.locator('#settings-button').click();
+        if (width <= 390) {
+          const settingsTabs = await page.locator('.settings-tab').evaluateAll(nodes => nodes.map(node => {
+            const bounds = node.getBoundingClientRect();
+            return { label: node.textContent.trim(), left: bounds.left, right: bounds.right,
+              top: bounds.top, bottom: bounds.bottom, contentWidth: node.scrollWidth, width: node.clientWidth };
+          }));
+          assert.equal(settingsTabs.length, 4);
+          for (const tab of settingsTabs) {
+            assert.ok(tab.left >= -1 && tab.right <= width + 1
+              && tab.top >= -1 && tab.bottom <= 844, tab.label + ' clipped by viewport');
+            assert.ok(tab.contentWidth <= tab.width + 1, tab.label + ' text clipped');
+          }
+        }
+        await page.getByRole('tab', { name: 'Appearance' }).click();
         await page.locator('#theme-picker-summary').click();
         await noOverflow(page);
-        await page.screenshot({ path: path.join(artifacts, `appearance-${width}.png`), animations: 'disabled' });
+        await page.screenshot({ path: path.join(artifacts, 'appearance-' + width + '.png'), animations: 'disabled' });
         await page.keyboard.press('Escape');
         assert.equal(await page.locator('#theme-picker').getAttribute('open'), null);
-        assert.equal(await page.locator('.main').evaluate(node => node.inert), true);
+        assert.equal(await page.locator('#ai-config-dialog').getAttribute('open'), '');
         await page.locator('#theme-picker-summary').click();
         await page.locator('#theme-menu [data-theme="dark"]').click();
         assert.equal(await page.evaluate(() => localStorage.getItem('brain.theme')), 'dark');
         assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).colorScheme), 'dark');
         assert.equal(await page.locator('#theme-picker').getAttribute('open'), null);
-        await page.locator('#theme-picker-summary').focus();
+        await page.locator('#ai-config-close').click();
+        assert.equal(await page.locator('#menu-button').evaluate(node => node === document.activeElement), true);
+        await page.locator('#menu-button').click();
+        await page.locator('#settings-button').focus();
         await page.keyboard.press('Tab');
         assert.equal(await page.locator('#conversations-view').evaluate(node => node === document.activeElement), true);
         await page.keyboard.press('Escape');

@@ -6,6 +6,7 @@ import tempfile
 import time
 
 from test_brain import brain, config, tool_call
+from test_file_tool import file_tool
 
 
 class PreviewLLM:
@@ -89,6 +90,58 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
         service.store.save(session["session_id"], messages, status, pending, 0)
         service.store.set_metadata(session["session_id"], {"title": title, "pinned": key == "main"})
         if key == "archived": service.store.set_archived(session["session_id"], True)
+    # Real file helper backs simulated runner actions for diff/editor browser checks.
+    file_state = Path(directory) / "file-state"
+    file_path = Path(directory) / "sample.py"
+    file_path.write_text("value = 1\n", encoding="utf-8")
+    file_session = service.store.create(runner_id)
+    sessions["files"] = file_session["session_id"]
+    file_call = {"id": "file_call", "type": "function", "function": {
+        "name": "edit_file", "arguments": json.dumps({"path": str(file_path), "operation": "replace",
+            "old_text": "value = 1", "new_text": "value = 2", "reason": "Update sample"})}}
+    file_result = file_tool.perform(file_state, {"action": "apply",
+        "request_id": brain.file_request_id(file_session["session_id"], file_call["id"]),
+        "cwd": str(Path(directory)), "path": str(file_path), "operation": "replace",
+        "old_text": "value = 1", "new_text": "value = 2", "reason": "Update sample"})
+    file_edit = {**file_result["edit"], "runner_id": runner_id}
+    file_messages = file_session["messages"] + [
+        {"role": "user", "content": "Update sample"},
+        {"role": "assistant", "content": None, "tool_calls": [file_call]},
+        {"role": "tool", "tool_call_id": file_call["id"],
+         "content": brain.file_edit_summary(file_edit),
+         "ui": {"file_edit": file_edit, "approval": {"decision": "automatic", "prefix": []}}},
+        {"role": "assistant", "content": "Updated sample.py."},
+    ]
+    service.store.save(file_session["session_id"], file_messages, "ready", [], 0)
+    service.store.set_metadata(file_session["session_id"], {"title": "File edit review"})
+    created_path = Path(directory) / "created.py"
+    created_session = service.store.create(runner_id)
+    sessions["created_file"] = created_session["session_id"]
+    created_call = {"id": "created_call", "type": "function", "function": {
+        "name": "edit_file", "arguments": json.dumps({"path": str(created_path), "operation": "create",
+            "old_text": "", "new_text": "print('created')\n", "reason": "Create sample"})}}
+    created_result = file_tool.perform(file_state, {"action": "apply",
+        "request_id": brain.file_request_id(created_session["session_id"], created_call["id"]),
+        "cwd": str(Path(directory)), "path": str(created_path), "operation": "create",
+        "old_text": "", "new_text": "print('created')\n", "reason": "Create sample"})
+    created_edit = {**created_result["edit"], "runner_id": runner_id}
+    created_messages = created_session["messages"] + [
+        {"role": "user", "content": "Create sample"},
+        {"role": "assistant", "content": None, "tool_calls": [created_call]},
+        {"role": "tool", "tool_call_id": created_call["id"],
+         "content": brain.file_edit_summary(created_edit),
+         "ui": {"file_edit": created_edit, "approval": {"decision": "automatic", "prefix": []}}},
+        {"role": "assistant", "content": "Created created.py."},
+    ]
+    service.store.save(created_session["session_id"], created_messages, "ready", [], 0)
+    service.store.set_metadata(created_session["session_id"], {"title": "Created file review"})
+    def runner_file_request(_runner_id, payload):
+        try:
+            return file_tool.perform(file_state, payload)
+        except file_tool.FileError as error:
+            raise brain.FileToolError(str(error), error.status) from error
+    service.runner_file_request = runner_file_request
+
     research_session = service.store.create()
     sessions["research"] = research_session["session_id"]
     research_call = {"id": "research_call", "type": "function", "function": {
@@ -119,7 +172,36 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
     service.live_turns.start(live_research["session_id"], [])
     service.live_turns.append(live_research["session_id"], "research",
         {"call_id": "live_research_call", **{**research_trace, "status": "running"}})
+    pending_research = service.store.create()
+    sessions["research_pending"] = pending_research["session_id"]
+    service.store.save(pending_research["session_id"], pending_research["messages"] + [
+        {"role": "user", "content": "Investigate updates"}], "continuation_pending", [], 0)
+    service.store.set_metadata(pending_research["session_id"], {"title": "Pending research example"})
+    service.store.set_archived(pending_research["session_id"], True)
+    service.live_turns.start(pending_research["session_id"], [])
+
+    class FixtureHandler(brain.BrainHandler):
+        def do_GET(self):
+            if self.path == "/fixture/research-start":
+                service.live_turns.append(pending_research["session_id"], "research",
+                    {"call_id": "pending_research_call", **{**research_trace, "status": "running"}})
+                self.send_json(brain.HTTPStatus.OK, {"ok": True})
+                return
+            if self.path == "/fixture/research-update":
+                updated = {**research_trace, "status": "running",
+                    "steps": [*research_trace["steps"],
+                        {"kind": "search_searxng", "target": "change log", "status": "running"}],
+                    "messages": [*research_trace["messages"], *[
+                        {"role": "tool", "name": "load_web_page", "content": "Page extract " * 80}
+                        for _ in range(12)]]}
+                service.live_turns.append(pending_research["session_id"], "research",
+                    {"call_id": "pending_research_call", **updated})
+                self.send_json(brain.HTTPStatus.OK, {"ok": True})
+                return
+            super().do_GET()
+
     server = brain.BrainHTTPServer(("127.0.0.1", 0), service, web=True)
+    server.RequestHandlerClass = FixtureHandler
     print(json.dumps({"base": f"http://127.0.0.1:{server.server_port}", "sessions": sessions}), flush=True)
     try:
         server.serve_forever()

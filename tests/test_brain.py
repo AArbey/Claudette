@@ -514,8 +514,68 @@ class LLMStreamTests(unittest.TestCase):
     def test_empty_completion_after_tool_is_normal_finish(self):
         with tempfile.TemporaryDirectory() as directory:
             client = brain.LLMClient(config(Path(directory)))
-            lines = [
+            empty = ['data: {"choices":[{"delta":{}}]}\n', "data: [DONE]\n"]
+            messages = [
+                {"role": "user", "content": "check"},
+                {"role": "assistant", "content": None, "tool_calls": [tool_call()]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "exit_code=0"},
+            ]
+            with patch.object(brain, "urlopen", return_value=FakeHTTPResponse(empty)):
+                assistant, calls = client.complete(messages, lambda *_: None)
+            self.assertIsNone(assistant["content"])
+            self.assertEqual(calls, [])
+
+            reasoning = [
                 'data: {"choices":[{"delta":{"reasoning_content":"done"}}]}\n',
+                "data: [DONE]\n",
+            ]
+            with patch.object(
+                brain, "urlopen", return_value=FakeHTTPResponse(reasoning)
+            ), self.assertRaisesRegex(brain.BrainError, "neither content"):
+                client.complete(messages, lambda *_: None)
+
+    def test_qwen_retries_reasoning_only_completion_without_thinking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(brain.replace(
+                config(Path(directory)), model_name="qwen3.8-9b"))
+            client._context_tokens = 32768
+            messages = [
+                {"role": "user", "content": "check"},
+                {"role": "assistant", "content": None, "tool_calls": [tool_call()]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "exit_code=0"},
+            ]
+            reasoning = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"reasoning_content":"checking"},"finish_reason":null}]}\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n',
+                "data: [DONE]\n",
+            ])
+            answer = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"content":"Check passed."}}]}\n',
+                "data: [DONE]\n",
+            ])
+            events = []
+            with patch.object(brain, "urlopen", side_effect=[reasoning, answer]) as upstream:
+                assistant, calls = client.complete(messages,
+                    lambda name, data: events.append((name, data)))
+            self.assertEqual(assistant["content"], "Check passed.")
+            self.assertEqual(calls, [])
+            first = json.loads(upstream.call_args_list[0].args[0].data)
+            second = json.loads(upstream.call_args_list[1].args[0].data)
+            self.assertNotIn("chat_template_kwargs", first)
+            self.assertEqual(second["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertEqual(second["reasoning_effort"], "none")
+            self.assertEqual(events, [
+                ("reasoning", {"delta": "checking"}),
+                ("content", {"delta": "Check passed."}),
+            ])
+
+    def test_qwen_failed_retry_does_not_silently_finish_after_tool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(brain.replace(
+                config(Path(directory)), model_name="qwen3.8-9b"))
+            client._context_tokens = 32768
+            reasoning = [
+                'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n',
                 "data: [DONE]\n",
             ]
             messages = [
@@ -523,19 +583,15 @@ class LLMStreamTests(unittest.TestCase):
                 {"role": "assistant", "content": None, "tool_calls": [tool_call()]},
                 {"role": "tool", "tool_call_id": "call_1", "content": "exit_code=0"},
             ]
-            with patch.object(
-                brain, "urlopen", return_value=FakeHTTPResponse(lines)
-            ):
-                assistant, calls = client.complete(messages, lambda *_: None)
-            self.assertIsNone(assistant["content"])
-            self.assertEqual(calls, [])
-
-            with patch.object(
-                brain, "urlopen", return_value=FakeHTTPResponse(lines)
-            ), self.assertRaisesRegex(brain.BrainError, "neither content"):
-                client.complete(
-                    [{"role": "user", "content": "check"}], lambda *_: None
-                )
+            whitespace = [
+                'data: {"choices":[{"delta":{"content":"  "}}]}\n',
+                "data: [DONE]\n",
+            ]
+            with patch.object(brain, "urlopen", side_effect=[
+                FakeHTTPResponse(reasoning), FakeHTTPResponse(whitespace),
+            ]) as upstream, self.assertRaisesRegex(brain.BrainError, "neither content"):
+                client.complete(messages, lambda *_: None)
+            self.assertEqual(upstream.call_count, 2)
 
 
 class StoreAndServiceTests(unittest.TestCase):
@@ -580,6 +636,35 @@ class StoreAndServiceTests(unittest.TestCase):
                 service.store.active_ai_model()["support_wait_for_main"]
             )
             self.assertNotEqual(first["server_id"], second["server_id"])
+
+    def test_same_as_main_follows_main_model_for_titles_and_research(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            server = service.store.save_ai_server(
+                None, "Local", "http://llm.test/v1/chat/completions", "",
+                ["first", "second"],
+            )
+            server_id = server["server_id"]
+            service.store.select_ai_support_model(server_id, "")
+            service.store.select_ai_model(server_id, "second")
+            service.store.refresh_ai_models(server_id, ["first", "second"])
+            service.store.save_ai_server(
+                server_id, "Local", "http://llm.test/v1/chat/completions", None,
+                ["first", "second"],
+            )
+            self.assertEqual(service.store.active_ai_model()["support_model"], "")
+            with patch.object(brain.LLMClient, "complete", return_value=(
+                {"role": "assistant", "content": "Done"}, [],
+            )) as completion:
+                service.llm.complete_support([{"role": "user", "content": "Title"}], lambda *_: None)
+            self.assertEqual(completion.call_args.kwargs["model_name"], "second")
+            settings = service.store.save_web_tools_config({
+                "searxng_url": "", "default_results": 8,
+                "research_server_id": None, "research_model": None,
+            })
+            self.assertEqual(settings["effective_research_model"], "second")
+            service.store.select_ai_model(server_id, "first")
+            self.assertEqual(service.store.get_web_tools_config()["effective_research_model"], "first")
 
     def test_schema_8_adds_ai_servers(self):
         with closing(sqlite3.connect(":memory:")) as connection, connection:
@@ -1526,7 +1611,7 @@ class StoreAndServiceTests(unittest.TestCase):
             self.assertEqual(loaded["messages"][-1]["role"], "tool")
             self.assertEqual(events[-1], ("done", {}))
 
-    def test_reasoning_only_completion_after_command_saves_thinking(self):
+    def test_reasoning_only_completion_after_command_stays_recoverable(self):
         with tempfile.TemporaryDirectory() as directory:
             service = brain.BrainService(config(Path(directory)), "system")
             call = tool_call()
@@ -1548,7 +1633,7 @@ class StoreAndServiceTests(unittest.TestCase):
             ]
             with patch.object(
                 brain, "urlopen", return_value=FakeHTTPResponse(lines)
-            ):
+            ), self.assertRaisesRegex(brain.BrainError, "neither content"):
                 service.run_turn(
                     session_id,
                     {
@@ -1565,7 +1650,7 @@ class StoreAndServiceTests(unittest.TestCase):
                 )
 
             loaded = service.store.get(session_id)
-            self.assertEqual(loaded["status"], "ready")
+            self.assertEqual(loaded["status"], "continuation_pending")
             self.assertEqual(
                 loaded["messages"][-1],
                 {
@@ -1574,6 +1659,45 @@ class StoreAndServiceTests(unittest.TestCase):
                     "ui": {"reasoning": "all done"},
                 },
             )
+
+    def test_qwen_retry_after_command_saves_final_answer_without_replaying_tool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(brain.replace(
+                config(Path(directory)), model_name="qwen3.8-9b"), "system")
+            service.llm.current_client()._context_tokens = 32768
+            call = tool_call()
+            session = service.store.create()
+            session_id = session["session_id"]
+            service.store.save(
+                session_id,
+                session["messages"] + [
+                    {"role": "user", "content": "run check"},
+                    {"role": "assistant", "content": None, "tool_calls": [call]},
+                ],
+                "awaiting_tool_results", [call], 1,
+            )
+            reasoning = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"reasoning_content":"checking result"}}]}\n',
+                "data: [DONE]\n",
+            ])
+            answer = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"content":"Check passed."}}]}\n',
+                "data: [DONE]\n",
+            ])
+            with patch.object(brain, "urlopen", side_effect=[reasoning, answer]) as upstream:
+                service.run_turn(session_id, {
+                    "type": "tool_results",
+                    "results": [{
+                        "tool_call_id": "call_1", "content": "exit_code=0\nok",
+                        "approval": {"decision": "allowed_once", "prefix": []},
+                    }],
+                }, lambda *_: None)
+            loaded = service.store.get(session_id)
+            self.assertEqual(loaded["status"], "ready")
+            self.assertEqual(loaded["messages"][-1]["content"], "Check passed.")
+            self.assertEqual(loaded["messages"][-1]["ui"]["reasoning"], "checking result")
+            self.assertEqual(sum(message["role"] == "tool" for message in loaded["messages"]), 1)
+            self.assertEqual(upstream.call_count, 2)
 
     def test_reasoning_only_response_can_recover_with_continuation_message(self):
         with tempfile.TemporaryDirectory() as directory:
