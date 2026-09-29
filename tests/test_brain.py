@@ -3,16 +3,19 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,9 +26,7 @@ sys.modules[SPEC.name] = brain
 SPEC.loader.exec_module(brain)
 
 
-def config(
-    root: Path, *, max_tool_rounds: int = 8, support_model_name: str = ""
-):
+def config(root: Path, *, max_tool_rounds: int = 8):
     return brain.Config(
         llm_endpoint_url="http://127.0.0.1:1/v1/chat/completions",
         llm_api_key="",
@@ -47,7 +48,6 @@ def config(
         client_max_tool_output_bytes=65536,
         client_brain_connect_timeout_seconds=10,
         client_brain_request_timeout_seconds=30,
-        support_model_name=support_model_name,
         runner_script_path=ROOT / "client" / "runner.sh",
         runner_installer_path=ROOT / "client" / "install-runner.sh",
     )
@@ -76,12 +76,15 @@ class FakeLLM:
         self.responses = list(responses)
         self.seen_messages = []
         self.seen_include_tools = []
+        self.seen_model_names = []
 
     def complete(
-        self, messages, emit, *, include_tools=True, model_name=None
+        self, messages, emit, *, include_tools=True, model_name=None,
+        cancellation=None,
     ):
         self.seen_messages.append(json.loads(json.dumps(messages)))
         self.seen_include_tools.append(include_tools)
+        self.seen_model_names.append(model_name)
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -96,16 +99,26 @@ class BlockingLLM:
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def complete(self, messages, emit, *, include_tools=True):
+    def complete(self, messages, emit, *, include_tools=True, cancellation=None):
         emit("reasoning", {"delta": "checking"})
         emit("content", {"delta": "answer"})
         self.started.set()
-        if not self.release.wait(timeout=2):
-            raise brain.BrainError("test release timed out")
+        deadline = time.monotonic() + 2
+        while not self.release.wait(timeout=.01):
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
+            if time.monotonic() >= deadline:
+                raise brain.BrainError("test release timed out")
         return {"role": "assistant", "content": "answer"}, []
 
 
 class PromptTests(unittest.TestCase):
+    def test_estimates_context_tokens(self):
+        self.assertEqual(
+            brain.estimate_message_tokens([{"role": "user", "content": "x" * 40}]),
+            13,
+        )
+
     def test_web_turn_keeps_attachment_references(self):
         references = [{"type": "attachment", "id": "a" * 32, "label": "notes.txt"}]
         result = brain.web_turn_body({"content": "Read it", "references": references})
@@ -203,8 +216,220 @@ class FakeHTTPResponse:
     def __iter__(self):
         return iter(self.lines)
 
+    def read(self, _limit=-1):
+        return b"".join(self.lines)
+
+
+class BlockingHTTPResponse:
+    status = 200
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.closed = threading.Event()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+        return False
+
+    def __iter__(self):
+        yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n'
+        self.started.set()
+        self.closed.wait(timeout=2)
+        raise AttributeError("'NoneType' object has no attribute 'peek'")
+
+    def close(self):
+        self.closed.set()
+
 
 class LLMStreamTests(unittest.TestCase):
+    def test_cancellation_closes_active_upstream_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            response = BlockingHTTPResponse()
+            cancellation = brain.TurnCancellation()
+            errors = []
+
+            def complete():
+                try:
+                    client.complete(
+                        [{"role": "user", "content": "test"}],
+                        lambda *_: None,
+                        cancellation=cancellation,
+                    )
+                except Exception as error:  # pragma: no cover - assertion aid
+                    errors.append(error)
+
+            with patch.object(brain, "urlopen", return_value=response):
+                thread = threading.Thread(target=complete)
+                thread.start()
+                self.assertTrue(response.started.wait(timeout=1))
+                cancellation.cancel()
+                thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(response.closed.is_set())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], brain.TurnCancelled)
+
+    def test_cancellation_does_not_wait_for_response_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            response = BlockingHTTPResponse()
+            cancellation = brain.TurnCancellation()
+            opening = threading.Event()
+            release = threading.Event()
+            errors = []
+
+            def delayed_open(*_args, **_kwargs):
+                opening.set()
+                release.wait(timeout=2)
+                return response
+
+            def complete():
+                try:
+                    client.complete(
+                        [{"role": "user", "content": "test"}],
+                        lambda *_: None,
+                        cancellation=cancellation,
+                    )
+                except Exception as error:  # pragma: no cover - assertion aid
+                    errors.append(error)
+
+            try:
+                with patch.object(brain, "urlopen", side_effect=delayed_open):
+                    thread = threading.Thread(target=complete)
+                    thread.start()
+                    self.assertTrue(opening.wait(timeout=1))
+                    cancellation.cancel()
+                    thread.join(timeout=1)
+                    self.assertFalse(thread.is_alive())
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsInstance(errors[0], brain.TurnCancelled)
+                    release.set()
+                    self.assertTrue(response.closed.wait(timeout=1))
+            finally:
+                release.set()
+
+    def test_discovers_models_from_base_url(self):
+        response = FakeHTTPResponse([
+            '{"data":[{"id":"model-b"},{"id":"model-a"},{"id":"model-b"}]}'
+        ])
+        with patch.object(brain, "urlopen", return_value=response) as upstream:
+            models = brain.discover_llm_models(
+                "http://llm.test:8080/v1", "secret", 30
+            )
+        self.assertEqual(models, ["model-b", "model-a"])
+        request = upstream.call_args.args[0]
+        self.assertEqual(request.full_url, "http://llm.test:8080/v1/models")
+        self.assertEqual(request.headers["Authorization"], "Bearer secret")
+
+    def test_reads_context_window_from_first_real_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            lines = [
+                'data: {"__verbose":{"generation_settings":{"n_ctx":131072}},'
+                '"choices":[{"delta":{"content":"ok"}}]}\n',
+                "data: [DONE]\n",
+            ]
+            with patch.object(
+                brain, "urlopen",
+                side_effect=[FakeHTTPResponse(lines), FakeHTTPResponse(lines)],
+            ) as upstream:
+                self.assertIsNone(client.context_window())
+                client.complete([{"role": "user", "content": "first"}], lambda *_: None)
+                client.complete([{"role": "user", "content": "second"}], lambda *_: None)
+            first_payload = json.loads(upstream.call_args_list[0].args[0].data)
+            second_payload = json.loads(upstream.call_args_list[1].args[0].data)
+            self.assertTrue(first_payload["verbose"])
+            self.assertNotIn("verbose", second_payload)
+            self.assertEqual(client.context_window(), 131072)
+
+    def test_reads_nested_context_and_accepts_usage_only_chunk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            lines = [
+                'data: {"generation_settings":{"n_ctx":65536},'
+                '"choices":[{"delta":{"content":"ok"}}]}\n',
+                'data: {"choices":[],"usage":{"total_tokens":12}}\n',
+                "data: [DONE]\n",
+            ]
+            with patch.object(brain, "urlopen", return_value=FakeHTTPResponse(lines)):
+                assistant, _calls = client.complete(
+                    [{"role": "user", "content": "first"}], lambda *_: None
+                )
+            self.assertEqual(assistant["content"], "ok")
+            self.assertEqual(client.context_window(), 65536)
+
+    def test_context_properties_fallback_starts_after_real_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changed = threading.Event()
+            client = brain.LLMClient(config(Path(directory)), changed.set)
+            completion = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+                "data: [DONE]\n",
+            ])
+            props = FakeHTTPResponse([
+                '{"default_generation_settings":{"n_ctx":32768}}'
+            ])
+            requests = []
+
+            def respond(request, **_kwargs):
+                requests.append(request)
+                return completion if request.data is not None else props
+
+            with patch.object(brain, "urlopen", side_effect=respond):
+                client.complete(
+                    [{"role": "user", "content": "first"}], lambda *_: None
+                )
+                deadline = time.monotonic() + 2
+                while client.context_window() is None and time.monotonic() < deadline:
+                    changed.wait(.05)
+                    changed.clear()
+            self.assertEqual(client.context_window(), 32768)
+            self.assertEqual(client.context_info()["discovery"], "ready")
+            self.assertEqual(requests[1].full_url, "http://127.0.0.1:1/props?model=test-model")
+
+    def test_context_properties_fallback_has_hard_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            changed = threading.Event()
+            client = brain.LLMClient(config(Path(directory)), changed.set)
+            completion = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"content":"ok"}}]}\n',
+                "data: [DONE]\n",
+            ])
+            release = threading.Event()
+
+            def respond(request, **_kwargs):
+                if request.data is not None:
+                    return completion
+                release.wait(.5)
+                return FakeHTTPResponse([
+                    '{"default_generation_settings":{"n_ctx":32768}}'
+                ])
+
+            try:
+                with (
+                    patch.object(brain, "urlopen", side_effect=respond),
+                    patch.object(client, "CONTEXT_LOOKUP_TIMEOUT_SECONDS", .02),
+                ):
+                    client.complete(
+                        [{"role": "user", "content": "first"}], lambda *_: None
+                    )
+                    deadline = time.monotonic() + 1
+                    while (
+                        client.context_info()["discovery"] == "loading"
+                        and time.monotonic() < deadline
+                    ):
+                        changed.wait(.02)
+                        changed.clear()
+                self.assertEqual(client.context_info()["discovery"], "unknown")
+                self.assertIsNone(client.context_window())
+                self.assertFalse(client._context_lookup_running)
+            finally:
+                release.set()
+
     def test_folds_target_notices_into_leading_system_message(self):
         with tempfile.TemporaryDirectory() as directory:
             client = brain.LLMClient(config(Path(directory)))
@@ -289,8 +514,68 @@ class LLMStreamTests(unittest.TestCase):
     def test_empty_completion_after_tool_is_normal_finish(self):
         with tempfile.TemporaryDirectory() as directory:
             client = brain.LLMClient(config(Path(directory)))
-            lines = [
+            empty = ['data: {"choices":[{"delta":{}}]}\n', "data: [DONE]\n"]
+            messages = [
+                {"role": "user", "content": "check"},
+                {"role": "assistant", "content": None, "tool_calls": [tool_call()]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "exit_code=0"},
+            ]
+            with patch.object(brain, "urlopen", return_value=FakeHTTPResponse(empty)):
+                assistant, calls = client.complete(messages, lambda *_: None)
+            self.assertIsNone(assistant["content"])
+            self.assertEqual(calls, [])
+
+            reasoning = [
                 'data: {"choices":[{"delta":{"reasoning_content":"done"}}]}\n',
+                "data: [DONE]\n",
+            ]
+            with patch.object(
+                brain, "urlopen", return_value=FakeHTTPResponse(reasoning)
+            ), self.assertRaisesRegex(brain.BrainError, "neither content"):
+                client.complete(messages, lambda *_: None)
+
+    def test_qwen_retries_reasoning_only_completion_without_thinking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(brain.replace(
+                config(Path(directory)), model_name="qwen3.8-9b"))
+            client._context_tokens = 32768
+            messages = [
+                {"role": "user", "content": "check"},
+                {"role": "assistant", "content": None, "tool_calls": [tool_call()]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "exit_code=0"},
+            ]
+            reasoning = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"reasoning_content":"checking"},"finish_reason":null}]}\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n',
+                "data: [DONE]\n",
+            ])
+            answer = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"content":"Check passed."}}]}\n',
+                "data: [DONE]\n",
+            ])
+            events = []
+            with patch.object(brain, "urlopen", side_effect=[reasoning, answer]) as upstream:
+                assistant, calls = client.complete(messages,
+                    lambda name, data: events.append((name, data)))
+            self.assertEqual(assistant["content"], "Check passed.")
+            self.assertEqual(calls, [])
+            first = json.loads(upstream.call_args_list[0].args[0].data)
+            second = json.loads(upstream.call_args_list[1].args[0].data)
+            self.assertNotIn("chat_template_kwargs", first)
+            self.assertEqual(second["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertEqual(second["reasoning_effort"], "none")
+            self.assertEqual(events, [
+                ("reasoning", {"delta": "checking"}),
+                ("content", {"delta": "Check passed."}),
+            ])
+
+    def test_qwen_failed_retry_does_not_silently_finish_after_tool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(brain.replace(
+                config(Path(directory)), model_name="qwen3.8-9b"))
+            client._context_tokens = 32768
+            reasoning = [
+                'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n',
                 "data: [DONE]\n",
             ]
             messages = [
@@ -298,22 +583,157 @@ class LLMStreamTests(unittest.TestCase):
                 {"role": "assistant", "content": None, "tool_calls": [tool_call()]},
                 {"role": "tool", "tool_call_id": "call_1", "content": "exit_code=0"},
             ]
-            with patch.object(
-                brain, "urlopen", return_value=FakeHTTPResponse(lines)
-            ):
-                assistant, calls = client.complete(messages, lambda *_: None)
-            self.assertIsNone(assistant["content"])
-            self.assertEqual(calls, [])
-
-            with patch.object(
-                brain, "urlopen", return_value=FakeHTTPResponse(lines)
-            ), self.assertRaisesRegex(brain.BrainError, "neither content"):
-                client.complete(
-                    [{"role": "user", "content": "check"}], lambda *_: None
-                )
+            whitespace = [
+                'data: {"choices":[{"delta":{"content":"  "}}]}\n',
+                "data: [DONE]\n",
+            ]
+            with patch.object(brain, "urlopen", side_effect=[
+                FakeHTTPResponse(reasoning), FakeHTTPResponse(whitespace),
+            ]) as upstream, self.assertRaisesRegex(brain.BrainError, "neither content"):
+                client.complete(messages, lambda *_: None)
+            self.assertEqual(upstream.call_count, 2)
 
 
 class StoreAndServiceTests(unittest.TestCase):
+    def test_ai_servers_are_persisted_and_global_selection_changes_client(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = brain.BrainService(
+                brain.replace(
+                    config(root), llm_endpoint_url="", llm_api_key="", model_name=""
+                ),
+                "system",
+            )
+            self.assertEqual(service.store.list_ai_servers(), [])
+            with self.assertRaisesRegex(brain.BrainError, "No AI model configured"):
+                service.llm.current_client()
+
+            first = service.store.save_ai_server(
+                None, "Local", "http://one.test/v1/chat/completions",
+                "top-secret", ["one", "two"],
+            )
+            second = service.store.save_ai_server(
+                None, "Remote", "https://two.test/v1/chat/completions",
+                "", ["three"],
+            )
+            public = service.store.list_ai_servers()
+            self.assertNotIn("api_key", public[0])
+            self.assertTrue(public[0]["has_api_key"])
+            self.assertEqual(first["support_model"], "one")
+            self.assertFalse(first["support_wait_for_main"])
+            self.assertEqual(service.llm.current_client().config.model_name, "one")
+
+            service.store.select_ai_support_model(second["server_id"], "three")
+            service.store.set_ai_support_wait(second["server_id"], True)
+            service.store.select_ai_model(second["server_id"], "three")
+            selected = service.llm.current_client().config
+            self.assertEqual(selected.model_name, "three")
+            self.assertEqual(selected.llm_endpoint_url, second["endpoint_url"])
+            self.assertEqual(
+                service.store.active_ai_model()["support_model"], "three"
+            )
+            self.assertTrue(
+                service.store.active_ai_model()["support_wait_for_main"]
+            )
+            self.assertNotEqual(first["server_id"], second["server_id"])
+
+    def test_same_as_main_follows_main_model_for_titles_and_research(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            server = service.store.save_ai_server(
+                None, "Local", "http://llm.test/v1/chat/completions", "",
+                ["first", "second"],
+            )
+            server_id = server["server_id"]
+            service.store.select_ai_support_model(server_id, "")
+            service.store.select_ai_model(server_id, "second")
+            service.store.refresh_ai_models(server_id, ["first", "second"])
+            service.store.save_ai_server(
+                server_id, "Local", "http://llm.test/v1/chat/completions", None,
+                ["first", "second"],
+            )
+            self.assertEqual(service.store.active_ai_model()["support_model"], "")
+            with patch.object(brain.LLMClient, "complete", return_value=(
+                {"role": "assistant", "content": "Done"}, [],
+            )) as completion:
+                service.llm.complete_support([{"role": "user", "content": "Title"}], lambda *_: None)
+            self.assertEqual(completion.call_args.kwargs["model_name"], "second")
+            settings = service.store.save_web_tools_config({
+                "searxng_url": "", "default_results": 8,
+                "research_server_id": None, "research_model": None,
+            })
+            self.assertEqual(settings["effective_research_model"], "second")
+            service.store.select_ai_model(server_id, "first")
+            self.assertEqual(service.store.get_web_tools_config()["effective_research_model"], "first")
+
+    def test_schema_8_adds_ai_servers(self):
+        with closing(sqlite3.connect(":memory:")) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                "CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO app_metadata VALUES ('schema_version', '8')"
+            )
+            brain.SessionStore.migrate_schema(connection)
+            self.assertIsNotNone(connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_servers'"
+            ).fetchone())
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+
+    def test_schema_9_adds_support_model(self):
+        with closing(sqlite3.connect(":memory:")) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            brain.SessionStore.create_schema(connection)
+            connection.execute(
+                "ALTER TABLE ai_servers DROP COLUMN support_wait_for_main"
+            )
+            connection.execute("ALTER TABLE ai_servers DROP COLUMN support_model")
+            connection.execute(
+                "INSERT INTO ai_servers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "server", "Local", "http://llm.test/v1/chat/completions", "",
+                    '["chat","small"]', "chat", 1, "now", "now",
+                ),
+            )
+            brain.SessionStore.set_schema_version(connection, 9)
+            brain.SessionStore.migrate_schema(connection)
+            row = connection.execute(
+                "SELECT support_model FROM ai_servers WHERE id = 'server'"
+            ).fetchone()
+            self.assertEqual(row["support_model"], "chat")
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+
+    def test_schema_10_adds_support_wait_setting(self):
+        with closing(sqlite3.connect(":memory:")) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            brain.SessionStore.create_schema(connection)
+            connection.execute(
+                "ALTER TABLE ai_servers DROP COLUMN support_wait_for_main"
+            )
+            brain.SessionStore.set_schema_version(connection, 10)
+            brain.SessionStore.migrate_schema(connection)
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(ai_servers)")
+            }
+            self.assertIn("support_wait_for_main", columns)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+
+    def test_environment_ignores_legacy_ai_configuration(self):
+        with patch.dict(os.environ, {
+            "BRAIN_URL": "http://brain.test:8080",
+            "LLM_ENDPOINT_URL": "http://legacy.test/v1/chat/completions",
+            "LLM_API_KEY": "secret",
+            "MODEL_NAME": "legacy-model",
+            "SUPPORT_MODEL_NAME": "legacy-support",
+        }, clear=True):
+            loaded = brain.Config.from_environment()
+        self.assertEqual(loaded.llm_endpoint_url, "")
+        self.assertEqual(loaded.llm_api_key, "")
+        self.assertEqual(loaded.model_name, "")
+        self.assertFalse(hasattr(loaded, "support_model_name"))
+
     def test_uploaded_file_content_is_sent_inline_not_as_host_path(self):
         with tempfile.TemporaryDirectory() as directory:
             service = brain.BrainService(config(Path(directory)), "system")
@@ -356,19 +776,19 @@ class StoreAndServiceTests(unittest.TestCase):
             self.assertEqual(loaded["cwd"], "/srv/project")
             self.assertEqual(
                 loaded["messages"][-1]["content"],
-                "The commands you run will run on the host host at IP 192.0.2.20.",
+                "The commands you run will run on the host host at IP 192.0.2.20. Durable memory is scoped to this runner; do not use memories from other runners.",
             )
             created = store.create(client_id)
             self.assertEqual(
                 created["messages"][-1]["content"],
-                "The commands you run will run on the host host at IP 192.0.2.20.",
+                "The commands you run will run on the host host at IP 192.0.2.20. Durable memory is scoped to this runner; do not use memories from other runners.",
             )
             bound = store.create()
             store.bind_client(bound["session_id"], client_id, "/srv/other")
             bound = store.get(bound["session_id"])
             self.assertEqual(
                 bound["messages"][-1]["content"],
-                "The commands you run will run on the host host at IP 192.0.2.20.",
+                "The commands you run will run on the host host at IP 192.0.2.20. Durable memory is scoped to this runner; do not use memories from other runners.",
             )
             with self.assertRaises(KeyError):
                 store.complete_runner_enrollment(
@@ -380,7 +800,7 @@ class StoreAndServiceTests(unittest.TestCase):
             self.assertIsNone(loaded["runner_id"])
             self.assertEqual(
                 loaded["messages"][-1]["content"],
-                "No runner is selected. You cannot run commands.",
+                "No runner is selected. You cannot run commands or use durable runner memory.",
             )
             self.assertTrue(loaded["messages"][-1]["ui"]["notice"])
 
@@ -761,7 +1181,7 @@ class StoreAndServiceTests(unittest.TestCase):
                 row["name"] for row in connection.execute("PRAGMA table_info(runners)")
             }
             self.assertIn("runner_version", columns)
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 6)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
 
     def test_message_branches_preserve_and_switch_responses(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -833,7 +1253,7 @@ class StoreAndServiceTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(session["active_branch_id"], branch["id"])
             self.assertEqual(branch["cwd"], "/srv")
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 6)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
 
     def test_summary_archive_and_newer_schema_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -934,16 +1354,24 @@ class StoreAndServiceTests(unittest.TestCase):
                 "cancelled",
             )
 
-    def test_title_uses_final_exchange_and_starts_after_done(self):
+    def test_title_uses_first_user_request_and_starts_after_main_request(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            service = brain.BrainService(
-                config(root, support_model_name="title-model"), "system"
+            service = brain.BrainService(config(root), "system")
+            server = service.store.save_ai_server(
+                None, "Local", "http://llm.test/v1/chat/completions", "",
+                ["chat-model", "title-model"],
             )
+            service.store.select_ai_model(server["server_id"], "chat-model")
+            service.store.select_ai_support_model(server["server_id"], "title-model")
             session_id = service.store.create()["session_id"]
             messages = [
                 {"role": "system", "content": "system"},
-                {"role": "user", "content": "inspect server"},
+                {
+                    "role": "user",
+                    "content": "inspect server\nprivate attachment text",
+                    "ui": {"display_content": "inspect server"},
+                },
                 {"role": "assistant", "content": None, "tool_calls": [tool_call()]},
                 {"role": "tool", "tool_call_id": "call_1", "content": "private output"},
                 {"role": "assistant", "content": "server looks healthy", "ui": {"reasoning": "private thinking"}},
@@ -959,9 +1387,11 @@ class StoreAndServiceTests(unittest.TestCase):
             )
             title_input = json.dumps(title_llm.seen_messages)
             self.assertIn("inspect server", title_input)
-            self.assertIn("server looks healthy", title_input)
+            self.assertNotIn("server looks healthy", title_input)
+            self.assertNotIn("private attachment text", title_input)
             self.assertNotIn("private output", title_input)
             self.assertNotIn("private thinking", title_input)
+            self.assertEqual(title_llm.seen_model_names, ["title-model"])
 
             invalid_id = service.store.create()["session_id"]
             service.store.save(invalid_id, messages, "ready", [], 0)
@@ -970,6 +1400,20 @@ class StoreAndServiceTests(unittest.TestCase):
             ])
             service.generate_conversation_title(invalid_id, messages)
             self.assertIsNone(service.store.get(invalid_id)["title"])
+            service.llm = FakeLLM([
+                ({"role": "assistant", "content": "Server Health Inspection"}, [])
+            ])
+            service.generate_conversation_title(
+                invalid_id,
+                messages + [
+                    {"role": "user", "content": "what next"},
+                    {"role": "assistant", "content": "apply updates"},
+                ],
+            )
+            self.assertEqual(
+                service.store.get(invalid_id)["title"], "Server Health Inspection"
+            )
+            self.assertNotIn("apply updates", json.dumps(service.llm.seen_messages))
 
             failed_id = service.store.create()["session_id"]
             service.store.save(failed_id, messages, "ready", [], 0)
@@ -977,18 +1421,97 @@ class StoreAndServiceTests(unittest.TestCase):
             service.generate_conversation_title(failed_id, messages)
             self.assertIsNone(service.store.get(failed_id)["title"])
 
-            order = []
+            class TimingLLM:
+                def __init__(self):
+                    self.title_started = threading.Event()
+                    self.seen_messages = []
+                    self.seen_model_names = []
+
+                def complete(
+                    self, current_messages, emit, *, include_tools=True,
+                    model_name=None, cancellation=None,
+                ):
+                    self.seen_messages.append(deepcopy(current_messages))
+                    self.seen_model_names.append(model_name)
+                    if model_name == "title-model":
+                        self.title_started.set()
+                        return {
+                            "role": "assistant",
+                            "content": "Maintenance Planning Request",
+                        }, []
+                    if self.title_started.is_set():
+                        raise AssertionError("title request started before main stream")
+                    emit("content", {"delta": "main answer"})
+                    if not self.title_started.wait(1):
+                        raise AssertionError("title request did not start during main stream")
+                    return {"role": "assistant", "content": "main answer"}, []
+
             fresh_id = service.store.create()["session_id"]
-            service.schedule_conversation_title = lambda *_: order.append("title")
-            service.finish_completion(
+            timing_llm = TimingLLM()
+            service.llm = timing_llm
+            service.run_turn(
                 fresh_id,
-                [{"role": "system", "content": "system"}, {"role": "user", "content": "hello"}],
-                {"role": "assistant", "content": "hello back"},
-                [],
-                0,
-                lambda event, _data: order.append(event),
+                {"type": "web_user", "content": "plan maintenance"},
+                lambda *_: None,
             )
-            self.assertEqual(order, ["done", "title"])
+            deadline = time.monotonic() + 1
+            while service.store.get(fresh_id)["title"] is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(
+                service.store.get(fresh_id)["title"], "Maintenance Planning Request"
+            )
+            self.assertEqual(timing_llm.seen_model_names, [None, "title-model"])
+            title_input = json.dumps(timing_llm.seen_messages[1])
+            self.assertIn("plan maintenance", title_input)
+            self.assertNotIn("main answer", title_input)
+
+            class WaitingTitleLLM:
+                def __init__(self):
+                    self.main_finished = threading.Event()
+                    self.title_started = threading.Event()
+                    self.seen_model_names = []
+
+                def complete(
+                    self, current_messages, emit, *, include_tools=True,
+                    model_name=None, cancellation=None,
+                ):
+                    self.seen_model_names.append(model_name)
+                    if model_name == "title-model":
+                        if not self.main_finished.is_set():
+                            raise AssertionError(
+                                "title request started before main completion"
+                            )
+                        self.title_started.set()
+                        return {
+                            "role": "assistant",
+                            "content": "Delayed Maintenance Request",
+                        }, []
+                    emit("content", {"delta": "main answer"})
+                    if self.title_started.is_set():
+                        raise AssertionError(
+                            "title request started during main stream"
+                        )
+                    self.main_finished.set()
+                    return {"role": "assistant", "content": "main answer"}, []
+
+            service.store.set_ai_support_wait(server["server_id"], True)
+            delayed_id = service.store.create()["session_id"]
+            waiting_llm = WaitingTitleLLM()
+            service.llm = waiting_llm
+            service.run_turn(
+                delayed_id,
+                {"type": "user", "content": "delay title generation"},
+                lambda *_: None,
+            )
+            self.assertTrue(waiting_llm.title_started.wait(1))
+            deadline = time.monotonic() + 1
+            while service.store.get(delayed_id)["title"] is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(
+                service.store.get(delayed_id)["title"],
+                "Delayed Maintenance Request",
+            )
+            self.assertEqual(waiting_llm.seen_model_names, [None, "title-model"])
 
     def test_lock_entries_do_not_accumulate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1088,7 +1611,7 @@ class StoreAndServiceTests(unittest.TestCase):
             self.assertEqual(loaded["messages"][-1]["role"], "tool")
             self.assertEqual(events[-1], ("done", {}))
 
-    def test_reasoning_only_completion_after_command_saves_thinking(self):
+    def test_reasoning_only_completion_after_command_stays_recoverable(self):
         with tempfile.TemporaryDirectory() as directory:
             service = brain.BrainService(config(Path(directory)), "system")
             call = tool_call()
@@ -1110,7 +1633,7 @@ class StoreAndServiceTests(unittest.TestCase):
             ]
             with patch.object(
                 brain, "urlopen", return_value=FakeHTTPResponse(lines)
-            ):
+            ), self.assertRaisesRegex(brain.BrainError, "neither content"):
                 service.run_turn(
                     session_id,
                     {
@@ -1127,7 +1650,7 @@ class StoreAndServiceTests(unittest.TestCase):
                 )
 
             loaded = service.store.get(session_id)
-            self.assertEqual(loaded["status"], "ready")
+            self.assertEqual(loaded["status"], "continuation_pending")
             self.assertEqual(
                 loaded["messages"][-1],
                 {
@@ -1136,6 +1659,45 @@ class StoreAndServiceTests(unittest.TestCase):
                     "ui": {"reasoning": "all done"},
                 },
             )
+
+    def test_qwen_retry_after_command_saves_final_answer_without_replaying_tool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(brain.replace(
+                config(Path(directory)), model_name="qwen3.8-9b"), "system")
+            service.llm.current_client()._context_tokens = 32768
+            call = tool_call()
+            session = service.store.create()
+            session_id = session["session_id"]
+            service.store.save(
+                session_id,
+                session["messages"] + [
+                    {"role": "user", "content": "run check"},
+                    {"role": "assistant", "content": None, "tool_calls": [call]},
+                ],
+                "awaiting_tool_results", [call], 1,
+            )
+            reasoning = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"reasoning_content":"checking result"}}]}\n',
+                "data: [DONE]\n",
+            ])
+            answer = FakeHTTPResponse([
+                'data: {"choices":[{"delta":{"content":"Check passed."}}]}\n',
+                "data: [DONE]\n",
+            ])
+            with patch.object(brain, "urlopen", side_effect=[reasoning, answer]) as upstream:
+                service.run_turn(session_id, {
+                    "type": "tool_results",
+                    "results": [{
+                        "tool_call_id": "call_1", "content": "exit_code=0\nok",
+                        "approval": {"decision": "allowed_once", "prefix": []},
+                    }],
+                }, lambda *_: None)
+            loaded = service.store.get(session_id)
+            self.assertEqual(loaded["status"], "ready")
+            self.assertEqual(loaded["messages"][-1]["content"], "Check passed.")
+            self.assertEqual(loaded["messages"][-1]["ui"]["reasoning"], "checking result")
+            self.assertEqual(sum(message["role"] == "tool" for message in loaded["messages"]), 1)
+            self.assertEqual(upstream.call_count, 2)
 
     def test_reasoning_only_response_can_recover_with_continuation_message(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1255,6 +1817,55 @@ class StoreAndServiceTests(unittest.TestCase):
                 reopened.get(session_id)["messages"][-1]["ui"]["reasoning"], "checking"
             )
 
+    def test_stopped_generation_saves_partial_answer_and_can_continue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            blocking_llm = BlockingLLM()
+            service.llm = blocking_llm
+            session_id = service.store.create()["session_id"]
+            events = []
+            errors = []
+
+            def run_turn():
+                try:
+                    service.run_turn(
+                        session_id,
+                        {"type": "web_user", "content": "long request"},
+                        lambda event, data: events.append((event, data)),
+                    )
+                except Exception as error:  # pragma: no cover - assertion aid
+                    errors.append(error)
+
+            thread = threading.Thread(target=run_turn)
+            thread.start()
+            self.assertTrue(blocking_llm.started.wait(timeout=1))
+            self.assertTrue(service.stop_generation(session_id))
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(events[-1], ("done", {"stopped": True}))
+            stopped = service.store.get(session_id)
+            self.assertEqual(stopped["status"], "ready")
+            self.assertEqual(stopped["messages"][-1]["content"], "answer")
+            self.assertEqual(
+                stopped["messages"][-1]["ui"],
+                {"stopped": True, "reasoning": "checking"},
+            )
+            self.assertFalse(service.stop_generation(session_id))
+
+            service.llm = FakeLLM([
+                ({"role": "assistant", "content": "continued answer"}, []),
+            ])
+            service.run_turn(
+                session_id,
+                {"type": "web_user", "content": "continue"},
+                lambda *_: None,
+            )
+            continued = service.store.get(session_id)
+            self.assertEqual(continued["status"], "ready")
+            self.assertEqual(continued["messages"][-1]["content"], "continued answer")
+
 class ClientTrustTests(unittest.TestCase):
     def test_first_runner_hostname_names_server_without_overwriting_user_name(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1342,6 +1953,160 @@ class ClientTrustTests(unittest.TestCase):
 
 
 class HTTPTests(unittest.TestCase):
+    def test_web_stop_endpoint_cancels_active_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            blocking_llm = BlockingLLM()
+            service.llm = blocking_llm
+            session_id = service.store.create()["session_id"]
+            server = brain.BrainHTTPServer(("127.0.0.1", 0), service, web=True)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            headers = {
+                "Content-Type": "application/json",
+                "X-Brain-UI": "1",
+                "Origin": base,
+            }
+            turn_events = []
+            turn_errors = []
+
+            def request_turn():
+                try:
+                    request = Request(
+                        f"{base}/v1/conversations/{session_id}/turns",
+                        data=b'{"content":"long request"}',
+                        headers=headers,
+                    )
+                    with urlopen(request) as response:
+                        turn_events.append(response.read().decode())
+                except Exception as error:  # pragma: no cover - assertion aid
+                    turn_errors.append(error)
+
+            turn_thread = threading.Thread(target=request_turn)
+            turn_thread.start()
+            try:
+                self.assertTrue(blocking_llm.started.wait(timeout=1))
+                stop = Request(
+                    f"{base}/v1/conversations/{session_id}/stop",
+                    data=b"{}",
+                    headers=headers,
+                )
+                with urlopen(stop) as response:
+                    self.assertEqual(response.status, 202)
+                    self.assertEqual(json.load(response), {"stopping": True})
+                turn_thread.join(timeout=2)
+                self.assertFalse(turn_thread.is_alive())
+                self.assertEqual(turn_errors, [])
+                self.assertIn('event: done\ndata: {"stopped":true}', turn_events[0])
+                self.assertEqual(service.store.get(session_id)["status"], "ready")
+            finally:
+                blocking_llm.release.set()
+                turn_thread.join(timeout=2)
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=2)
+
+    def test_web_ai_configuration_and_global_model_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(
+                brain.replace(
+                    config(Path(directory)),
+                    llm_endpoint_url="", llm_api_key="", model_name="",
+                ),
+                "system",
+            )
+            server = brain.BrainHTTPServer(("127.0.0.1", 0), service, web=True)
+            client_server = brain.BrainHTTPServer(("127.0.0.1", 0), service)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            client_thread = threading.Thread(
+                target=client_server.serve_forever, daemon=True
+            )
+            thread.start()
+            client_thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            client_base = f"http://127.0.0.1:{client_server.server_port}"
+            headers = {
+                "Content-Type": "application/json", "X-Brain-UI": "1",
+                "Origin": base,
+            }
+
+            def post(path, body):
+                request = Request(
+                    base + path, data=json.dumps(body).encode(), headers=headers,
+                    method="POST",
+                )
+                with urlopen(request) as response:
+                    return response.status, json.load(response)
+
+            try:
+                with urlopen(base + "/v1/ai/config") as response:
+                    self.assertEqual(json.load(response), {"servers": [], "active": None})
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(Request(
+                        client_base + "/v1/ai/selection", data=b"{}",
+                        headers={"Content-Type": "application/json"}, method="POST",
+                    ))
+                self.assertEqual(denied.exception.code, 404)
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(Request(
+                        client_base + "/v1/ai/support-selection", data=b"{}",
+                        headers={"Content-Type": "application/json"}, method="POST",
+                    ))
+                self.assertEqual(denied.exception.code, 404)
+                with self.assertRaises(HTTPError) as denied:
+                    urlopen(Request(
+                        client_base + "/v1/ai/support-settings", data=b"{}",
+                        headers={"Content-Type": "application/json"}, method="POST",
+                    ))
+                self.assertEqual(denied.exception.code, 404)
+                with patch.object(
+                    brain, "discover_llm_models", return_value=["small", "large"]
+                ):
+                    status, created = post("/v1/ai/servers", {
+                        "name": "Local llama.cpp",
+                        "endpoint_url": "http://llm.test:8080/v1",
+                        "api_key": "secret",
+                    })
+                    self.assertEqual(status, 201)
+                    self.assertNotIn("api_key", created["server"])
+                    self.assertTrue(created["server"]["active"])
+                    self.assertEqual(created["server"]["selected_model"], "small")
+                    self.assertEqual(created["server"]["support_model"], "small")
+                    self.assertFalse(
+                        created["server"]["support_wait_for_main"]
+                    )
+                    status, support = post("/v1/ai/support-selection", {
+                        "server_id": created["server"]["server_id"],
+                        "model": "large",
+                    })
+                    self.assertEqual(status, 200)
+                    self.assertEqual(support["server"]["selected_model"], "small")
+                    self.assertEqual(support["server"]["support_model"], "large")
+                    status, settings = post("/v1/ai/support-settings", {
+                        "server_id": created["server"]["server_id"],
+                        "wait_for_main": True,
+                    })
+                    self.assertEqual(status, 200)
+                    self.assertTrue(
+                        settings["server"]["support_wait_for_main"]
+                    )
+                    status, selected = post("/v1/ai/selection", {
+                        "server_id": created["server"]["server_id"],
+                        "model": "large",
+                    })
+                    self.assertEqual(status, 200)
+                    self.assertEqual(selected["server"]["selected_model"], "large")
+                    self.assertEqual(selected["server"]["support_model"], "large")
+                self.assertEqual(service.llm.current_client().config.model_name, "large")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                client_server.shutdown()
+                client_server.server_close()
+                client_thread.join(timeout=2)
+
     def test_conversation_metadata_validation_and_access(self):
         with tempfile.TemporaryDirectory() as directory:
             service = brain.BrainService(config(Path(directory)), "system")
