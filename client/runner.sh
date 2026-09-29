@@ -5,8 +5,8 @@ set -Eeuo pipefail
 readonly MAX_HEADER_BYTES=16384
 readonly MAX_BODY_BYTES=2097152
 readonly READ_TIMEOUT_SECONDS=10
-readonly RUNNER_PROTOCOL_VERSION=1
-readonly RUNNER_VERSION=3
+readonly RUNNER_PROTOCOL_VERSION=2
+readonly RUNNER_VERSION=4
 
 respond_json() {
     local status="$1" reason="$2" payload="$3" length
@@ -71,17 +71,21 @@ authenticate() {
 }
 
 validate_execute_request() {
-    jq -e --arg runner "$RUNNER_ID" '
+    jq -e --arg brain_url "$BRAIN_URL" '
         type == "object" and
-        (keys == ["approval", "command", "cwd", "max_output_bytes", "request_id",
-                  "session_id", "timeout_seconds"]) and
+        (keys == ["approval", "brain_url", "command", "cwd", "job_id",
+                  "job_token", "max_output_bytes", "max_runtime_seconds",
+                  "request_id", "session_id"]) and
         (.request_id | type == "string" and test("^[A-Za-z0-9_-]{32,128}$")) and
+        (.job_id == .request_id) and
+        (.job_token | type == "string" and test("^[A-Za-z0-9_-]{40,128}$")) and
+        (.brain_url == $brain_url) and
         (.session_id | type == "string" and test("^[A-Za-z0-9_-]{32}$")) and
         (.cwd | type == "string" and startswith("/") and
             (explode | index(0) == null) and
             ((contains("\n") or contains("\r")) | not)) and
-        (.timeout_seconds | type == "number" and floor == . and . >= 1 and . <= 3600) and
-        (.max_output_bytes | type == "number" and floor == . and . >= 1 and . <= 1048576) and
+        (.max_runtime_seconds | type == "number" and floor == . and . >= 1) and
+        (.max_output_bytes | type == "number" and floor == . and . >= 1 and . <= 65536) and
         (.command | type == "object" and
             (keys == ["arguments", "program", "reason", "trust_prefix"]) and
             (.program | type == "string" and length >= 1 and
@@ -109,31 +113,49 @@ validate_execute_request() {
 }
 
 unknown_result() {
-    local request_id="$1" cwd="$2" destination="$3" temporary
-    temporary="${destination}.tmp.$$"
+    local request_id="$1" cwd="$2" result_file="$3" temporary
+    temporary="${result_file}.tmp.$$"
     jq -cn --arg request_id "$request_id" --arg cwd "$cwd" '
-        {request_id: $request_id, status: "outcome_unknown", exit_code: 125,
-         output: "Previous execution stopped before result was saved.", cwd: $cwd,
-         truncated: false}
+        {request_id:$request_id,job_id:$request_id,status:"outcome_unknown",
+         exit_code:125,output:"Worker result unavailable; command not rerun.",
+         cwd:$cwd,truncated:false}
     ' >"$temporary"
     chmod 600 "$temporary"
-    mv -f -- "$temporary" "$destination"
+    mv -f -- "$temporary" "$result_file"
 }
 
 execute_request() {
-    local request_id session_id cwd program timeout_seconds output_limit
-    local request_dir result_file temporary output_file byte_count exit_code=0
-    local new_cwd truncated=false capture_limit
-    local -a arguments=() pipeline_status=()
-
+    local request_id session_id cwd job_id request_dir result_file inspect worker_pid
     validate_execute_request || fail_json 400 BadRequest "invalid execute request"
     request_id=$(jq -r '.request_id' "$BODY_FILE")
+    job_id=$(jq -r '.job_id' "$BODY_FILE")
     session_id=$(jq -r '.session_id' "$BODY_FILE")
     cwd=$(jq -r '.cwd' "$BODY_FILE")
     request_dir="$RUNNER_STATE_DIR/requests/$request_id"
     result_file="$request_dir/result.json"
     if ! mkdir "$request_dir" 2>/dev/null; then
-        if [[ ! -f "$result_file" ]]; then
+        if [[ -f "$result_file" ]]; then
+            respond_json 200 OK "$(<"$result_file")"
+            return
+        fi
+        for _ in {1..100}; do
+            inspect=$(python3 "$RUNNER_COMMAND_WORKER" inspect --state-dir "$request_dir") || \
+                fail_json 500 Internal "could not inspect existing command"
+            if [[ "$(jq -r '.status' <<<"$inspect")" != outcome_unknown ]]; then
+                break
+            fi
+            sleep 0.05
+        done
+        if jq -e '.status == "running"' <<<"$inspect" >/dev/null; then
+            respond_json 202 Accepted "$(jq -cn --arg job_id "$job_id" '{job_id:$job_id,status:"running"}')"
+            return
+        fi
+        if jq -e '.status == "completed" or .status == "stopped" or .status == "timed_out"' <<<"$inspect" >/dev/null; then
+            jq -cn --arg request_id "$request_id" --arg job_id "$job_id" \
+                --argjson snapshot "$inspect" \
+                '$snapshot + {request_id:$request_id,job_id:$job_id}' >"$result_file"
+            chmod 600 "$result_file"
+        else
             unknown_result "$request_id" "$cwd" "$result_file"
         fi
         respond_json 200 OK "$(<"$result_file")"
@@ -142,63 +164,31 @@ execute_request() {
     chmod 700 "$request_dir"
     cp -- "$BODY_FILE" "$request_dir/request.json"
     chmod 600 "$request_dir/request.json"
-    trap 'if [[ -n "${result_file:-}" && ! -f "$result_file" ]]; then unknown_result "$request_id" "$cwd" "$result_file"; fi' EXIT
-
-    program=$(jq -r '.command.program' "$BODY_FILE")
-    mapfile -t arguments < <(jq -r '.command.arguments[]' "$BODY_FILE")
-    timeout_seconds=$(jq -r '.timeout_seconds' "$BODY_FILE")
-    output_limit=$(jq -r '.max_output_bytes' "$BODY_FILE")
-    new_cwd="$cwd"
-    output_file="$request_dir/output"
-    : >"$output_file"
-
-    if [[ "$program" == cd ]]; then
-        if (( ${#arguments[@]} != 1 )); then
-            exit_code=1
-            printf '%s' 'cd requires exactly one path argument' >"$output_file"
-        elif new_cwd=$(cd -- "$cwd" 2>/dev/null && cd -- "${arguments[0]}" 2>/dev/null && pwd -P); then
-            printf '%s' "$new_cwd" >"$output_file"
-        else
-            exit_code=1
-            printf '%s' 'cd failed: target is not an accessible directory' >"$output_file"
-        fi
-    elif ! cd -- "$cwd" 2>/dev/null; then
-        exit_code=1
-        printf '%s' 'working directory is not accessible' >"$output_file"
+    python3 "$RUNNER_COMMAND_WORKER" run --request "$request_dir/request.json" \
+        --state-dir "$request_dir" >/dev/null 2>&1 &
+    worker_pid=$!
+    printf '%s\n' "$worker_pid" >"$request_dir/worker.pid"
+    chmod 600 "$request_dir/worker.pid"
+    # Keep systemd one-shot service alive while worker owns command process group.
+    for _ in {1..100}; do
+        [[ -f "$request_dir/status.json" ]] && break
+        kill -0 "$worker_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    if [[ -f "$request_dir/status.json" ]]; then
+        respond_json 202 Accepted "$(jq -cn --arg job_id "$job_id" '{job_id:$job_id,status:"running"}')"
     else
-        capture_limit=$((output_limit + 1))
-        set +e
-        (
-            timeout --signal=TERM --kill-after=1s "${timeout_seconds}s" \
-                env -i "PATH=$RUNNER_PATH" "HOME=$RUNNER_HOME" "PWD=$PWD" \
-                "USER=$RUNNER_USER" "LOGNAME=$RUNNER_USER" "LANG=C.UTF-8" "TERM=dumb" \
-                "$program" "${arguments[@]}" 2>&1
-        ) | {
-            head -c "$capture_limit" >"$output_file"
-            cat >/dev/null
-        }
-        pipeline_status=("${PIPESTATUS[@]}")
-        set -e
-        exit_code=${pipeline_status[0]}
+        unknown_result "$request_id" "$cwd" "$result_file"
+        respond_json 200 OK "$(<"$result_file")"
     fi
-
-    byte_count=$(wc -c <"$output_file")
-    if (( byte_count > output_limit )); then
-        head -c "$output_limit" "$output_file" >"${output_file}.trimmed"
-        mv -f -- "${output_file}.trimmed" "$output_file"
-        truncated=true
+    wait "$worker_pid" || true
+    if [[ -f "$request_dir/status.json" ]]; then
+        jq --arg request_id "$request_id" --arg job_id "$job_id" \
+            '. + {request_id:$request_id,job_id:$job_id,status:.state}' \
+            "$request_dir/status.json" >"$request_dir/result.tmp"
+        chmod 600 "$request_dir/result.tmp"
+        mv -f -- "$request_dir/result.tmp" "$result_file"
     fi
-    temporary="${result_file}.tmp.$$"
-    jq -n --arg request_id "$request_id" --arg status completed \
-        --argjson exit_code "$exit_code" --rawfile output "$output_file" \
-        --arg cwd "$new_cwd" --argjson truncated "$truncated" '
-        {request_id: $request_id, status: $status, exit_code: $exit_code,
-         output: $output, cwd: $cwd, truncated: $truncated}
-    ' >"$temporary"
-    chmod 600 "$temporary"
-    mv -f -- "$temporary" "$result_file"
-    trap - EXIT
-    respond_json 200 OK "$(<"$result_file")"
 }
 
 execute_file_request() {

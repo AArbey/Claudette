@@ -4,6 +4,11 @@ set -Eeuo pipefail
 
 TOOL_RESULT=''
 TOOL_FILE_EDIT=''
+TOOL_JOB_ID=''
+TOOL_JOB_CWD=''
+COMMAND_WORKER_FILE=''
+COMMAND_JOB_STATE_DIR=''
+COMMAND_WORKER_PIDS=()
 TOOL_APPROVAL='{"decision":"invalid","prefix":[]}'
 COMMAND_PERMISSION_ACTION=''
 PENDING_USER_INSTRUCTION=''
@@ -142,6 +147,184 @@ add_trusted_prefix() {
 
 # Local command execution
 
+cleanup_command_workers() {
+    local pid
+    for pid in "${COMMAND_WORKER_PIDS[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in "${COMMAND_WORKER_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    [[ -z "$COMMAND_WORKER_FILE" ]] || rm -f -- "$COMMAND_WORKER_FILE"
+}
+
+ensure_command_worker() {
+    [[ -n "$COMMAND_WORKER_FILE" && -f "$COMMAND_WORKER_FILE" ]] && return 0
+    mkdir -p -- "$COMMAND_JOB_STATE_DIR"
+    chmod 700 "$COMMAND_JOB_STATE_DIR"
+    COMMAND_WORKER_FILE=$(mktemp "$COMMAND_JOB_STATE_DIR/worker.XXXXXXXX.py")
+    if ! curl --fail --silent --show-error --connect-timeout "$BRAIN_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$BRAIN_REQUEST_TIMEOUT_SECONDS" "$BRAIN_URL/command-worker.py" \
+        -o "$COMMAND_WORKER_FILE" || \
+        [[ "$(head -n 1 "$COMMAND_WORKER_FILE")" != '#!/usr/bin/env python3' ]]; then
+        rm -f -- "$COMMAND_WORKER_FILE"
+        COMMAND_WORKER_FILE=''
+        return 1
+    fi
+    chmod 600 "$COMMAND_WORKER_FILE"
+}
+
+command_job_result() {
+    local job="$1" state background
+    TOOL_JOB_ID=$(jq -r '.job_id' <<<"$job")
+    TOOL_JOB_CWD=$(jq -r '.cwd' <<<"$job")
+    TOOL_APPROVAL=$(jq -c '.approval' <<<"$job")
+    state=$(jq -r '.state' <<<"$job")
+    background=$(jq -r '.background' <<<"$job")
+    if [[ "$state" == completed || "$state" == stopped || "$state" == timed_out ]]; then
+        TOOL_RESULT=$(jq -r '"exit_code=\(.exit_code)\n\(.output)"' <<<"$job")
+        print_status "Command job $TOOL_JOB_ID: $state"
+    elif [[ "$state" == outcome_unknown || "$state" == unreachable ]]; then
+        TOOL_RESULT=$(jq -r '"Command outcome unknown or worker unreachable; job_id=\(.job_id). Current output:\n\(.output)"' <<<"$job")
+        print_status "Command job $TOOL_JOB_ID: $state"
+    else
+        TOOL_RESULT=$(jq -r '"Command still running; job_id=\(.job_id). Current output snapshot:\n\(.output)"' <<<"$job")
+        if [[ "$background" == true ]]; then
+            print_status "Command job $TOOL_JOB_ID continues in background."
+        fi
+    fi
+}
+
+wait_terminal_command_job() {
+    local job_id="$1" job state background
+    while true; do
+        if ! brain_request GET "/v1/sessions/$SESSION_ID/command-jobs/$job_id" || \
+            [[ "$BRAIN_HTTP_STATUS" != 200 ]]; then
+            TOOL_RESULT="Command job $job_id status unavailable; command not rerun."
+            TOOL_JOB_ID="$job_id"
+            return
+        fi
+        job=$(jq -c '.job' <<<"$BRAIN_RESPONSE") || return 1
+        state=$(jq -r '.state' <<<"$job")
+        background=$(jq -r '.background' <<<"$job")
+        if [[ "$state" == completed || "$state" == stopped || "$state" == timed_out || \
+              "$state" == outcome_unknown || "$state" == unreachable || "$background" == true ]]; then
+            command_job_result "$job"
+            return
+        fi
+        sleep 0.5
+    done
+}
+
+start_terminal_command_job() {
+    local call_id="$1" command="$2" approval="$3" job_id job_token
+    local job_dir request_file registration response worker_pid
+    if ! ensure_command_worker; then
+        TOOL_RESULT="Tool error: command worker unavailable. Command not run."
+        return
+    fi
+    job_id=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
+    job_token=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
+    job_dir="$COMMAND_JOB_STATE_DIR/$job_id"
+    mkdir -m 700 -- "$job_dir" || {
+        TOOL_RESULT="Tool error: could not create command job state."
+        return
+    }
+    request_file="$job_dir/request.json"
+    jq -cn --arg job_id "$job_id" --arg job_token "$job_token" \
+        --arg brain_url "$BRAIN_URL" --arg cwd "$PWD" \
+        --argjson command "$command" \
+        --argjson max_output_bytes "$MAX_TOOL_OUTPUT_BYTES" \
+        --arg parent_pid "$$" \
+        --arg path "$PATH" --arg home "$HOME" --arg user "${USER:-}" \
+        --arg logname "${LOGNAME:-}" --arg lang "${LANG:-C.UTF-8}" \
+        --arg term "${TERM:-dumb}" \
+        '{job_id:$job_id,job_token:$job_token,brain_url:$brain_url,
+          cwd:$cwd,command:$command,max_output_bytes:$max_output_bytes,
+          max_runtime_seconds:3600,parent_pid:($parent_pid|tonumber),
+          environment:{PATH:$path,HOME:$home,PWD:$cwd,USER:$user,
+                       LOGNAME:$logname,LANG:$lang,TERM:$term}}' \
+        >"$request_file"
+    chmod 600 "$request_file"
+    registration=$(jq -cn --arg client_id "$CLIENT_ID" --arg tool_call_id "$call_id" \
+        --arg job_id "$job_id" --arg job_token "$job_token" --arg cwd "$PWD" \
+        --argjson approval "$approval" \
+        '{client_id:$client_id,tool_call_id:$tool_call_id,job_id:$job_id,
+          job_token:$job_token,cwd:$cwd,approval:$approval}')
+    if ! brain_request POST "/v1/sessions/$SESSION_ID/command-jobs" "$registration" || \
+        [[ "$BRAIN_HTTP_STATUS" != 202 ]]; then
+        TOOL_RESULT="Tool error: could not register command job. Command not run."
+        return
+    fi
+    response=$(jq -c '.job' <<<"$BRAIN_RESPONSE") || {
+        TOOL_RESULT="Tool error: invalid command job registration."
+        return
+    }
+    if [[ "$(jq -r '.job_id' <<<"$response")" != "$job_id" ]]; then
+        TOOL_RESULT="Tool error: command job registration ID mismatch."
+        return
+    fi
+    jq --argjson lease "$(jq -r '.max_runtime_seconds' <<<"$response")" \
+        '.max_runtime_seconds = $lease' "$request_file" >"$job_dir/request.tmp"
+    chmod 600 "$job_dir/request.tmp"
+    mv -f -- "$job_dir/request.tmp" "$request_file"
+    python3 "$COMMAND_WORKER_FILE" run --request "$request_file" \
+        --state-dir "$job_dir" --client-mode >/dev/null 2>&1 &
+    worker_pid=$!
+    COMMAND_WORKER_PIDS+=("$worker_pid")
+    TOOL_JOB_ID="$job_id"
+    wait_terminal_command_job "$job_id"
+}
+
+show_command_jobs() {
+    if ! brain_request GET "/v1/sessions/$SESSION_ID/command-jobs" || \
+        [[ "$BRAIN_HTTP_STATUS" != 200 ]]; then
+        print_error "Could not read command jobs."
+        return 1
+    fi
+    jq -r '.jobs[] | "\(.job_id)  \(.state)  \(if .background then "background" else "foreground" end)  \(.command.program)"' \
+        <<<"$BRAIN_RESPONSE"
+}
+
+show_command_job() {
+    local job_id="$1"
+    if ! brain_request GET "/v1/sessions/$SESSION_ID/command-jobs/$job_id" || \
+        [[ "$BRAIN_HTTP_STATUS" != 200 ]]; then
+        print_error "Command job not found."
+        return 1
+    fi
+    jq -r '.job | "Job \(.job_id): \(.state)\nDecision: \(.decision_reason)\nOutput:\n\(.output)"' \
+        <<<"$BRAIN_RESPONSE"
+}
+
+stop_terminal_command_job() {
+    local job_id="$1" request_file job_token result_file http_status
+    request_file="$COMMAND_JOB_STATE_DIR/$job_id/request.json"
+    if [[ ! -f "$request_file" ]]; then
+        print_error "Local token for command job $job_id unavailable."
+        return 1
+    fi
+    job_token=$(jq -r '.job_token' "$request_file")
+    result_file=$(mktemp)
+    http_status=$(curl --silent --show-error --request POST \
+        --connect-timeout "$BRAIN_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$BRAIN_REQUEST_TIMEOUT_SECONDS" \
+        --header "Authorization: Bearer $job_token" \
+        --header 'Content-Type: application/json' --data '{}' \
+        --output "$result_file" --write-out '%{http_code}' \
+        "$BRAIN_URL/v1/sessions/$SESSION_ID/command-jobs/$job_id/stop") || {
+            rm -f -- "$result_file"
+            print_error "Could not request command stop."
+            return 1
+        }
+    rm -f -- "$result_file"
+    if [[ "$http_status" != 202 ]]; then
+        print_error "Command stop rejected (HTTP $http_status)."
+        return 1
+    fi
+    print_status "Stop requested for command job $job_id."
+}
+
 capture_command() {
     local output_file exit_code=0 byte_count captured_output capture_limit
     local -a pipeline_status=()
@@ -213,7 +396,15 @@ request_command_permission() {
 }
 
 execute_approved_command() {
-    local arguments_json="$1" program reason printable_reason
+    local arguments_json="$1" call_id="${2:-}" existing_job_id="${3:-}"
+    local program reason printable_reason
+    if [[ -n "$existing_job_id" ]]; then
+        wait_terminal_command_job "$existing_job_id"
+        if [[ "$(jq -r '.program' <<<"$arguments_json")" == cd && "$TOOL_RESULT" == exit_code=0* ]]; then
+            cd -- "$TOOL_JOB_CWD"
+        fi
+        return
+    fi
     local printable_command printable_trust_prefix printable_matched_prefix
     local command_json trust_prefix_json matched_prefix_json execution_mode
     local -a arguments=()
@@ -282,18 +473,10 @@ execute_approved_command() {
 
     printf '%sTool: %s%s%s %s%s\n' "$COLOR_STATUS" "$COLOR_COMMAND" \
         "$printable_command" "$COLOR_STATUS" "$execution_mode" "$COLOR_RESET"
-    if [[ "$program" == "cd" ]]; then
-        if cd -- "${arguments[0]}" 2>/dev/null; then
-            printf -v TOOL_RESULT 'exit_code=0\n%s' "$PWD"
-        else
-            TOOL_RESULT=$'exit_code=1\ncd failed: target is not an accessible directory'
-        fi
-        return
+    start_terminal_command_job "$call_id" "$arguments_json" "$TOOL_APPROVAL"
+    if [[ "$program" == cd && "$TOOL_RESULT" == exit_code=0* ]]; then
+        cd -- "$TOOL_JOB_CWD"
     fi
-    capture_command env -i \
-        "PATH=$PATH" "HOME=$HOME" "PWD=$PWD" "USER=${USER:-}" \
-        "LOGNAME=${LOGNAME:-}" "LANG=${LANG:-C.UTF-8}" "TERM=${TERM:-dumb}" \
-        "$program" "${arguments[@]}"
 }
 
 execute_file_edit() {
@@ -333,6 +516,7 @@ execute_tool_call() {
     local call="$1" name arguments_text arguments_json
     TOOL_APPROVAL='{"decision":"invalid","prefix":[]}'
     TOOL_FILE_EDIT=''
+    TOOL_JOB_ID=''
     name=$(jq -r '.function.name // empty' <<<"$call")
     printf '%sAI requested function: %q%s\n' "$COLOR_STATUS" "${name:-unknown}" "$COLOR_RESET"
     arguments_text=$(jq -r '.function.arguments // "{}"' <<<"$call")
@@ -342,7 +526,7 @@ execute_tool_call() {
         return
     fi
     case "$name" in
-        run_command) execute_approved_command "$arguments_json" ;;
+        run_command) execute_approved_command "$arguments_json" "$(jq -r '.id' <<<"$call")" "$(jq -r '.ui.command_job_id // empty' <<<"$call")" ;;
         edit_file) execute_file_edit "$arguments_json" "$(jq -r '.id' <<<"$call")" ;;
         *) printf -v TOOL_RESULT 'Tool error: unknown tool %q.' "$name" ;;
     esac
@@ -622,6 +806,12 @@ stream_turn() {
                 fi
                 printf '%s' "$delta"
                 ;;
+            reset)
+                [[ "$reasoning_started" == true || "$response_started" == true ]] && printf '%s\n' "$COLOR_RESET"
+                print_status "Command finished. Refreshing answer."
+                reasoning_started=false
+                response_started=false
+                ;;
             tool_calls)
                 if ! PENDING_TOOL_CALLS=$(jq -ce '
                     .tool_calls |
@@ -705,6 +895,7 @@ submit_tool_results() {
         id=$(jq -r '.id' <<<"$call")
         TOOL_RESULT=''
         TOOL_FILE_EDIT=''
+        TOOL_JOB_ID=''
         if [[ -n "$PENDING_USER_INSTRUCTION" ]]; then
             TOOL_RESULT="Tool call cancelled because user provided new instructions."
             TOOL_APPROVAL='{"decision":"cancelled","prefix":[]}'
@@ -714,8 +905,10 @@ submit_tool_results() {
         results=$(jq -cn --slurpfile current <(printf '%s' "$results") --arg id "$id" \
             --arg content "$TOOL_RESULT" --argjson approval "$TOOL_APPROVAL" \
             --slurpfile file_edit <(printf '%s' "${TOOL_FILE_EDIT:-null}") \
+            --arg job_id "$TOOL_JOB_ID" \
             '$current[0] + [{tool_call_id: $id, content: $content, approval: $approval}
-              + (if $file_edit[0] == null then {} else {file_edit: $file_edit[0]} end)]')
+              + (if $file_edit[0] == null then {} else {file_edit: $file_edit[0]} end)
+              + (if $job_id == "" then {} else {job_id: $job_id} end)]')
     done
     if [[ -n "$PENDING_USER_INSTRUCTION" ]]; then
         payload=$(jq -cn --slurpfile results <(printf '%s' "$results") \
@@ -768,6 +961,8 @@ initialize_configuration() {
         print_error "BRAIN_URL must be a valid HTTP(S) URL."
         return 1
     fi
+    COMMAND_JOB_STATE_DIR="${HOME}/.local/state/ai-helper/command-jobs"
+    trap cleanup_command_workers EXIT
     SESSION_FILE="${HOME}/.local/state/ai-helper/session-id"
     CLIENT_ID_FILE="${HOME}/.local/state/ai-helper/client-id"
     for variable_name in COMMAND_TIMEOUT_SECONDS MAX_TOOL_OUTPUT_BYTES \
@@ -809,6 +1004,9 @@ run_conversation() {
                 continue
                 ;;
             /new) new_session; continue ;;
+            /jobs) show_command_jobs; continue ;;
+            /job\ *) show_command_job "${input#/job }"; continue ;;
+            /stop-job\ *) stop_terminal_command_job "${input#/stop-job }"; continue ;;
         esac
         [[ -z "$input" ]] && continue
         [[ -n "$input" ]] && history -s -- "$input"

@@ -267,8 +267,8 @@ refuses to overwrite a file changed elsewhere.
 Web edits use selected runner. Terminal edits run on terminal host. Web review
 of a terminal edit works from conversation history; Web editing and restore
 require installing runner for that same user and host. Backups live under
-`~/.local/state/ai-helper/file-edits`. Update existing runners to version 3
-through **Install / repair** before Web file editing.
+`~/.local/state/ai-helper/file-edits`. Update existing runners to version 4
+through **Install / repair** before Web commands.
 
 Runner accepts only authenticated HTTP/1.1 from configured Brain source IP.
 Protocol requires `Content-Length` and `Connection: close`; chunking, malformed
@@ -282,9 +282,11 @@ Brain host to connect directly to selected server port. Set
 `RUNNER_TRUSTED_SOURCE_IP` when Brain URL host differs from source IP observed by
 runners.
 
-Each command uses deterministic request ID. Runner caches completed result.
-Repeated request returns cached result. Interrupted request returns
-`outcome_unknown` and never executes again automatically.
+Each approved command gets a durable random job ID. Runner starts tracked worker,
+returns HTTP 202, and stays alive until worker exits. Repeated starts use same ID
+and never run command twice. Brain keeps live output and status in SQLite; lost
+contact shows `unreachable` until worker reconnects. If runner cannot determine
+outcome, it reports `outcome_unknown` and does not rerun command.
 
 ## Configure clients
 
@@ -336,6 +338,8 @@ Resume previous session [R] / new [n]?
 Press Enter to resume. Use `/new` during conversation to preserve current
 session in Brain history and create another. `exit` preserves current session.
 Terminal input keeps every line from multiline clipboard pastes in one message.
+Use `/jobs` to list jobs, `/job ID` for current output, and `/stop-job ID` to
+request stop. Terminal background jobs stop when terminal client exits.
 
 Brain records accepted user input and command results before contacting LLM.
 If network, client stream, or LLM fails, use `/resume` to retry continuation
@@ -373,10 +377,15 @@ Stored prefix `docker ps` permits `docker ps --format ...`; it does not permit
 `docker psx` or `docker run`. Longest exact argv-token prefix wins.
 
 Approved commands receive a small clean environment. LLM and Brain credentials
-are never copied into command environment. Commands receive `TERM` at timeout
-and `KILL` one second later if needed. Temporary captured output stays bounded
-to configured cap plus one byte; remaining output is drained without storage.
-Tool output returns to Brain as untrusted model context.
+are never copied into command environment. After 30 seconds, main model reviews
+delay and chooses stop, background, or longer wait. Review repeats after chosen
+wait. Background command output appears live in Web; answer generation restarts
+if command finishes during response. Each job has one-hour runtime lease. Model
+may renew lease repeatedly; failed renewal leaves current lease to expire.
+Stop sends `TERM` to process group, then `KILL` one second later if needed.
+Combined output keeps bounded head and rolling tail within 64 KiB. Tool output
+returns to Brain as untrusted model context. Running jobs block conversation
+deletion; archiving leaves them running.
 
 ## Prompt and knowledge
 
@@ -417,13 +426,17 @@ to client servers.
 | `KNOWLEDGE_DIR` | `/knowledge` | Knowledge files |
 | `CLIENT_SCRIPT_PATH` | `/client/main.sh` | Bash client served by Brain |
 | `RUNNER_SCRIPT_PATH` | `/client/runner.sh` | Bash one-shot runner served by Brain |
+| `COMMAND_WORKER_PATH` | `/client/command_worker.py` | Shared Python command worker |
+| `COMMAND_REVIEW_AFTER_SECONDS` | `30` | First slow-command review delay |
+| `COMMAND_REVIEW_TIMEOUT_SECONDS` | `30` | Model review request timeout |
+| `COMMAND_INITIAL_LEASE_SECONDS` | `3600` | Initial command runtime lease |
 | `RUNNER_INSTALLER_PATH` | `/client/install-runner.sh` | Rendered systemd installer |
 | `WEB_DIR` | `/web` | Read-only web interface files |
 | `MAX_TOOL_ROUNDS` | `8` | Tool-call rounds per user turn |
 | `MAX_KNOWLEDGE_BYTES` | `65536` | Total knowledge byte limit |
 | `MAX_REQUEST_BYTES` | `5242880` | Client request byte limit |
 | `LLM_TIMEOUT_SECONDS` | `300` | Upstream request timeout |
-| `CLIENT_COMMAND_TIMEOUT_SECONDS` | `30` | Rendered local command timeout |
+| `CLIENT_COMMAND_TIMEOUT_SECONDS` | `30` | Legacy local capture timeout; tracked jobs use lease |
 | `CLIENT_MAX_TOOL_OUTPUT_BYTES` | `65536` | Rendered local output cap |
 | `CLIENT_BRAIN_CONNECT_TIMEOUT_SECONDS` | `10` | Rendered Brain connection timeout |
 | `CLIENT_BRAIN_REQUEST_TIMEOUT_SECONDS` | `30` | Total timeout for non-streaming client API requests |
@@ -442,6 +455,7 @@ Brain exposes:
 - `GET /readyz`
 - `GET /client.sh`
 - `GET /runner.sh`
+- `GET /command-worker.py`
 - `GET /file-tool.py`
 - `GET /runner/install/{single_use_token}`
 - `GET /v1/conversations`
@@ -454,6 +468,7 @@ Brain exposes:
 - `POST /v1/conversations/{id}/branches/{branch_id}` with `{}` (web dashboard)
 - `POST /v1/conversations/{id}/runner` with `{"runner_id":null}`
 - `POST /v1/conversations/{id}/commands/{tool_call_id}` with approval decision
+- `POST /v1/conversations/{id}/command-jobs/{job_id}/stop` (web dashboard)
 - `GET /v1/conversations/{id}/file-edits/{tool_call_id}` for current text and hash
 - `POST /v1/conversations/{id}/file-edits/{tool_call_id}` with `{"action":"save","expected_hash":"...","content":"..."}` or `{"action":"restore","expected_hash":"..."}`
 - `GET /v1/conversations/{id}/events` (web SSE: snapshot, reasoning/content deltas, deleted)
@@ -466,6 +481,11 @@ Brain exposes:
   empty name clears it)
 - `POST /v1/sessions`
 - `GET /v1/sessions/{id}`
+- `POST /v1/sessions/{id}/command-jobs` (terminal starts approved job)
+- `GET /v1/sessions/{id}/command-jobs`
+- `GET /v1/sessions/{id}/command-jobs/{job_id}`
+- `POST /v1/sessions/{id}/command-jobs/{job_id}/stop` (worker token)
+- `POST /v1/command-jobs/{job_id}/updates` (worker heartbeat)
 - `DELETE /v1/sessions/{id}`
 - `POST /v1/sessions/{id}/turns`
 - `POST /v1/clients` with `client_id` and `name`

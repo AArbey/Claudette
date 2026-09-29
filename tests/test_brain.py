@@ -679,7 +679,7 @@ class StoreAndServiceTests(unittest.TestCase):
             self.assertIsNotNone(connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_servers'"
             ).fetchone())
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), brain.SCHEMA_VERSION)
 
     def test_schema_9_adds_support_model(self):
         with closing(sqlite3.connect(":memory:")) as connection, connection:
@@ -702,7 +702,7 @@ class StoreAndServiceTests(unittest.TestCase):
                 "SELECT support_model FROM ai_servers WHERE id = 'server'"
             ).fetchone()
             self.assertEqual(row["support_model"], "chat")
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), brain.SCHEMA_VERSION)
 
     def test_schema_10_adds_support_wait_setting(self):
         with closing(sqlite3.connect(":memory:")) as connection, connection:
@@ -718,7 +718,7 @@ class StoreAndServiceTests(unittest.TestCase):
                 for row in connection.execute("PRAGMA table_info(ai_servers)")
             }
             self.assertIn("support_wait_for_main", columns)
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), brain.SCHEMA_VERSION)
 
     def test_environment_ignores_legacy_ai_configuration(self):
         with patch.dict(os.environ, {
@@ -870,7 +870,7 @@ class StoreAndServiceTests(unittest.TestCase):
             with patch.object(brain, "urlopen", return_value=response):
                 self.assertTrue(service.probe_runner(client_id))
             public = service.public_runner(client_id)
-            self.assertEqual(public["status"], "online")
+            self.assertEqual(public["status"], "upgrade_required")
             self.assertEqual(public["runner_version"], 0)
             self.assertEqual(public["version_status"], "outdated")
 
@@ -893,6 +893,10 @@ class StoreAndServiceTests(unittest.TestCase):
             service.store.complete_runner_enrollment(
                 enrollment["token"], "192.0.2.20", runner_id, 8766,
                 "192.0.2.10", "/home/user",
+            )
+            service.store.record_runner_probe(
+                runner_id, success=True, home="/home/user",
+                runner_version=brain.RUNNER_VERSION,
             )
             sessions = [service.store.create(runner_id) for _ in range(2)]
             releases = {
@@ -921,7 +925,10 @@ class StoreAndServiceTests(unittest.TestCase):
                 releases[session_id].wait(5)
                 return RunnerResponse(json.dumps({
                     "request_id": payload["request_id"],
+                    "job_id": payload["job_id"],
                     "status": "completed",
+                    "sequence": 1,
+                    "total_bytes": 2,
                     "exit_code": 0,
                     "output": "ok",
                     "cwd": payload["cwd"],
@@ -972,6 +979,11 @@ class StoreAndServiceTests(unittest.TestCase):
                 "192.0.2.10", "/home/user",
             )
             service.store.change_server_trust("192.0.2.20", "add", ["printf"])
+            service.store.record_runner_probe(
+                client_id,
+                success=True, home="/home/user",
+                runner_version=brain.RUNNER_VERSION,
+            )
             session = service.store.create(client_id)
             call = tool_call()
             service.llm = FakeLLM([
@@ -980,16 +992,18 @@ class StoreAndServiceTests(unittest.TestCase):
             ])
             executed = []
 
-            def execute(current, requested, approval):
+            def execute(current, requested, approval, job, _token):
                 executed.append((current["session_id"], requested["id"], approval))
                 return {
-                    "tool_call_id": requested["id"],
                     "content": "exit_code=0\nok",
                     "approval": approval,
+                    "command_job_id": job["job_id"],
                 }
 
             events = []
-            with patch.object(service, "execute_runner", side_effect=execute):
+            with patch.object(service, "ensure_runner_command_job",
+                              return_value=({"job_id": "j" * 32}, None)), \
+                 patch.object(service, "run_runner_command_job", side_effect=execute):
                 service.run_turn(
                     session["session_id"],
                     {"type": "web_user", "content": "run it"},
@@ -1013,6 +1027,11 @@ class StoreAndServiceTests(unittest.TestCase):
                 "192.0.2.10", "/home/user",
             )
             service.store.change_server_trust("192.0.2.20", "add", ["printf"])
+            service.store.record_runner_probe(
+                runner_id,
+                success=True, home="/home/user",
+                runner_version=brain.RUNNER_VERSION,
+            )
             session = service.store.create(runner_id)
             calls = [tool_call("call_1"), tool_call("call_2")]
             service.llm = FakeLLM([
@@ -1024,15 +1043,17 @@ class StoreAndServiceTests(unittest.TestCase):
             ])
             barrier = threading.Barrier(2)
 
-            def execute(_session, call, approval):
+            def execute(_session, call, approval, job, _token):
                 barrier.wait(2)
                 return {
-                    "tool_call_id": call["id"],
                     "content": f"exit_code=0\n{call['id']}",
                     "approval": approval,
+                    "command_job_id": job["job_id"],
                 }
 
-            with patch.object(service, "execute_runner", side_effect=execute):
+            with patch.object(service, "ensure_runner_command_job",
+                              return_value=({"job_id": "j" * 32}, None)), \
+                 patch.object(service, "run_runner_command_job", side_effect=execute):
                 service.run_turn(
                     session["session_id"],
                     {"type": "web_user", "content": "run both"},
@@ -1060,6 +1081,11 @@ class StoreAndServiceTests(unittest.TestCase):
             service.store.complete_runner_enrollment(
                 enrollment["token"], "192.0.2.20", runner_id, 8766,
                 "192.0.2.10", "/home/user",
+            )
+            service.store.record_runner_probe(
+                runner_id,
+                success=True, home="/home/user",
+                runner_version=brain.RUNNER_VERSION,
             )
             session = service.store.create(runner_id)
             calls = [tool_call("call_1"), tool_call("call_2")]
@@ -1098,7 +1124,10 @@ class StoreAndServiceTests(unittest.TestCase):
                 "tool_call_id": "call_2", "content": "exit_code=0\nok",
                 "approval": {"decision": "allowed_once", "prefix": []},
             }
-            with patch.object(service, "execute_runner", return_value=result):
+            result["command_job_id"] = "j" * 32
+            with patch.object(service, "ensure_runner_command_job",
+                              return_value=({"job_id": "j" * 32}, None)), \
+                 patch.object(service, "run_runner_command_job", return_value=result):
                 service.resolve_remote_command(
                     session["session_id"], "call_2", "allow_once", lambda *_: None
                 )
@@ -1116,6 +1145,11 @@ class StoreAndServiceTests(unittest.TestCase):
             service.store.complete_runner_enrollment(
                 enrollment["token"], "192.0.2.20", client_id, 8766,
                 "192.0.2.10", "/home/user",
+            )
+            service.store.record_runner_probe(
+                client_id,
+                success=True, home="/home/user",
+                runner_version=brain.RUNNER_VERSION,
             )
             session = service.store.create(client_id)
             call = tool_call()
@@ -1139,7 +1173,10 @@ class StoreAndServiceTests(unittest.TestCase):
                 "tool_call_id": call["id"], "content": "exit_code=0\nok",
                 "approval": {"decision": "allowed_once", "prefix": []},
             }
-            with patch.object(service, "execute_runner", return_value=result):
+            result["command_job_id"] = "j" * 32
+            with patch.object(service, "ensure_runner_command_job",
+                              return_value=({"job_id": "j" * 32}, None)), \
+                 patch.object(service, "run_runner_command_job", return_value=result):
                 service.resolve_remote_command(
                     session["session_id"], call["id"], "allow_once", lambda *_: None
                 )
@@ -1181,7 +1218,7 @@ class StoreAndServiceTests(unittest.TestCase):
                 row["name"] for row in connection.execute("PRAGMA table_info(runners)")
             }
             self.assertIn("runner_version", columns)
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), brain.SCHEMA_VERSION)
 
     def test_message_branches_preserve_and_switch_responses(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1253,7 +1290,7 @@ class StoreAndServiceTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(session["active_branch_id"], branch["id"])
             self.assertEqual(branch["cwd"], "/srv")
-            self.assertEqual(brain.SessionStore.get_schema_version(connection), 11)
+            self.assertEqual(brain.SessionStore.get_schema_version(connection), brain.SCHEMA_VERSION)
 
     def test_summary_archive_and_newer_schema_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2199,7 +2236,9 @@ class HTTPTests(unittest.TestCase):
                 with urlopen(complete) as response:
                     runner = json.load(response)
                 self.assertEqual(runner["runner_id"], client_id)
-                service.store.record_runner_probe(client_id, success=True)
+                service.store.record_runner_probe(
+                    client_id, success=True, runner_version=brain.RUNNER_VERSION
+                )
                 check = Request(
                     base + f"/v1/runners/{client_id}/check",
                     data=b"{}", headers=headers, method="POST",

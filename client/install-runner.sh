@@ -79,7 +79,7 @@ enroll() {
 
 download_runner() {
     RUNNER_DOWNLOAD=$(mktemp)
-    trap 'rm -f -- "${RUNNER_DOWNLOAD:-}" "${FILE_TOOL_DOWNLOAD:-}"' EXIT
+    trap 'rm -f -- "${RUNNER_DOWNLOAD:-}" "${FILE_TOOL_DOWNLOAD:-}" "${COMMAND_WORKER_DOWNLOAD:-}"' EXIT
     curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
         "$BRAIN_URL/runner.sh" -o "$RUNNER_DOWNLOAD" || die "runner download failed"
     [[ "$(head -n 1 "$RUNNER_DOWNLOAD")" == '#!/usr/bin/env bash' ]] || \
@@ -89,6 +89,11 @@ download_runner() {
         "$BRAIN_URL/file-tool.py" -o "$FILE_TOOL_DOWNLOAD" || die "file editor download failed"
     [[ "$(head -n 1 "$FILE_TOOL_DOWNLOAD")" == '#!/usr/bin/env python3' ]] || \
         die "Brain returned invalid file editor"
+    COMMAND_WORKER_DOWNLOAD=$(mktemp)
+    curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+        "$BRAIN_URL/command-worker.py" -o "$COMMAND_WORKER_DOWNLOAD" || die "command worker download failed"
+    [[ "$(head -n 1 "$COMMAND_WORKER_DOWNLOAD")" == '#!/usr/bin/env python3' ]] || \
+        die "Brain returned invalid command worker"
 }
 
 install_files() {
@@ -97,6 +102,7 @@ install_files() {
     install -d -m 0755 /usr/local/libexec /etc/ai-helper-runner
     install -m 0755 "$RUNNER_DOWNLOAD" /usr/local/libexec/ai-helper-runner
     install -m 0755 "$FILE_TOOL_DOWNLOAD" /usr/local/libexec/ai-helper-file-tool.py
+    install -m 0755 "$COMMAND_WORKER_DOWNLOAD" /usr/local/libexec/ai-helper-command-worker.py
     token_hash=$(printf '%s' "$CREDENTIAL" | sha256sum | awk '{print $1}')
     install -d -m 0700 -o "$RUNNER_USER" -g "$RUNNER_GROUP" \
         "/var/lib/$unit_base"
@@ -106,6 +112,8 @@ install_files() {
         printf 'RUNNER_USER=%s\n' "$RUNNER_USER"
         printf 'RUNNER_HOME=%s\n' "$RUNNER_HOME"
         printf 'RUNNER_FILE_TOOL=/usr/local/libexec/ai-helper-file-tool.py\n'
+        printf 'RUNNER_COMMAND_WORKER=/usr/local/libexec/ai-helper-command-worker.py\n'
+        printf 'BRAIN_URL=%s\n' "$BRAIN_URL"
         printf 'RUNNER_STATE_DIR=/var/lib/%s\n' "$unit_base"
         printf 'RUNNER_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
         printf 'TRUSTED_BRAIN_IP=%s\n' "$TRUSTED_BRAIN_IP"

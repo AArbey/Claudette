@@ -1833,6 +1833,42 @@ function renderFileTool(call, result, key) {
   return card;
 }
 
+function commandJobFor(call, result, pending) {
+  const origin = currentDetail?.messages?.slice().reverse().find(message =>
+    message.role === "assistant" && message.tool_calls?.some(item => item.id === call.id));
+  const jobId = result?.ui?.command_job_id || pending?.ui?.command_job_id
+    || origin?.ui?.command_jobs?.[call.id];
+  return currentDetail?.command_jobs?.find(job => job.job_id === jobId) || null;
+}
+
+async function stopCommandJob(jobId) {
+  if (!currentDetail) return;
+  const sessionId = currentDetail.session_id;
+  const state = sessionState(sessionId);
+  if (state.commandBusy) return;
+  state.commandBusy = true;
+  renderDetail(currentDetail);
+  try {
+    const response = await fetch(
+      `/v1/conversations/${encodeURIComponent(sessionId)}/command-jobs/${encodeURIComponent(jobId)}/stop`,
+      { method: "POST", headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+        body: "{}" },
+    );
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Could not stop command job.");
+    const index = currentDetail?.command_jobs?.findIndex(job => job.job_id === jobId) ?? -1;
+    if (currentDetail?.session_id === sessionId && index >= 0) {
+      currentDetail.command_jobs[index] = data.job;
+      renderDetail(currentDetail);
+    }
+  } catch (error) {
+    showSessionError(sessionId, error.message || "Could not stop command job.");
+  } finally {
+    state.commandBusy = false;
+    if (currentDetail?.session_id === sessionId) renderDetail(currentDetail);
+  }
+}
+
 function renderTool(call, result, key) {
   if (fileToolArguments(call)) return renderFileTool(call, result, key);
   if (webToolArguments(call)) return renderWebTool(call, result, key);
@@ -1841,10 +1877,12 @@ function renderTool(call, result, key) {
   const args = commandArguments(call);
   const command = args ? formatCommand([args.program, ...args.arguments]) : "Command unavailable";
   const pending = currentDetail?.pending_tool_calls?.find((item) => item.id === call.id);
+  const job = commandJobFor(call, result, pending);
+  const jobActive = job && ["starting", "running", "unreachable"].includes(job.state);
   const remotePending = currentDetail?.pending_tool_calls?.filter(item => item.ui?.remote) || [];
   const pendingIndex = remotePending.findIndex(item => item.id === call.id);
   const isNext = pendingIndex === 0;
-  const card = disclosure("tool-card", key, Boolean(!result && pending?.ui?.remote && isNext));
+  const card = disclosure("tool-card", key, Boolean(jobActive || (!result && pending?.ui?.remote && isNext)));
   if (uiState.nextCommandId === call.id) {
     card.open = true;
     disclosureState.set(card.dataset.key, true);
@@ -1857,8 +1895,29 @@ function renderTool(call, result, key) {
     label = pending.ui.state === "failed" ? "Runner unavailable" : "Awaiting approval";
     statusState = pending.ui.state === "failed" ? "failed" : "pending";
   }
+  if (job) {
+    if (job.state === "completed") {
+      label = job.exit_code === 0 ? "Completed" : `Exit ${job.exit_code}`;
+      statusState = job.exit_code === 0 ? "success" : "failed";
+    } else if (job.state === "stopped") {
+      label = "Stopped"; statusState = "muted";
+    } else if (job.state === "timed_out") {
+      label = "Lease expired"; statusState = "failed";
+    } else if (job.state === "unreachable") {
+      label = "Worker unreachable"; statusState = "failed";
+    } else if (job.state === "outcome_unknown") {
+      label = "Outcome unknown"; statusState = "failed";
+    } else if (job.reviewing) {
+      label = "Checking delay"; statusState = "pending";
+    } else if (job.background) {
+      label = "Running in background"; statusState = "pending";
+    } else {
+      label = "Running"; statusState = "pending";
+    }
+    if (job.stop_requested && jobActive) label = "Stopping";
+  }
   const badges = element("span", "command-badges");
-  if (result) badges.append(approvalBadge(result.ui?.approval));
+  if (result || job) badges.append(approvalBadge(result?.ui?.approval || job?.approval));
   if (!result && pending?.ui?.remote && remotePending.length > 1) {
     badges.append(element("span", "command-badge queue-position",
       `${pendingIndex + 1} of ${remotePending.length}`));
@@ -1885,7 +1944,24 @@ function renderTool(call, result, key) {
     if (!result && pending?.ui?.remote) body.append(element("p", "command-note",
       `Trust saves this exact prefix for ${currentDetail.runner?.server_ip || currentDetail.client?.server_ip || "the selected server"}. Matching commands can run without asking.`));
   }
-  if (result) {
+  if (job) {
+    const elapsed = Math.max(0, Math.floor((Date.now() - Date.parse(job.started_at)) / 1000));
+    const meta = `${elapsed}s | ${job.state}${job.truncated ? " | output truncated" : ""}`;
+    body.append(element("p", "command-note", meta));
+    if (job.decision_reason) body.append(element("p", "command-note", job.decision_reason));
+    if (job.review_error) body.append(element("p", "command-note error", `Review failed: ${job.review_error}`));
+    const output = job.output || "No output yet.";
+    body.append(element("pre", "tool-body", output), copyButton(output, "Copy output"));
+    if (jobActive) {
+      const controls = element("div", "command-actions");
+      const stop = element("button", "danger", job.stop_requested ? "Stopping..." : "Stop command");
+      stop.type = "button";
+      stop.disabled = job.stop_requested || uiState.commandBusy;
+      stop.addEventListener("click", () => void stopCommandJob(job.job_id));
+      controls.append(stop);
+      body.append(controls);
+    }
+  } else if (result) {
     const output = (result.content || "").replace(/^exit_code=\d+\n?/, "") || "No output.";
     body.append(element("pre", "tool-body", output), copyButton(output, "Copy output"));
   } else if (pending?.ui?.remote) {
@@ -2776,7 +2852,10 @@ function renderResponseGroup(detail, group, position, isLast) {
   }
 
   if (activityCount) {
-    const activity = activityDisclosure(`${key}:activity`, Boolean(live));
+    const activeJob = detail.command_jobs?.some(job =>
+      ["starting", "running", "unreachable"].includes(job.state)
+      && assistants.some(entry => entry.message.tool_calls?.some(call => call.id === job.tool_call_id)));
+    const activity = activityDisclosure(`${key}:activity`, Boolean(live || activeJob));
     const count = activityBody.querySelectorAll(".tool-card").length;
     const summary = element("summary", "response-activity-summary");
     summary.append(
@@ -2784,7 +2863,7 @@ function renderResponseGroup(detail, group, position, isLast) {
       element("span", "activity-count", count ? `${count} ${count === 1 ? "action" : "actions"}` : ""),
     );
     activity.append(summary, activityBody);
-    activity.classList.toggle("answers-only-hidden", answersOnlyEnabled(detail));
+    activity.classList.toggle("answers-only-hidden", answersOnlyEnabled(detail) && !activeJob);
     section.append(activity);
   }
 
@@ -3239,6 +3318,11 @@ function refreshDetail() {
     if (conversationStream !== stream || !currentDetail?.live) return;
     currentDetail.live.research = JSON.parse(event.data);
     syncResearchDialog(currentDetail);
+  });
+  stream.addEventListener("command", event => {
+    if (conversationStream !== stream || !currentDetail) return;
+    currentDetail.command_jobs = JSON.parse(event.data).jobs;
+    renderDetail(currentDetail);
   });
   stream.addEventListener("context", event => {
     if (conversationStream !== stream || !currentDetail) return;

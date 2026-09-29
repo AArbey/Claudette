@@ -357,9 +357,33 @@ async function noOverflow(page) {
     await page.waitForFunction(() => currentDetail?.status === 'ready' && !currentDetail.active && !sessionState().messageBusy);
     console.log('Approval queue, runner retry, interrupted continuation passed');
 
+    await openChat(page, fixture, 'job');
+    await waitText(page, '.tool-card', 'building 50%');
+    await waitText(page, '.tool-card', 'Build normally takes minutes.');
+    assert.equal(await page.getByRole('button', { name: 'Stop command' }).isVisible(), true);
+    await page.locator('#message-input').fill('Another question');
+    assert.equal(await page.locator('#message-send').isEnabled(), true);
+    await page.locator('#message-input').fill('');
+    await page.evaluate(() => fetch('/fixture/job-update'));
+    await waitText(page, '.tool-card', 'building 75%');
+    await page.evaluate(() => { conversationStream.close(); conversationStream.onerror(); });
+    await page.locator('#connection-retry').click();
+    await waitText(page, '.tool-card', 'building 75%');
+    for (const width of [320, 390]) {
+      await page.setViewportSize({ width, height: 844 });
+      await noOverflow(page);
+    }
+    await page.getByRole('button', { name: 'Stop command' }).click();
+    await waitText(page, '.tool-card', 'Stopping');
+    await page.evaluate(() => fetch('/fixture/job-finish'));
+    await waitText(page, '.tool-card', 'building 75% before stop');
+    await waitText(page, '.tool-card', 'Stopped');
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    console.log('Live command card, reconnect, Stop, mobile layout passed');
+
     await page.goto(`${fixture.base}/#servers/127.0.0.1`);
     await page.locator('#server-name').waitFor();
-    await waitText(page, '.runner-version', 'v3 · Latest');
+    await waitText(page, '.runner-version', 'v4 · Latest');
     await page.locator('#server-name').fill('Production renamed');
     await page.getByRole('button', { name: 'Save name', exact: true }).click();
     await waitText(page, '#conversation-title', 'Production renamed');

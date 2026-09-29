@@ -2,6 +2,7 @@
 from dataclasses import replace
 from pathlib import Path
 import json
+import secrets
 import tempfile
 import time
 
@@ -59,8 +60,12 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
         return True
 
     service.probe_runner = probe
-    service.execute_runner = lambda session, call, approval: {
-        "tool_call_id": call["id"], "content": "exit_code=0\nSimulated command output", "approval": approval,
+    service.ensure_runner_command_job = lambda session, call, approval, assistant: (
+        {"job_id": "j" * 32}, None
+    )
+    service.run_runner_command_job = lambda session, call, approval, job, token: {
+        "tool_call_id": call["id"], "content": "exit_code=0\nSimulated command output",
+        "approval": approval, "command_job_id": job["job_id"],
     }
     sessions = {}
     for key, title in [("main", "Production health overview"), ("other", "Plan next maintenance window"), ("pending", "Review deployment command"), ("multi", "Review command queue"), ("failed", "Runner connection interrupted"), ("resume", "Continue server investigation"), ("archived", "Previous maintenance notes")]:
@@ -90,6 +95,44 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
         service.store.save(session["session_id"], messages, status, pending, 0)
         service.store.set_metadata(session["session_id"], {"title": title, "pinned": key == "main"})
         if key == "archived": service.store.set_archived(session["session_id"], True)
+    job_session = service.store.create(runner_id)
+    sessions["job"] = job_session["session_id"]
+    job_call = tool_call("job_call")
+    job_id = secrets.token_urlsafe(24)
+    job_token = secrets.token_urlsafe(48)
+    job_assistant_id = secrets.token_urlsafe(24)
+    job_messages = job_session["messages"] + [
+        {"role": "user", "content": "Start build"},
+        {"role": "assistant", "content": None, "tool_calls": [job_call],
+         "ui": {"command_message_id": job_assistant_id,
+                "command_jobs": {job_call["id"]: job_id}}},
+        {"role": "tool", "tool_call_id": job_call["id"],
+         "content": "Command still running; provisional output",
+         "ui": {"approval": {"decision": "allowed_once", "prefix": []},
+                "command_job_id": job_id}},
+        {"role": "assistant", "content": "Build started. You can keep chatting."},
+    ]
+    service.store.save(job_session["session_id"], job_messages, "ready", [], 0)
+    service.store.set_metadata(job_session["session_id"], {"title": "Live build job"})
+    job = service.store.create_command_job(
+        job_id=job_id, session_id=job_session["session_id"],
+        branch_id=job_session["active_branch_id"],
+        tool_call_id=job_call["id"], assistant_message_id=job_assistant_id,
+        executor="runner", runner_id=runner_id, client_id=runner_id,
+        cwd="/home/deploy", command=brain.parse_command_call(job_call),
+        approval={"decision": "allowed_once", "prefix": []},
+        job_token=job_token, review_after_seconds=30,
+        initial_lease_seconds=3600,
+    )
+    service.store.update_command_job(
+        job_id, sequence=1, state="running", output="building 50%",
+        total_bytes=12, truncated=False, exit_code=None, cwd=job["cwd"],
+    )
+    service.store.apply_command_job_decision(
+        job_id, usual="yes", reason="Build normally takes minutes.",
+        action="background",
+    )
+
     # Real file helper backs simulated runner actions for diff/editor browser checks.
     file_state = Path(directory) / "file-state"
     file_path = Path(directory) / "sample.py"
@@ -182,6 +225,22 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
 
     class FixtureHandler(brain.BrainHandler):
         def do_GET(self):
+            if self.path == "/fixture/job-update":
+                service.accept_command_job_update(job_id, job_token, {
+                    "sequence": 2, "state": "running", "output": "building 75%",
+                    "total_bytes": 12, "truncated": False, "cwd": job["cwd"],
+                })
+                self.send_json(brain.HTTPStatus.OK, {"ok": True})
+                return
+            if self.path == "/fixture/job-finish":
+                service.accept_command_job_update(job_id, job_token, {
+                    "sequence": 3, "state": "stopped",
+                    "output": "building 75% before stop",
+                    "total_bytes": 24, "truncated": False,
+                    "exit_code": 143, "cwd": job["cwd"],
+                })
+                self.send_json(brain.HTTPStatus.OK, {"ok": True})
+                return
             if self.path == "/fixture/research-start":
                 service.live_turns.append(pending_research["session_id"], "research",
                     {"call_id": "pending_research_call", **{**research_trace, "status": "running"}})

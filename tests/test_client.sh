@@ -70,6 +70,21 @@ capture_command sh -c 'trap "" TERM; while :; do sleep 0.05; done'
 (( SECONDS - started < 5 ))
 [[ "$TOOL_RESULT" == exit_code=137* ]]
 
+# Stub registration and worker. Worker process coverage lives in Python tests.
+start_terminal_command_job() {
+    local _call_id="$1" command="$2" _approval="$3" program
+    local -a arguments=()
+    program=$(jq -r '.program' <<<"$command")
+    mapfile -t arguments < <(jq -r '.arguments[]' <<<"$command")
+    TOOL_JOB_ID=jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
+    if [[ "$program" == cd ]]; then
+        TOOL_JOB_CWD="${arguments[0]}"
+        printf -v TOOL_RESULT 'exit_code=0\n%s' "$TOOL_JOB_CWD"
+    else
+        capture_command env -i "PATH=$PATH" "HOME=$HOME" "$program" "${arguments[@]}"
+    fi
+}
+
 SECRET_MUST_NOT_LEAK=hidden
 export SECRET_MUST_NOT_LEAK
 execute_approved_command \
@@ -123,6 +138,35 @@ malformed_response=true
 execute_approved_command "$valid" <<< 'y'
 [[ "$TOOL_RESULT" == *'Command not run.' ]]
 malformed_response=false
+
+# Resume uses tracked job snapshot before policy check or command start.
+saved_wait_function=$(declare -f wait_terminal_command_job)
+wait_terminal_command_job() {
+    TOOL_JOB_ID="$1"
+    TOOL_JOB_CWD="$PWD"
+    TOOL_RESULT=$'exit_code=0\nresumed'
+    TOOL_APPROVAL='{"decision":"allowed_once","prefix":[]}'
+}
+remote_available=false
+execute_approved_command "$valid" resume_call jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
+[[ "$TOOL_RESULT" == $'exit_code=0\nresumed' ]]
+[[ "$TOOL_JOB_ID" == jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj ]]
+remote_available=true
+eval "$saved_wait_function"
+
+# Internal reset clears terminal stream state before refreshed answer.
+BRAIN_URL=http://brain.test
+BRAIN_CONNECT_TIMEOUT_SECONDS=1
+SESSION_ID=ssssssssssssssssssssssssssssssss
+SESSION_STATUS=continuation_pending
+curl() {
+    printf 'event: content\ndata: {"delta":"stale"}\n\nevent: reset\ndata: {}\n\nevent: content\ndata: {"delta":"fresh"}\n\nevent: done\ndata: {}\n\n__BRAIN_HTTP_STATUS__:200\n'
+}
+stream_turn '{}' >"$test_dir/reset-output"
+unset -f curl
+[[ "$SESSION_STATUS" == ready ]]
+grep -q 'Command finished. Refreshing answer.' "$test_dir/reset-output"
+grep -q 'Assistant: fresh' "$test_dir/reset-output"
 
 # Reasoning-only response offers recovery and submits exact continuation message.
 stream_attempt=0

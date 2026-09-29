@@ -33,6 +33,7 @@ class WebToolsTests(unittest.TestCase):
             service = self.make_service(Path(directory))
             server = service.store.save_ai_server(
                 None, "research", "http://model.example/v1/chat/completions", "", ["fast"])
+            service.store.select_ai_model(server["server_id"], "fast")
             saved = service.store.save_web_tools_config({
                 "searxng_url": "http://search.example:8888", "default_results": 12,
                 "research_server_id": server["server_id"], "research_model": "fast",
