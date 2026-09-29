@@ -95,7 +95,7 @@ validate_execute_request() {
             (.arguments | type == "array" and length <= 64 and all(.[];
                 type == "string" and (explode | index(0) == null) and
                 ((contains("\n") or contains("\r")) | not))) and
-            (.trust_prefix | type == "array" and length >= 1 and length <= 8 and all(.[];
+            (.trust_prefix | type == "array" and length >= 1 and length <= 65 and all(.[];
                 type == "string" and length >= 1 and (explode | index(0) == null) and
                 ((contains("\n") or contains("\r")) | not))) and
             ([.program] + .arguments) as $argv |
@@ -106,7 +106,7 @@ validate_execute_request() {
              .decision == "allowed_once") and
             (.prefix | type == "array") and
             (if (.decision == "trusted" or .decision == "trusted_now") then
-                (.prefix | length >= 1 and length <= 8) and
+                (.prefix | length >= 1 and length <= 65) and
                 $command_argv[0:(.prefix | length)] == .prefix
              else .prefix == [] end))
     ' "$BODY_FILE" >/dev/null

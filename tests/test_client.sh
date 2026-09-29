@@ -57,6 +57,11 @@ if command_request_is_valid "$invalid"; then
     exit 1
 fi
 
+execute_approved_command \
+    '{"program":"bash","arguments":["-lc","printf ok"],"reason":"test","trust_prefix":["bash"]}'
+[[ "$TOOL_RESULT" == "Tool error: shell -c wrappers are unavailable. Run a direct command." ]]
+[[ $(jq -r '.decision' <<<"$TOOL_APPROVAL") == invalid ]]
+
 matched=$(check_trusted_command '["printf","%s","ok"]')
 [[ "$matched" == '["printf"]' ]]
 

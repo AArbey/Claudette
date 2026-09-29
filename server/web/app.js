@@ -1433,9 +1433,10 @@ function formatCommand(tokens) {
 function commandArguments(call) {
   try {
     const args = JSON.parse(call.function.arguments);
-    if (typeof args?.program !== "string" || !Array.isArray(args.arguments)
-        || !args.arguments.every((token) => typeof token === "string")) return null;
-    return args;
+    if (typeof args?.program === "string" && Array.isArray(args.arguments)
+        && args.arguments.every((token) => typeof token === "string")) return args;
+    if (typeof args?.command === "string") return args;
+    return null;
   } catch (_error) {
     return null;
   }
@@ -1875,7 +1876,8 @@ function renderTool(call, result, key) {
   if (memoryToolArguments(call)) return renderMemoryTool(call, result, key);
   const uiState = sessionState();
   const args = commandArguments(call);
-  const command = args ? formatCommand([args.program, ...args.arguments]) : "Command unavailable";
+  const command = typeof args?.command === "string" ? args.command
+    : args ? formatCommand([args.program, ...args.arguments]) : "Command unavailable";
   const pending = currentDetail?.pending_tool_calls?.find((item) => item.id === call.id);
   const job = commandJobFor(call, result, pending);
   const jobActive = job && ["starting", "running", "unreachable"].includes(job.state);

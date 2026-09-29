@@ -201,6 +201,54 @@ class ToolDeltaTests(unittest.TestCase):
             brain.validate_approval({"decision": "allowed_once", "prefix": ["printf"]}, tool_call())
 
 
+class CommandToolTests(unittest.TestCase):
+    def test_model_command_becomes_exact_argv_and_round_trips(self):
+        schema = brain.COMMAND_TOOLS[0]["function"]["parameters"]
+        self.assertEqual(schema["required"], ["command", "reason"])
+        call = {
+            "id": "call_1", "type": "function", "function": {
+                "name": "run_command",
+                "arguments": json.dumps({
+                    "command": "docker ps --format '{{.Names}}'",
+                    "reason": "List containers",
+                }),
+            },
+        }
+        brain.normalize_model_command_calls([call])
+        parsed = brain.parse_command_call(call)
+        self.assertEqual(parsed, {
+            "program": "docker", "arguments": ["ps", "--format", "{{.Names}}"],
+            "reason": "List containers",
+            "trust_prefix": ["docker", "ps", "--format", "{{.Names}}"],
+        })
+        upstream = brain.prepare_upstream_messages([{
+            "role": "assistant", "content": None, "tool_calls": [call],
+        }])
+        self.assertEqual(json.loads(upstream[0]["tool_calls"][0]["function"]["arguments"]), {
+            "command": "docker ps --format '{{.Names}}'",
+            "reason": "List containers",
+        })
+        self.assertEqual(brain.parse_command_call(call), parsed)
+
+    def test_literal_shell_character_is_data(self):
+        self.assertEqual(brain.split_model_command("printf '%s' '|'"),
+                         ["printf", "%s", "|"])
+        self.assertEqual(brain.split_model_command(r"printf %s \|"),
+                         ["printf", "%s", "|"])
+
+    def test_shell_syntax_and_wrappers_rejected(self):
+        for command in ("ls; id", "ls | cat", "bash -lc 'id'", "sudo sh -c id"):
+            with self.subTest(command=command), self.assertRaises(brain.BrainError):
+                brain.split_model_command(command)
+        call = tool_call()
+        call["function"]["arguments"] = json.dumps({
+            "program": "bash", "arguments": ["-lc", "id"],
+            "reason": "test", "trust_prefix": ["bash", "-lc", "id"],
+        })
+        with self.assertRaisesRegex(brain.BrainError, "shell -c wrappers"):
+            brain.parse_command_call(call)
+
+
 class FakeHTTPResponse:
     status = 200
 
@@ -467,6 +515,29 @@ class LLMStreamTests(unittest.TestCase):
             self.assertTrue(
                 all("ui" not in message for message in payload["messages"])
             )
+
+    def test_stream_normalizes_model_command_before_client_receives_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            model_call = {
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "run_command", "arguments": json.dumps({
+                    "command": "git status --short", "reason": "Inspect changes",
+                })},
+            }
+            lines = [
+                "data: " + json.dumps({"choices": [{"delta": {
+                    "tool_calls": [model_call],
+                }}]}) + "\n",
+                "data: [DONE]\n",
+            ]
+            with patch.object(brain, "urlopen", return_value=FakeHTTPResponse(lines)):
+                assistant, calls = client.complete(
+                    [{"role": "user", "content": "status"}], lambda *_: None,
+                )
+            self.assertIs(assistant["tool_calls"], calls)
+            self.assertEqual(brain.parse_command_call(calls[0])["trust_prefix"],
+                             ["git", "status", "--short"])
 
     def test_parses_content_and_fragmented_tool_call(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -45,38 +45,24 @@ COMMAND_TOOLS = [
             "name": "run_command",
             "description": (
                 "NEVER use this function to edit or remove files, instead use the edit_file function. "
-                "Execute an exact program and argument array on the client. "
-                "Trusted argv prefixes run automatically; otherwise the client asks permission."
-                "You should always try your best not to start your commands with bash -lc, sh -lc, or similar. "
+                "Run one command on the client. Write a command line such as "
+                "docker ps --format '{{.Names}}'. Brain splits it into exact arguments. "
+                "Shell operators, pipelines, and shell -c wrappers are unavailable. "
+                "Trusted commands run automatically; otherwise the client asks permission."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "program": {
+                    "command": {
                         "type": "string",
-                        "description": "Executable name or path, without arguments.",
-                    },
-                    "arguments": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Exact argv entries. Shell syntax is not interpreted.",
+                        "description": "One command line, e.g. ls -la /tmp. Quote arguments containing spaces.",
                     },
                     "reason": {
                         "type": "string",
                         "description": "Short explanation shown in the permission prompt.",
                     },
-                    "trust_prefix": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "maxItems": 8,
-                        "description": (
-                            "Specific argv prefix the user may trust. It must prefix the "
-                            "requested program and arguments."
-                        ),
-                    },
                 },
-                "required": ["program", "arguments", "reason", "trust_prefix"],
+                "required": ["command", "reason"],
                 "additionalProperties": False,
             },
         },
@@ -642,7 +628,7 @@ def validate_tool_calls(tool_calls: list[dict[str, Any]]) -> None:
 def validate_trusted_prefixes(prefixes: Any) -> None:
     if not isinstance(prefixes, list) or any(
         not isinstance(prefix, list)
-        or not 1 <= len(prefix) <= 8
+        or not 1 <= len(prefix) <= 65
         or any(
             not isinstance(token, str)
             or not token
@@ -651,7 +637,7 @@ def validate_trusted_prefixes(prefixes: Any) -> None:
         )
         for prefix in prefixes
     ):
-        raise BrainError("trusted prefixes must be arrays of 1-8 non-empty argv tokens")
+        raise BrainError("trusted prefixes must be arrays of 1-65 non-empty argv tokens")
 
 
 def normalize_ip(value: str) -> str:
@@ -681,22 +667,93 @@ def validate_argv(argv: Any) -> None:
         )
 
 
+def shell_command_wrapper(argv: list[str]) -> bool:
+    shells = {"bash", "sh", "dash", "zsh", "ksh", "fish"}
+    for index, token in enumerate(argv[:-1]):
+        if os.path.basename(token) not in shells:
+            continue
+        if any(re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*|--command", option)
+               for option in argv[index + 1:]):
+            return True
+    return False
+
+
+def split_model_command(command: Any) -> list[str]:
+    if not isinstance(command, str) or not command.strip():
+        raise BrainError("command must be a non-empty string")
+    quote = None
+    escaped = False
+    for char in command:
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif char == quote:
+            quote = None
+        elif quote is None and char in "\"'":
+            quote = char
+        elif quote is None and char in "|&;<>":
+            raise BrainError("shell operators are unavailable: no pipes, redirects, &&, or ;. Run one direct command per call; find -o is allowed.")
+    try:
+        argv = shlex.split(command, comments=False, posix=True)
+    except ValueError as error:
+        raise BrainError("command has invalid quoting") from error
+    validate_argv(argv)
+    if shell_command_wrapper(argv):
+        raise BrainError("shell -c wrappers are unavailable; run a direct command")
+    return argv
+
+
+def model_command_arguments(arguments: Any) -> dict[str, Any]:
+    if not isinstance(arguments, dict) or set(arguments) != {"command", "reason"}:
+        raise BrainError("run_command requires a command string and reason")
+    if not isinstance(arguments["reason"], str):
+        raise BrainError("run_command reason must be a string")
+    argv = split_model_command(arguments["command"])
+    return {
+        "program": argv[0], "arguments": argv[1:],
+        "reason": arguments["reason"], "trust_prefix": argv,
+    }
+
+
+def normalize_model_command_calls(calls: list[dict[str, Any]]) -> None:
+    """Keep existing client argv protocol while exposing a smaller model tool."""
+    for call in calls:
+        function = call["function"]
+        if function["name"] != "run_command":
+            continue
+        try:
+            model_args = json.loads(function["arguments"])
+            if not isinstance(model_args, dict) or set(model_args) != {"command", "reason"}:
+                continue
+            command = model_command_arguments(model_args)
+        except (json.JSONDecodeError, BrainError):
+            continue
+        function["arguments"] = json.dumps(
+            command, ensure_ascii=False, separators=(",", ":")
+        )
+
+
 def parse_command_call(call: dict[str, Any]) -> dict[str, Any]:
     try:
         if call["function"]["name"] != "run_command":
             raise BrainError("unsupported remote tool")
         command = json.loads(call["function"]["arguments"])
     except (KeyError, TypeError, json.JSONDecodeError) as error:
-        raise BrainError("invalid remote command") from error
+        raise BrainError("run_command arguments must be valid JSON with command and reason") from error
+    if isinstance(command, dict) and set(command) == {"command", "reason"}:
+        return model_command_arguments(command)
     if not isinstance(command, dict) or set(command) != {
         "program", "arguments", "reason", "trust_prefix",
     }:
-        raise BrainError("invalid remote command")
+        raise BrainError("run_command requires a command string and reason")
     if not isinstance(command["reason"], str):
         raise BrainError("invalid remote command reason")
     argv = [command.get("program"), *command.get("arguments", [])] \
         if isinstance(command.get("arguments"), list) else []
     validate_argv(argv)
+    if shell_command_wrapper(argv):
+        raise BrainError("shell -c wrappers are unavailable; run a direct command")
     validate_trusted_prefixes([command["trust_prefix"]])
     if argv[:len(command["trust_prefix"])] != command["trust_prefix"]:
         raise BrainError("trusted prefix does not match remote command")
@@ -961,6 +1018,28 @@ def prepare_upstream_messages(
                 raise BrainError("system message content must be a string")
             system_parts.append(content)
         else:
+            if cleaned.get("role") == "assistant" and cleaned.get("tool_calls"):
+                cleaned["tool_calls"] = deepcopy(cleaned["tool_calls"])
+                for call in cleaned["tool_calls"]:
+                    function = call.get("function", {})
+                    if function.get("name") != "run_command":
+                        continue
+                    try:
+                        command = json.loads(function["arguments"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if not isinstance(command, dict) or set(command) != {
+                        "program", "arguments", "reason", "trust_prefix"
+                    } or not isinstance(command["program"], str) or not isinstance(
+                        command["arguments"], list
+                    ) or any(not isinstance(arg, str) for arg in command["arguments"]) or not isinstance(
+                        command["reason"], str
+                    ):
+                        continue
+                    function["arguments"] = json.dumps({
+                        "command": shlex.join([command["program"], *command["arguments"]]),
+                        "reason": command["reason"],
+                    }, ensure_ascii=False, separators=(",", ":"))
             regular.append(cleaned)
     if system_parts:
         regular.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
@@ -1381,6 +1460,7 @@ class LLMClient:
             raise BrainError("LLM returned sparse tool call indexes")
         tool_calls = [call for call in tool_call_slots if call is not None]
         validate_tool_calls(tool_calls)
+        normalize_model_command_calls(tool_calls)
         content = "".join(content_parts)
         follows_tool_result = bool(upstream_messages) and upstream_messages[-1].get("role") == "tool"
         if not content.strip() and not tool_calls:

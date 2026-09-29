@@ -357,9 +357,10 @@ end of turn instead. Saved commands are never run again.
 
 Model receives one tool: `run_command`.
 
-Every request includes exact program, argument array, reason, and suggested
-trusted argv prefix. Client either denies, allows once, runs and trusts prefix,
-or replaces pending request with a new instruction.
+Model sends one command line and a reason. Brain splits that line into exact
+argv entries and suggests the full command as its trusted prefix. Client either
+denies, allows once, runs and trusts that exact command, or replaces the pending
+request with a new instruction.
 
 ```text
 AI requested function: run_command
@@ -553,9 +554,9 @@ Same warning applies to runner installer and Brain-to-runner bearer token.
 
 Client protections still apply:
 
-- Commands use exact argv entries. Shell syntax requires explicit `bash -lc`.
+- Commands use exact argv entries. Shell operators and `bash -lc` are rejected.
 - Trusted commands use argv-token prefixes, never raw string prefixes.
-- Broad prefixes such as `bash -lc`, `sudo`, or `rm` are dangerous.
+- Existing broad trusted prefixes such as `sudo` or `rm` remain dangerous; review them in Servers settings.
 - Session files reject symlinks and require current ownership.
 - Commands execute only on client after Brain policy check or local approval.
 

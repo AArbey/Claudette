@@ -116,7 +116,7 @@ check_trusted_command() {
         (keys == ["allowed", "prefix", "server_ip"]) and
         (.allowed | type == "boolean") and
         (.server_ip | type == "string" and length > 0) and
-        (.prefix | type == "array" and length <= 8 and
+        (.prefix | type == "array" and length <= 65 and
             all(.[]; type == "string" and length > 0 and
                 (index("\u0000") == null) and
                 ((contains("\n") or contains("\r")) | not))) and
@@ -351,6 +351,23 @@ capture_command() {
     printf -v TOOL_RESULT 'exit_code=%d\n%s' "$exit_code" "$captured_output"
 }
 
+shell_wrapper_is_requested() {
+    local -a argv=("$@")
+    local index option
+    for (( index=0; index<${#argv[@]}-1; index++ )); do
+        case "${argv[index]##*/}" in
+            bash|sh|dash|zsh|ksh|fish)
+                for option in "${argv[@]:index+1}"; do
+                    if [[ "$option" =~ ^-[[:alpha:]]*c[[:alpha:]]*$ || "$option" == --command ]]; then
+                        return 0
+                    fi
+                done
+                ;;
+        esac
+    done
+    return 1
+}
+
 command_request_is_valid() {
     jq -e '
         type == "object" and
@@ -361,7 +378,7 @@ command_request_is_valid() {
         (.arguments | type == "array" and length <= 64 and
             all(.[]; type == "string" and
                 ((contains("\n") or contains("\r")) | not))) and
-        (.trust_prefix | type == "array" and length >= 1 and length <= 8 and
+        (.trust_prefix | type == "array" and length >= 1 and length <= 65 and
             all(.[]; type == "string" and length >= 1 and
                 ((contains("\n") or contains("\r")) | not))) and
         ([.program] + .arguments) as $command |
@@ -421,6 +438,10 @@ execute_approved_command() {
     trust_prefix_json=$(jq -c '.trust_prefix' <<<"$arguments_json")
     command_json=$(jq -c '[.program] + .arguments' <<<"$arguments_json")
     mapfile -t arguments < <(jq -r '.arguments[]' <<<"$arguments_json")
+    if shell_wrapper_is_requested "$program" "${arguments[@]}"; then
+        TOOL_RESULT="Tool error: shell -c wrappers are unavailable. Run a direct command."
+        return
+    fi
     if [[ "$program" == "cd" && ${#arguments[@]} -ne 1 ]]; then
         TOOL_RESULT="Tool error: cd requires exactly one path argument."
         return
