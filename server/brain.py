@@ -70,6 +70,16 @@ COMMAND_TOOLS = [
     }
 ]
 
+RUNNER_TOOLS = [{"type": "function", "function": {
+    "name": "update_runner",
+    "description": (
+        "Update selected runner from Brain. This dedicated maintenance action runs "
+        "automatically when requested, without command approval. Use only when "
+        "user asks to update runner. If it fails, direct user to Fix install in Servers."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}}]
+
 FILE_TOOLS = [{"type": "function", "function": {
     "name": "edit_file",
     "description": (
@@ -274,6 +284,9 @@ CONVERSATION_FILE_EDIT_RE = re.compile(
 RUNNER_CHECK_RE = re.compile(
     r"^/v1/runners/([A-Za-z0-9_-]{32})/check$"
 )
+RUNNER_UPDATE_RE = re.compile(
+    r"^/v1/runners/([A-Za-z0-9_-]{32})/update$"
+)
 RUNNER_INSTALL_RE = re.compile(r"^/runner/install/([A-Za-z0-9_-]{32,128})$")
 RUNNER_ENROLL_RE = re.compile(
     r"^/v1/runner-enrollments/([A-Za-z0-9_-]{32,128})$"
@@ -285,8 +298,24 @@ AI_SERVER_MODELS_RE = re.compile(
 )
 
 SCHEMA_VERSION = 12
-RUNNER_VERSION = 5
+RUNNER_VERSION = 6
 MIN_RUNNER_VERSION = 4
+FILE_INSPECT_VERSION = 5
+
+# Used only to bootstrap root runners predating /v1/update. Brain constructs every argument.
+LEGACY_RUNNER_UPDATE_SCRIPT = r"""import os, subprocess, sys, tempfile, urllib.request
+with urllib.request.urlopen(sys.argv[1], timeout=20) as response:
+    installer = response.read(262145)
+if len(installer) > 262144 or not installer.startswith(b'#!/usr/bin/env bash\n'):
+    raise ValueError('Brain returned invalid installer')
+descriptor, path = tempfile.mkstemp(prefix='ai-helper-runner-update-')
+try:
+    with os.fdopen(descriptor, 'wb') as stream:
+        stream.write(installer)
+    subprocess.run(['bash', path], check=True, timeout=240)
+finally:
+    os.unlink(path)
+"""
 
 WEB_ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -1373,6 +1402,7 @@ class LLMClient:
         if include_tools:
             tools.extend(FILE_INSPECT_TOOLS)
             tools.extend(FILE_TOOLS)
+            tools.extend(RUNNER_TOOLS)
             tools.extend(COMMAND_TOOLS)
         if include_memory_tools:
             tools.extend(MEMORY_TOOLS)
@@ -3963,6 +3993,7 @@ class BrainService:
         self.llm = DynamicLLMClient(config, self.store, self.context_changed)
         self._runner_guard = threading.Lock()
         self._active_runner_requests: dict[str, int] = {}
+        self._runner_updates: set[str] = set()
         self._runner_monitor_stop = threading.Event()
         self._cancellation_guard = threading.Lock()
         self._turn_cancellations: dict[str, TurnCancellation] = {}
@@ -4605,7 +4636,7 @@ class BrainService:
             runner = self.store.get_runner(runner_id)
         except KeyError as error:
             raise FileToolError("Target runner unavailable. Install or repair it to review this file.", 409) from error
-        required_version = RUNNER_VERSION if payload.get("action") in FILE_INSPECT_NAMES else MIN_RUNNER_VERSION
+        required_version = FILE_INSPECT_VERSION if payload.get("action") in FILE_INSPECT_NAMES else MIN_RUNNER_VERSION
         if runner["runner_version"] is None or runner["runner_version"] < required_version:
             raise FileToolError("Update selected runner to enable this file tool.", 409)
         with self._runner_guard:
@@ -4752,6 +4783,27 @@ class BrainService:
                         internal_results.append({"role": "tool", "tool_call_id": call["id"],
                             "content": "Memory tool call cancelled: maximum tool rounds exceeded.",
                             "ui": {"memory": True, "runner_id": session.get("runner_id")}})
+                elif name == "update_runner":
+                    try:
+                        update_arguments = json.loads(call["function"]["arguments"])
+                    except (TypeError, ValueError):
+                        update_arguments = None
+                    if not execute_memory:
+                        content = "Runner update cancelled: maximum tool rounds exceeded."
+                    elif update_arguments != {}:
+                        content = "Runner update failed: update_runner accepts no arguments."
+                    elif not session.get("runner_id"):
+                        content = "Runner update failed: no runner selected."
+                    else:
+                        try:
+                            updated = self.update_runner(session["runner_id"])
+                            content = f"Runner updated to v{updated['runner_version']}."
+                        except (BrainError, KeyError) as error:
+                            content = f"Runner update failed: {error} Use Fix install in Servers."
+                    internal_results.append({
+                        "role": "tool", "tool_call_id": call["id"], "content": content,
+                        "ui": {"approval": {"decision": "automatic", "prefix": []}},
+                    })
                 elif name == "edit_file" and session.get("runner_id"):
                     if execute_memory:
                         internal_results.append(self.execute_file_tool(session, call))
@@ -4877,6 +4929,115 @@ class BrainService:
                 runner_id, success=False, error=str(error)
             )
             return False
+
+    def update_legacy_root_runner(self, runner: dict[str, Any], token: str) -> None:
+        if runner["client_name"].split("@", 1)[0] != "root" or runner["home"] != "/root":
+            raise BrainError("Runner needs Fix install; automatic update requires root access.")
+        request_id = secrets.token_urlsafe(24)
+        payload = {
+            "request_id": request_id, "job_id": request_id,
+            "job_token": secrets.token_urlsafe(48),
+            "session_id": secrets.token_urlsafe(24),
+            "brain_url": self.config.brain_url, "cwd": "/root",
+            "command": {
+                "program": "python3", "arguments": [
+                    "-c", "exec(" + repr(LEGACY_RUNNER_UPDATE_SCRIPT) + ")",
+                    self.config.brain_url + "/runner/install/" + token,
+                ],
+                "reason": "Update runner", "trust_prefix": ["python3"],
+            },
+            "approval": {"decision": "allowed_once", "prefix": []},
+            "max_runtime_seconds": 270, "max_output_bytes": 4096,
+        }
+        request = Request(
+            self.runner_url(runner, "/v1/execute"),
+            data=json.dumps(payload, separators=(",", ":")).encode(),
+            headers={"Authorization": f"Bearer {runner['token']}",
+                     "Content-Type": "application/json", "Connection": "close"},
+            method="POST",
+        )
+        def replacement_ready() -> bool:
+            if self.store.get_runner(runner["id"])["token"] == runner["token"]:
+                return False
+            return self.probe_runner(runner["id"]) and (
+                self.store.get_runner(runner["id"])["runner_version"] == RUNNER_VERSION
+            )
+
+        deadline = time.monotonic() + 280
+        while time.monotonic() < deadline:
+            try:
+                with urlopen(request, timeout=15) as response:
+                    result = json.load(response)
+            except HTTPError as error:
+                if error.code in {401, 403} and self.store.get_runner(runner["id"])["token"] != runner["token"]:
+                    if replacement_ready():
+                        return
+                    time.sleep(2)
+                    continue
+                raise BrainError(f"runner update failed: {self.runner_http_error(error)}") from error
+            except (OSError, TimeoutError, URLError, ValueError, json.JSONDecodeError):
+                if replacement_ready():
+                    return
+                time.sleep(2)
+                continue  # Retry identical request ID; runner executes it once.
+            if not isinstance(result, dict) or result.get("job_id") != request_id:
+                raise BrainError("runner returned invalid update result")
+            if result.get("status") == "running":
+                if replacement_ready():
+                    return
+                time.sleep(2)
+                continue
+            if result.get("status") == "completed" and result.get("exit_code") == 0:
+                return
+            raise BrainError(
+                "runner update failed: " + str(result.get("output") or result.get("status"))[:2000]
+            )
+        raise BrainError("runner update timed out. Press Check now before trying Fix install.")
+
+    def update_runner(self, runner_id: str) -> dict[str, Any]:
+        with self._runner_guard:
+            if runner_id in self._runner_updates:
+                raise BrainError("Runner update already in progress.")
+            self._runner_updates.add(runner_id)
+        try:
+            return self._update_runner_once(runner_id)
+        finally:
+            with self._runner_guard:
+                self._runner_updates.discard(runner_id)
+
+    def _update_runner_once(self, runner_id: str) -> dict[str, Any]:
+        runner = self.store.get_runner(runner_id)
+        enrollment = self.store.create_runner_enrollment(runner["client_id"])
+        payload = json.dumps({"token": enrollment["token"]}, separators=(",", ":")).encode()
+        request = Request(
+            self.runner_url(runner, "/v1/update"), data=payload,
+            headers={"Authorization": f"Bearer {runner['token']}",
+                     "Content-Type": "application/json", "Connection": "close"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=280) as response:
+                result = json.load(response)
+            if not isinstance(result, dict) or result.get("updated") is not True:
+                raise BrainError("runner returned invalid update result")
+        except HTTPError as error:
+            if error.code == 404:
+                self.update_legacy_root_runner(runner, enrollment["token"])
+            else:
+                raise BrainError(f"runner update failed: {self.runner_http_error(error)}") from error
+        except (OSError, TimeoutError, URLError, ValueError, json.JSONDecodeError) as error:
+            if self.store.get_runner(runner_id)["token"] != runner["token"] and self.probe_runner(runner_id):
+                updated = self.public_runner(runner_id)
+                if updated["runner_version"] == RUNNER_VERSION:
+                    return updated
+            raise BrainError(f"runner update failed: {error}") from error
+        for _ in range(5):
+            if self.probe_runner(runner_id):
+                updated = self.public_runner(runner_id)
+                if updated["runner_version"] == RUNNER_VERSION:
+                    return updated
+            time.sleep(1)
+        raise BrainError("Update finished, but runner check failed. Press Check now or Fix install.")
 
     def start_runner_monitor(self) -> None:
         def monitor() -> None:
@@ -5101,7 +5262,7 @@ class BrainService:
         if not runner_id:
             raise BrainError("conversation has no runner")
         runner = self.store.get_runner(runner_id)
-        if runner["runner_version"] not in {MIN_RUNNER_VERSION, RUNNER_VERSION}:
+        if not isinstance(runner["runner_version"], int) or not MIN_RUNNER_VERSION <= runner["runner_version"] <= RUNNER_VERSION:
             raise BrainError("Runner needs Install / repair before running commands.")
         command = parse_command_call(call)
         assistant_message_id = assistant.get("ui", {}).get("command_message_id")
@@ -5914,7 +6075,7 @@ class BrainService:
                     remote_mode = bool(session["runner_id"])
                     if remote_mode:
                         selected_runner = self.store.get_runner(session["runner_id"])
-                        remote_mode = selected_runner["runner_version"] in {MIN_RUNNER_VERSION, RUNNER_VERSION}
+                        remote_mode = isinstance(selected_runner["runner_version"], int) and MIN_RUNNER_VERSION <= selected_runner["runner_version"] <= RUNNER_VERSION
                     include_tools = remote_mode
                     if session["archived"]:
                         raise BrainError("archived conversation must be restored first")
@@ -7443,6 +7604,24 @@ class BrainHandler(BaseHTTPRequestHandler):
                 {"command": command, "expires_at": enrollment["expires_at"]},
                 cache_control="no-store",
             )
+            return
+        runner_update = RUNNER_UPDATE_RE.fullmatch(self.path)
+        if runner_update:
+            if not self.server.web:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
+                return
+            if not self.dashboard_write_allowed(require_json=True):
+                return
+            try:
+                self.read_json_body(allow_empty=True)
+                runner = self.server.service.update_runner(runner_update.group(1))
+            except KeyError:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "runner not found")
+                return
+            except BrainError as error:
+                self.send_error_json(HTTPStatus.CONFLICT, str(error))
+                return
+            self.send_json(HTTPStatus.OK, {"runner": runner}, cache_control="no-store")
             return
         runner_check = RUNNER_CHECK_RE.fullmatch(self.path)
         if runner_check:

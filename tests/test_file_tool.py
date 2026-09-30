@@ -146,6 +146,7 @@ class BrainFileInspectTests(unittest.TestCase):
             payload = json.loads(upstream.call_args.args[0].data)
             names = [tool["function"]["name"] for tool in payload["tools"]]
             self.assertEqual(names[:3], ["find_files", "search_text", "read_file"])
+            self.assertIn("update_runner", names)
             self.assertEqual(names[-1], "run_command")
 
     def test_web_turn_runs_read_tools_on_selected_runner(self):

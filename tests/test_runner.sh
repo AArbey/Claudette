@@ -32,8 +32,26 @@ body_from_response() { printf '%s' "${1#*$'\r\n\r\n'}"; }
 
 health=$(request GET /healthz)
 [[ "$health" == HTTP/1.1\ 200* ]]
-jq -e '.status == "ready" and .protocol_version == 2 and .runner_version == 5' \
+jq -e '.status == "ready" and .protocol_version == 2 and .runner_version == 6' \
     <<<"$(body_from_response "$health")" >/dev/null
+
+invalid_update=$(request POST /v1/update '{"token":"bad"}')
+[[ "$invalid_update" == HTTP/1.1\ 400* ]]
+
+fake_bin="$RUNNER_STATE_DIR/fake-bin"
+mkdir "$fake_bin"
+cat >"$fake_bin/curl" <<'CURL'
+#!/usr/bin/env bash
+while (($#)); do
+    if [[ "$1" == -o ]]; then shift; output=$1; break; fi
+    shift
+done
+printf '#!/usr/bin/env bash\nprintf "updated\\n"\n' >"$output"
+CURL
+chmod +x "$fake_bin/curl"
+update=$(PATH="$fake_bin:$PATH" request POST /v1/update '{"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')
+[[ "$update" == HTTP/1.1\ 200* ]]
+jq -e '.updated == true' <<<"$(body_from_response "$update")" >/dev/null
 
 bad_source=$(REMOTE_ADDR_OVERRIDE=192.0.2.99 request GET /healthz)
 [[ "$bad_source" == HTTP/1.1\ 403* ]]

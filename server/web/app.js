@@ -2363,7 +2363,36 @@ async function checkRunner(runnerId, clientId) {
   }
 }
 
-async function generateEnrollment(clientId) {
+async function updateRunner(runnerId, clientId) {
+  const editor = enrollmentEditor(clientId);
+  if (editor.busy) return;
+  editor.busy = true;
+  editor.action = "update";
+  editor.command = "";
+  editor.message = "Updating runner…";
+  editor.error = false;
+  renderServers();
+  try {
+    const response = await fetch(`/v1/runners/${encodeURIComponent(runnerId)}/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Brain-UI": "1" },
+      body: "{}",
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    replaceRunner(result.runner);
+    editor.message = `Runner updated to v${result.runner.runner_version}.`;
+  } catch (error) {
+    editor.message = `${error.message || "Update failed."} Use Fix install on target server.`;
+    editor.error = true;
+  } finally {
+    editor.busy = false;
+    editor.action = "";
+    renderServers();
+  }
+}
+
+async function generateEnrollment(clientId, button) {
   const editor = enrollmentEditor(clientId);
   if (editor.busy) return;
   editor.busy = true;
@@ -2381,7 +2410,10 @@ async function generateEnrollment(clientId) {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
     editor.command = result.command;
-    editor.message = `Run on target server. Command expires ${fullTime(result.expires_at)}.`;
+    const copied = await copyText(result.command, button);
+    editor.message = copied
+      ? `Command copied. Run on target server before ${fullTime(result.expires_at)}.`
+      : `Copy command below. Run on target server before ${fullTime(result.expires_at)}.`;
   } catch (error) {
     editor.message = error.message || "Could not generate setup command.";
     editor.error = true;
@@ -2540,11 +2572,19 @@ function renderServers() {
         check.addEventListener("click", () => void checkRunner(runner.runner_id, client.client_id));
         actions.append(check);
       }
+      if (runner) {
+        const update = element("button", "trust-add",
+          editor.action === "update" ? "Updating…" : "Update runner");
+        update.type = "button";
+        update.disabled = editor.busy;
+        update.addEventListener("click", () => void updateRunner(runner.runner_id, client.client_id));
+        actions.append(update);
+      }
       const setup = element("button", "trust-add",
-        editor.action === "install" ? "Preparing…" : "Install / repair");
+        editor.action === "install" ? "Preparing…" : "Fix install");
       setup.type = "button";
       setup.disabled = editor.busy;
-      setup.addEventListener("click", () => void generateEnrollment(client.client_id));
+      setup.addEventListener("click", () => void generateEnrollment(client.client_id, setup));
       actions.append(setup);
       item.append(info, actions);
       if (runner?.last_error) {

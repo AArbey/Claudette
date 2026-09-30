@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -874,6 +875,183 @@ class StoreAndServiceTests(unittest.TestCase):
                 "No runner is selected. You cannot run commands or use durable runner memory.",
             )
             self.assertTrue(loaded["messages"][-1]["ui"]["notice"])
+
+    def test_update_runner_uses_dedicated_authenticated_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            runner_id = "r" * 32
+            service.store.register_client(runner_id, "root@host", "192.0.2.20")
+            enrollment = service.store.create_runner_enrollment(runner_id)
+            service.store.complete_runner_enrollment(
+                enrollment["token"], "192.0.2.20", runner_id, 8766,
+                "192.0.2.10", "/root",
+            )
+            service.store.record_runner_probe(runner_id, success=True, runner_version=5)
+            requests = []
+
+            def send(request, **_kwargs):
+                requests.append(request)
+                return io.BytesIO(b'{"updated":true}')
+
+            def probe(ident):
+                service.store.record_runner_probe(
+                    ident, success=True, runner_version=brain.RUNNER_VERSION
+                )
+                return True
+
+            with patch.object(brain, "urlopen", side_effect=send), patch.object(
+                service, "probe_runner", side_effect=probe
+            ):
+                updated = service.update_runner(runner_id)
+            self.assertEqual(updated["runner_version"], brain.RUNNER_VERSION)
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0].full_url, "http://192.0.2.20:8766/v1/update")
+            self.assertEqual(requests[0].get_method(), "POST")
+            self.assertEqual(requests[0].get_header("Authorization"),
+                             f"Bearer {service.store.get_runner(runner_id)['token']}")
+            token = json.loads(requests[0].data)["token"]
+            self.assertEqual(service.store.get_runner_enrollment(token, "192.0.2.20")["client_id"], runner_id)
+
+    def test_legacy_update_script_executes_downloaded_installer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            installer = Path(directory) / "installer.sh"
+            marker = Path(directory) / "installed"
+            installer.write_text(
+                '#!/usr/bin/env bash\nprintf installed > "$RUNNER_UPDATE_TEST_MARKER"\n',
+                encoding="utf-8",
+            )
+            environment = {**os.environ, "RUNNER_UPDATE_TEST_MARKER": str(marker)}
+            command = "exec(" + repr(brain.LEGACY_RUNNER_UPDATE_SCRIPT) + ")"
+            self.assertNotIn("\n", command)
+            completed = subprocess.run(
+                [sys.executable, "-c", command, installer.as_uri()],
+                env=environment, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(marker.read_text(), "installed")
+
+    def test_old_root_runner_updates_through_existing_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            runner_id = "r" * 32
+            service.store.register_client(runner_id, "root@host", "192.0.2.20")
+            enrollment = service.store.create_runner_enrollment(runner_id)
+            service.store.complete_runner_enrollment(
+                enrollment["token"], "192.0.2.20", runner_id, 8766,
+                "192.0.2.10", "/root",
+            )
+            service.store.record_runner_probe(runner_id, success=True, runner_version=4)
+            requests = []
+
+            def send(request, **_kwargs):
+                requests.append(request)
+                if request.full_url.endswith("/v1/update"):
+                    raise HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO(b'{}'))
+                payload = json.loads(request.data)
+                result = {"job_id": payload["job_id"], "status": "running"}
+                if len(requests) == 3:
+                    result.update(status="completed", exit_code=0)
+                return io.BytesIO(json.dumps(result).encode())
+
+            def probe(ident):
+                service.store.record_runner_probe(
+                    ident, success=True, runner_version=brain.RUNNER_VERSION
+                )
+                return True
+
+            with patch.object(brain, "urlopen", side_effect=send), patch.object(
+                brain.time, "sleep"
+            ), patch.object(service, "probe_runner", side_effect=probe):
+                updated = service.update_runner(runner_id)
+            self.assertEqual(updated["runner_version"], brain.RUNNER_VERSION)
+            self.assertEqual([request.full_url.rsplit("/", 1)[-1] for request in requests],
+                             ["update", "execute", "execute"])
+            first = json.loads(requests[1].data)
+            self.assertEqual(requests[1].data, requests[2].data)
+            self.assertEqual(first["approval"], {"decision": "allowed_once", "prefix": []})
+            self.assertEqual(first["command"]["program"], "python3")
+            self.assertNotIn("\n", first["command"]["arguments"][1])
+            self.assertIn("/runner/install/", first["command"]["arguments"][2])
+
+    def test_old_runner_token_rotation_finishes_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            runner_id = "r" * 32
+            service.store.register_client(runner_id, "root@host", "192.0.2.20")
+            enrollment = service.store.create_runner_enrollment(runner_id)
+            service.store.complete_runner_enrollment(
+                enrollment["token"], "192.0.2.20", runner_id, 8766,
+                "192.0.2.10", "/root",
+            )
+            service.store.record_runner_probe(runner_id, success=True, runner_version=4)
+            requests = []
+
+            def send(request, **_kwargs):
+                requests.append(request)
+                if request.full_url.endswith("/v1/update"):
+                    raise HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO(b'{}'))
+                if len(requests) == 2:
+                    payload = json.loads(request.data)
+                    token = payload["command"]["arguments"][2].rsplit("/", 1)[1]
+                    service.store.complete_runner_enrollment(
+                        token, "192.0.2.20", runner_id, 8766,
+                        "192.0.2.10", "/root",
+                    )
+                    return io.BytesIO(json.dumps({
+                        "job_id": payload["job_id"], "status": "running"
+                    }).encode())
+                raise HTTPError(request.full_url, 401, "Unauthorized", {}, io.BytesIO(b'{}'))
+
+            def probe(ident):
+                service.store.record_runner_probe(
+                    ident, success=True, runner_version=brain.RUNNER_VERSION
+                )
+                return True
+
+            with patch.object(brain, "urlopen", side_effect=send), patch.object(
+                brain.time, "sleep"
+            ), patch.object(service, "probe_runner", side_effect=probe):
+                updated = service.update_runner(runner_id)
+            self.assertEqual(updated["runner_version"], brain.RUNNER_VERSION)
+            self.assertEqual(len(requests), 2)
+
+    def test_old_nonroot_runner_requires_fix_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            runner_id = "r" * 32
+            service.store.register_client(runner_id, "user@host", "192.0.2.20")
+            enrollment = service.store.create_runner_enrollment(runner_id)
+            service.store.complete_runner_enrollment(
+                enrollment["token"], "192.0.2.20", runner_id, 8766,
+                "192.0.2.10", "/home/user",
+            )
+            error = HTTPError("http://runner/v1/update", 404, "Not Found", {}, io.BytesIO(b'{}'))
+            with patch.object(brain, "urlopen", side_effect=error):
+                with self.assertRaisesRegex(brain.BrainError, "Fix install"):
+                    service.update_runner(runner_id)
+
+    def test_model_runner_update_skips_command_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            runner_id = "r" * 32
+            service.store.register_client(runner_id, "root@host", "192.0.2.20")
+            enrollment = service.store.create_runner_enrollment(runner_id)
+            service.store.complete_runner_enrollment(
+                enrollment["token"], "192.0.2.20", runner_id, 8766,
+                "192.0.2.10", "/root",
+            )
+            session = service.store.create(runner_id)
+            call = {"id": "update_1", "type": "function", "function": {
+                "name": "update_runner", "arguments": "{}",
+            }}
+            with patch.object(service, "update_runner", return_value={
+                "runner_version": brain.RUNNER_VERSION
+            }) as update:
+                external, internal = service.split_tool_calls(session, [call])
+            update.assert_called_once_with(runner_id)
+            self.assertEqual(external, [])
+            self.assertEqual(internal[0]["ui"]["approval"]["decision"], "automatic")
+            self.assertIn("Runner updated", internal[0]["content"])
 
     def test_runner_check_records_current_version(self):
         with tempfile.TemporaryDirectory() as directory:

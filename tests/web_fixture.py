@@ -63,6 +63,13 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
         return True
 
     service.probe_runner = probe
+    def update_runner(ident):
+        service.store.record_runner_probe(
+            ident, success=True, runner_version=brain.RUNNER_VERSION
+        )
+        return service.public_runner(ident)
+
+    service.update_runner = update_runner
     service.ensure_runner_command_job = lambda session, call, approval, assistant: (
         {"job_id": "j" * 32}, None
     )

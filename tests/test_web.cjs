@@ -396,7 +396,7 @@ async function noOverflow(page) {
 
     await page.goto(`${fixture.base}/#servers/127.0.0.1`);
     await page.locator('#server-name').waitFor();
-    await waitText(page, '.runner-version', 'v4 · Latest');
+    await waitText(page, '.runner-version', 'v6 · Latest');
     await page.locator('#server-name').fill('Production renamed');
     await page.getByRole('button', { name: 'Save name', exact: true }).click();
     await waitText(page, '#conversation-title', 'Production renamed');
@@ -406,9 +406,13 @@ async function noOverflow(page) {
     await page.getByRole('button', { name: 'Remove trust for docker ps', exact: true }).click();
     await page.getByRole('button', { name: 'Check now', exact: true }).click();
     await waitText(page, '#servers', 'Check passed');
-    await page.getByRole('button', { name: 'Install / repair', exact: true }).click();
+    await page.getByRole('button', { name: 'Update runner', exact: true }).click();
+    await waitText(page, '#servers', 'Runner updated to v6');
+    await page.getByRole('button', { name: 'Fix install', exact: true }).click();
     await page.locator('.setup-command').waitFor();
-    assert.ok((await page.locator('.setup-command').innerText()).includes('/runner/install/'));
+    const fixCommand = await page.locator('.setup-command').innerText();
+    assert.ok(fixCommand.includes('/runner/install/'));
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), fixCommand);
     await page.locator('#sidebar-search').fill('192.0.2.25');
     await page.locator('#server-list button').click();
     await page.locator('.runner-diagnostic').waitFor();

@@ -187,7 +187,9 @@ then manage its trusted prefixes. The first installed runner supplies its hostna
 as the default display name; edit or clear that persistent name at any time.
 Each observed CLI identity shows runner status: not installed, offline, online,
 busy, or error. It also shows installed runner release and whether latest release
-bundled with Brain is installed. **Install / repair** updates outdated runners.
+bundled with Brain is installed. **Update runner** runs a dedicated authenticated
+update action when runner has root access. **Fix install** copies a fresh command
+for target server if automatic update fails or runner needs first setup.
 **Setup** generates single-use command valid for ten minutes.
 Type a prefix such as `docker ps` and choose **Add prefix**, or use the remove
 button beside an existing prefix. Quote arguments containing spaces, for example
@@ -234,7 +236,7 @@ requests; this protects against cross-site browser requests, not untrusted LAN u
 ## Optional always-available runner
 
 Run `ai-helper` once on target Debian user, then open **Servers**, select server,
-and choose **Install / repair** beside that user. Copy generated command. It
+and choose **Fix install** beside that user. Command is copied automatically. It
 downloads to a temporary file, runs as root directly or through `sudo`, then
 removes the temporary file.
 
@@ -270,8 +272,10 @@ refuses to overwrite a file changed elsewhere.
 Web edits use selected runner. Terminal edits run on terminal host. Web review
 of a terminal edit works from conversation history; Web editing and restore
 require installing runner for that same user and host. Backups live under
-`~/.local/state/ai-helper/file-edits`. Update existing runners to version 5
-through **Install / repair** before Web file inspection.
+`~/.local/state/ai-helper/file-edits`. Existing version 5 runners support Web file
+inspection. Existing root runners can update through **Update runner** or model
+`update_runner` tool, including older releases. Runners installed for non-root users
+still need **Fix install** for root-owned files.
 
 Runner accepts only authenticated HTTP/1.1 from configured Brain source IP.
 Protocol requires `Content-Length` and `Connection: close`; chunking, malformed

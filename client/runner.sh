@@ -6,7 +6,7 @@ readonly MAX_HEADER_BYTES=16384
 readonly MAX_BODY_BYTES=2097152
 readonly READ_TIMEOUT_SECONDS=10
 readonly RUNNER_PROTOCOL_VERSION=2
-readonly RUNNER_VERSION=5
+readonly RUNNER_VERSION=6
 
 respond_json() {
     local status="$1" reason="$2" payload="$3" length
@@ -207,6 +207,34 @@ execute_file_request() {
     respond_json 200 OK "$result"
 }
 
+update_request() {
+    local token update_file output_file output
+    token=$(jq -er 'select(type == "object" and (keys == ["token"])) |
+        .token | select(type == "string" and test("^[A-Za-z0-9_-]{32,128}$"))' \
+        "$BODY_FILE") || fail_json 400 BadRequest "invalid update token"
+    [[ $EUID -eq 0 ]] || fail_json 409 Conflict \
+        "Runner lacks root access. Use Fix install on target server."
+    update_file=$(mktemp "$RUNNER_STATE_DIR/update.XXXXXX")
+    output_file=$(mktemp "$RUNNER_STATE_DIR/update-output.XXXXXX")
+    if ! curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+        "$BRAIN_URL/runner/install/$token" -o "$update_file" >"$output_file" 2>&1; then
+        output=$(tail -c 2000 "$output_file")
+        rm -f -- "$update_file" "$output_file"
+        fail_json 502 BadGateway "Installer download failed: $output"
+    fi
+    if [[ "$(head -n 1 "$update_file")" != '#!/usr/bin/env bash' ]]; then
+        rm -f -- "$update_file" "$output_file"
+        fail_json 502 BadGateway "Brain returned invalid installer"
+    fi
+    if ! timeout --signal=TERM --kill-after=5s 240s bash "$update_file" >"$output_file" 2>&1; then
+        output=$(tail -c 2000 "$output_file")
+        rm -f -- "$update_file" "$output_file"
+        fail_json 500 Internal "Runner update failed: $output"
+    fi
+    rm -f -- "$update_file" "$output_file"
+    respond_json 200 OK '{"updated":true}'
+}
+
 main() {
     umask 077
     mkdir -p -- "$RUNNER_STATE_DIR/requests"
@@ -222,7 +250,7 @@ main() {
                 '{runner_id: $id, status: "ready", home: $home,
                   protocol_version: $protocol, runner_version: $runner_version}')"
             ;;
-        'POST /v1/execute HTTP/1.1'|'POST /v1/file HTTP/1.1')
+        'POST /v1/execute HTTP/1.1'|'POST /v1/file HTTP/1.1'|'POST /v1/update HTTP/1.1')
             [[ "${CONTENT_TYPE_VALUE:-}" == application/json* ]] || \
                 fail_json 415 Unsupported "application/json required"
             [[ "${CONTENT_LENGTH_VALUE:-}" =~ ^[0-9]+$ ]] || \
@@ -236,7 +264,9 @@ main() {
                 fail_json 408 Timeout "request body timeout"
             [[ "$(wc -c <"$BODY_FILE")" == "$CONTENT_LENGTH_VALUE" ]] || \
                 fail_json 400 BadRequest "incomplete request body"
-            if [[ "$REQUEST_LINE" == 'POST /v1/file HTTP/1.1' ]]; then
+            if [[ "$REQUEST_LINE" == 'POST /v1/update HTTP/1.1' ]]; then
+                update_request
+            elif [[ "$REQUEST_LINE" == 'POST /v1/file HTTP/1.1' ]]; then
                 execute_file_request
             else
                 execute_request
