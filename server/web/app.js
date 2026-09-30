@@ -3172,7 +3172,7 @@ async function sendWebMessage() {
       : `${error.message || "Could not send message."} Draft kept. Check the transcript before retrying.`;
   } finally {
     state.messageBusy = false;
-    if (currentDetail?.session_id === sessionId) renderComposer(currentDetail);
+    if (currentDetail?.session_id === sessionId) renderDetail(currentDetail);
   }
 }
 

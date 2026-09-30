@@ -18,10 +18,13 @@ class PreviewLLM:
         self, messages, emit, *, include_tools=True, model_name=None,
         cancellation=None,
     ):
-        last = messages[-1]
+        last = next(message for message in reversed(messages) if message.get("role") != "system")
         if last.get("role") == "user" and last.get("content") == "request command" and include_tools:
             call = tool_call()
             return {"role": "assistant", "content": None, "tool_calls": [call]}, [call]
+        if last.get("role") == "user" and last.get("content") == "request two commands" and include_tools:
+            calls = [tool_call(f"fresh_call_{index}") for index in (1, 2)]
+            return {"role": "assistant", "content": None, "tool_calls": calls}, calls
         content = "## Check complete\n\nEverything looks healthy.\n\n- Configuration loaded\n- Services responding\n\n```bash\ndocker ps\n```"
         emit("reasoning", {"delta": "Checking the current request."})
         for _ in range(20):
@@ -68,8 +71,8 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
         "approval": approval, "command_job_id": job["job_id"],
     }
     sessions = {}
-    for key, title in [("main", "Production health overview"), ("other", "Plan next maintenance window"), ("pending", "Review deployment command"), ("multi", "Review command queue"), ("failed", "Runner connection interrupted"), ("resume", "Continue server investigation"), ("archived", "Previous maintenance notes")]:
-        session = service.store.create(runner_id if key in {"pending", "multi", "failed"} else None)
+    for key, title in [("main", "Production health overview"), ("other", "Plan next maintenance window"), ("pending", "Review deployment command"), ("multi", "Review command queue"), ("first_multi", "New command queue"), ("failed", "Runner connection interrupted"), ("resume", "Continue server investigation"), ("archived", "Previous maintenance notes")]:
+        session = service.store.create(runner_id if key in {"pending", "multi", "first_multi", "failed"} else None)
         sessions[key] = session["session_id"]
         messages = session["messages"] + [{"role": "user", "content": "Check server health and suggest next steps."}]
         status, pending = "ready", []

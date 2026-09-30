@@ -693,14 +693,14 @@ def split_model_command(command: Any) -> list[str]:
         elif quote is None and char in "\"'":
             quote = char
         elif quote is None and char in "|&;<>":
-            raise BrainError("shell operators are unavailable: no pipes, redirects, &&, or ;. Run one direct command per call; find -o is allowed.")
+            raise BrainError("Shell operators and redirects are PROHIBITED: no pipes (|), redirects (>, <, 2>), \&\& , ||, ;, or &. Use only direct commands with standard arguments. find -o (OR predicate) is allowed.")
     try:
         argv = shlex.split(command, comments=False, posix=True)
     except ValueError as error:
         raise BrainError("command has invalid quoting") from error
     validate_argv(argv)
     if shell_command_wrapper(argv):
-        raise BrainError("shell -c wrappers are unavailable; run a direct command")
+        raise BrainError("Shell -c wrappers are PROHIBITED: use direct commands only (no bash -lc, sh -c, etc.)")
     return argv
 
 
@@ -753,7 +753,7 @@ def parse_command_call(call: dict[str, Any]) -> dict[str, Any]:
         if isinstance(command.get("arguments"), list) else []
     validate_argv(argv)
     if shell_command_wrapper(argv):
-        raise BrainError("shell -c wrappers are unavailable; run a direct command")
+        raise BrainError("Shell -c wrappers are PROHIBITED: use direct commands only (no bash -lc, sh -c, etc.)")
     validate_trusted_prefixes([command["trust_prefix"]])
     if argv[:len(command["trust_prefix"])] != command["trust_prefix"]:
         raise BrainError("trusted prefix does not match remote command")

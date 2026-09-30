@@ -324,6 +324,19 @@ async function noOverflow(page) {
     console.log('Draft isolation, IME, streaming, reconnect, disclosures passed');
 
     // Remote approval uses actual Brain endpoints, but execution is mocked by the fixture.
+    await openChat(page, fixture, 'first_multi');
+    await page.locator('#message-input').fill('request two commands');
+    await page.locator('#message-send').click();
+    await page.waitForFunction(() => currentDetail?.pending_tool_calls?.length === 2
+      && !currentDetail.active && !sessionState().messageBusy);
+    assert.equal(await page.getByRole('button', { name: 'Allow once', exact: true }).isEnabled(), true);
+    await page.getByRole('button', { name: 'Allow once', exact: true }).click();
+    await page.waitForFunction(() => currentDetail?.pending_tool_calls?.length === 1
+      && !currentDetail.active && !sessionState().commandBusy);
+    assert.equal(await page.getByRole('button', { name: 'Deny', exact: true }).isEnabled(), true);
+    await page.getByRole('button', { name: 'Deny', exact: true }).click();
+    await page.waitForFunction(() => currentDetail?.status === 'ready'
+      && !currentDetail.active && !sessionState().commandBusy);
     await openChat(page, fixture, 'pending');
     await page.locator('#approval-banner').waitFor();
     await page.waitForTimeout(3200); // Banner must survive dashboard polling.
