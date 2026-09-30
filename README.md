@@ -259,7 +259,10 @@ separate ports selected from `8766-8865`.
 Brain dispatches trusted tool calls from one model response concurrently.
 Untrusted calls remain pending until each receives an approval or denial.
 
-`edit_file` creates, changes, or deletes one UTF-8 text file up to 256 KiB.
+`find_files` finds names by glob, `search_text` finds matching lines by regular
+expression, and `read_file` reads selected lines. These read-only tools run on
+selected target without command approval and return bounded results. `edit_file`
+creates, changes, or deletes one UTF-8 text file up to 256 KiB.
 The edit applies immediately. Web shows file path and diff outside collapsed
 activity, with **Edit file** and **Restore original** actions. Created files
 show **Delete file** instead. Restore uses backup saved on target host and
@@ -267,8 +270,8 @@ refuses to overwrite a file changed elsewhere.
 Web edits use selected runner. Terminal edits run on terminal host. Web review
 of a terminal edit works from conversation history; Web editing and restore
 require installing runner for that same user and host. Backups live under
-`~/.local/state/ai-helper/file-edits`. Update existing runners to version 4
-through **Install / repair** before Web commands.
+`~/.local/state/ai-helper/file-edits`. Update existing runners to version 5
+through **Install / repair** before Web file inspection.
 
 Runner accepts only authenticated HTTP/1.1 from configured Brain source IP.
 Protocol requires `Content-Length` and `Connection: close`; chunking, malformed
@@ -355,7 +358,8 @@ end of turn instead. Saved commands are never run again.
 
 ## Command policy
 
-Model receives one tool: `run_command`.
+Model uses dedicated file tools for discovery, content search, reading, and edits.
+`run_command` handles system operations without a dedicated tool.
 
 Model sends one command line and a reason. Brain splits that line into exact
 argv entries and suggests the full command as its trusted prefix. Client either

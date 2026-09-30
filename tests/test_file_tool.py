@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_brain import brain, config, FakeLLM
+from test_brain import brain, config, FakeHTTPResponse, FakeLLM
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("file_tool", ROOT / "client" / "file_tool.py")
@@ -92,6 +92,129 @@ class FileToolTests(unittest.TestCase):
             binary.write_bytes(b"x\0y")
             with self.assertRaisesRegex(file_tool.FileError, "UTF-8"):
                 file_tool.perform(state, request("l" * 32, root, binary.name, "replace", "x", "z"))
+
+
+class FileInspectTests(unittest.TestCase):
+    def test_find_search_and_read_without_edit_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            (root / ".git").mkdir()
+            (root / "src" / "app.py").write_text("alpha\nBeta value\nlast\n", encoding="utf-8")
+            (root / "src" / "other.py").write_text("none\n", encoding="utf-8")
+            (root / ".git" / "secret.py").write_text("Beta value\n", encoding="utf-8")
+            (root / "link.py").symlink_to(root / "src" / "app.py")
+            state = root / "state"
+            found = file_tool.perform(state, {"action": "find_files", "cwd": str(root), "glob": "*.py"})
+            self.assertEqual(found["matches"], [str(root / "src" / "app.py"),
+                                                 str(root / "src" / "other.py")])
+            matches = file_tool.perform(state, {"action": "search_text", "cwd": str(root),
+                "pattern": r"beta\s+value", "file_glob": "*.py", "case_sensitive": False})
+            self.assertEqual(matches["matches"], [{"path": str(root / "src" / "app.py"),
+                "line": 2, "text": "Beta value"}])
+            read = file_tool.perform(state, {"action": "read_file", "cwd": str(root),
+                "path": "src/app.py", "start_line": 2, "max_lines": 1})
+            self.assertEqual((read["content"], read["end_line"], read["total_lines"], read["truncated"]),
+                             ("Beta value\n", 2, 3, True))
+            self.assertFalse(state.exists())
+
+    def test_bounds_and_binary_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "big.txt").write_text("match\n" * 210, encoding="utf-8")
+            (root / "binary.txt").write_bytes(b"bad\0text")
+            state = root / "state"
+            matches = file_tool.perform(state, {"action": "search_text", "cwd": str(root),
+                "pattern": "match", "max_results": 2})
+            self.assertEqual(len(matches["matches"]), 2)
+            self.assertTrue(matches["truncated"])
+            with self.assertRaisesRegex(file_tool.FileError, "UTF-8|binary"):
+                file_tool.perform(state, {"action": "read_file", "cwd": str(root), "path": "binary.txt"})
+            with self.assertRaises(file_tool.FileError):
+                file_tool.perform(state, {"action": "read_file", "cwd": str(root), "path": "missing.txt"})
+
+
+class BrainFileInspectTests(unittest.TestCase):
+    def test_model_sees_dedicated_file_tools_before_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = brain.LLMClient(config(Path(directory)))
+            lines = ['data: {"choices":[{"delta":{"content":"Ready"}}]}\n',
+                     'data: [DONE]\n']
+            with patch.object(brain, "urlopen", return_value=FakeHTTPResponse(lines)) as upstream:
+                client.complete([{"role": "user", "content": "inspect"}], lambda *_: None,
+                    include_memory_tools=False, include_web_tools=False)
+            payload = json.loads(upstream.call_args.args[0].data)
+            names = [tool["function"]["name"] for tool in payload["tools"]]
+            self.assertEqual(names[:3], ["find_files", "search_text", "read_file"])
+            self.assertEqual(names[-1], "run_command")
+
+    def test_web_turn_runs_read_tools_on_selected_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = brain.BrainService(config(root), "system")
+            runner_id = "r" * 32
+            service.store.register_client(runner_id, "user@host", "192.0.2.20")
+            enrollment = service.store.create_runner_enrollment(runner_id)
+            service.store.complete_runner_enrollment(enrollment["token"], "192.0.2.20",
+                runner_id, 8766, "192.0.2.10", str(root))
+            service.store.record_runner_probe(runner_id, success=True, runner_version=brain.RUNNER_VERSION)
+            session = service.store.create(runner_id)
+            (root / "app.py").write_text("hello\n", encoding="utf-8")
+            names = ("find_files", "search_text", "read_file")
+            args = ({"glob": "*.py"}, {"pattern": "hello"}, {"path": "app.py"})
+            calls = [{"id": name, "type": "function", "function": {
+                "name": name, "arguments": json.dumps(arguments)}}
+                for name, arguments in zip(names, args)]
+            service.llm = FakeLLM([
+                ({"role": "assistant", "content": None, "tool_calls": calls}, calls),
+                ({"role": "assistant", "content": "Found it."}, []),
+            ])
+            with patch.object(service, "runner_file_request",
+                    side_effect=lambda _runner, payload: file_tool.perform(root / "state", payload)) as runner:
+                service.run_turn(session["session_id"],
+                    {"type": "web_user", "content": "Inspect files"}, lambda *_: None)
+            self.assertEqual(runner.call_count, 3)
+            saved = service.store.get(session["session_id"])
+            self.assertEqual(saved["status"], "ready")
+            self.assertEqual(saved["pending_tool_calls"], [])
+            results = [m for m in saved["messages"] if m.get("role") == "tool"]
+            self.assertEqual(len(results), 3)
+            self.assertTrue(all(m["ui"]["approval"]["decision"] == "automatic" for m in results))
+            self.assertEqual(json.loads(results[2]["content"])["content"], "hello\n")
+
+    def test_v4_runner_remains_usable_but_inspection_needs_upgrade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = brain.BrainService(config(root), "system")
+            runner_id = "r" * 32
+            service.store.register_client(runner_id, "user@host", "192.0.2.20")
+            enrollment = service.store.create_runner_enrollment(runner_id)
+            service.store.complete_runner_enrollment(enrollment["token"], "192.0.2.20",
+                runner_id, 8766, "192.0.2.10", str(root))
+            service.store.record_runner_probe(runner_id, success=True, runner_version=4)
+            self.assertNotEqual(service.public_runner(runner_id)["status"], "upgrade_required")
+            with self.assertRaisesRegex(brain.FileToolError, "Update selected runner"):
+                service.runner_file_request(runner_id,
+                    {"action": "read_file", "cwd": str(root), "path": "app.py"})
+
+    def test_terminal_inspection_result_accepts_automatic_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = brain.BrainService(config(Path(directory)), "system")
+            session = service.store.create()
+            call = {"id": "inspect", "type": "function", "function": {
+                "name": "read_file", "arguments": json.dumps({"path": "app.py"})}}
+            service.llm = FakeLLM([
+                ({"role": "assistant", "content": None, "tool_calls": [call]}, [call]),
+                ({"role": "assistant", "content": "Done."}, []),
+            ])
+            service.run_turn(session["session_id"], {"type": "user", "content": "Read app"}, lambda *_: None)
+            self.assertEqual(service.store.get(session["session_id"])["status"], "awaiting_tool_results")
+            service.run_turn(session["session_id"], {"type": "tool_results", "results": [{
+                "tool_call_id": "inspect", "content": '{"ok":true,"content":"hello"}',
+                "approval": {"decision": "automatic", "prefix": []},
+            }]}, lambda *_: None)
+            self.assertEqual(service.store.get(session["session_id"])["status"], "ready")
+
 
 
 class BrainFileEditTests(unittest.TestCase):

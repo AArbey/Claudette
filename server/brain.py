@@ -44,8 +44,9 @@ COMMAND_TOOLS = [
         "function": {
             "name": "run_command",
             "description": (
-                "NEVER use this function to edit or remove files, instead use the edit_file function. "
-                "Run one command on the client. Write a command line such as "
+                "Use for system operations that have no dedicated tool. "
+                "For file discovery, content search, and reading use find_files, search_text, and read_file. "
+                "For file changes use edit_file. Run one command on the client. Write a command line such as "
                 "docker ps --format '{{.Names}}'. Brain splits it into exact arguments. "
                 "Shell operators, pipelines, and shell -c wrappers are unavailable. "
                 "Trusted commands run automatically; otherwise the client asks permission."
@@ -74,7 +75,7 @@ FILE_TOOLS = [{"type": "function", "function": {
     "description": (
         "Create, edit, or delete one UTF-8 text file (max 256 KiB) on the execution target. "
         "Changes apply immediately, with a saved backup and reviewable diff in Web UI. "
-        "Read existing files first using run_command. For replace, old_text must match exactly "
+        "Read existing files first using read_file. For replace, old_text must match exactly "
         "once; include enough context. For create, old_text must be empty and path must not exist. "
         "For delete, old_text must contain the full current file and new_text must be empty. "
         "Parent directory must exist. Use this tool for file changes instead of shell writes. "
@@ -87,6 +88,40 @@ FILE_TOOLS = [{"type": "function", "function": {
         "reason": {"type": "string"},
     }, "required": ["path", "operation", "old_text", "new_text", "reason"], "additionalProperties": False},
 }}]
+
+FILE_INSPECT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "find_files",
+        "description": "Find files by glob on the execution target. Prefer this over ls, find, or shell commands for file discovery. Skips common generated directories and symbolic links. Results are bounded.",
+        "parameters": {"type": "object", "properties": {
+            "glob": {"type": "string", "description": "Filename or relative path glob, e.g. *.py or server/*.py."},
+            "path": {"type": "string", "description": "Directory or file; defaults to current working directory."},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 200},
+        }, "required": ["glob"], "additionalProperties": False},
+    }},
+    {"type": "function", "function": {
+        "name": "search_text",
+        "description": "Search UTF-8 file contents with a Python regular expression on the execution target. Prefer this over grep, rg, or shell commands for text search. Returns matching file, line number, and line text. Results are bounded.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "Python regular expression."},
+            "path": {"type": "string", "description": "Directory or file; defaults to current working directory."},
+            "file_glob": {"type": "string", "description": "Filename or relative path glob; defaults to *."},
+            "case_sensitive": {"type": "boolean", "description": "Defaults to true."},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 200},
+        }, "required": ["pattern"], "additionalProperties": False},
+    }},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read UTF-8 text file on the execution target. Prefer this over cat, sed, head, or shell commands for file reading. Output is bounded; use start_line to continue.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Absolute path or path relative to current working directory."},
+            "start_line": {"type": "integer", "minimum": 1, "maximum": 1000000},
+            "max_lines": {"type": "integer", "minimum": 1, "maximum": 500},
+        }, "required": ["path"], "additionalProperties": False},
+    }},
+]
+FILE_INSPECT_NAMES = {tool["function"]["name"] for tool in FILE_INSPECT_TOOLS}
+
 
 MEMORY_TOOLS = [
     {
@@ -250,7 +285,8 @@ AI_SERVER_MODELS_RE = re.compile(
 )
 
 SCHEMA_VERSION = 12
-RUNNER_VERSION = 4
+RUNNER_VERSION = 5
+MIN_RUNNER_VERSION = 4
 
 WEB_ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -693,14 +729,14 @@ def split_model_command(command: Any) -> list[str]:
         elif quote is None and char in "\"'":
             quote = char
         elif quote is None and char in "|&;<>":
-            raise BrainError("Shell operators and redirects are PROHIBITED: no pipes (|), redirects (>, <, 2>), \&\& , ||, ;, or &. Use only direct commands with standard arguments. find -o (OR predicate) is allowed.")
+            raise BrainError("Shell operators and redirects are PROHIBITED: no pipes (|), redirects (>, <, 2>), &&, ||, ;, or &. Use only direct commands with standard arguments. find -o (OR predicate) is allowed.")
     try:
         argv = shlex.split(command, comments=False, posix=True)
     except ValueError as error:
         raise BrainError("command has invalid quoting") from error
     validate_argv(argv)
     if shell_command_wrapper(argv):
-        raise BrainError("Shell -c wrappers are PROHIBITED: use direct commands only (no bash -lc, sh -c, etc.)")
+        raise BrainError("shell -c wrappers are PROHIBITED: use direct commands only (no bash -lc, sh -c, etc.)")
     return argv
 
 
@@ -753,7 +789,7 @@ def parse_command_call(call: dict[str, Any]) -> dict[str, Any]:
         if isinstance(command.get("arguments"), list) else []
     validate_argv(argv)
     if shell_command_wrapper(argv):
-        raise BrainError("Shell -c wrappers are PROHIBITED: use direct commands only (no bash -lc, sh -c, etc.)")
+        raise BrainError("shell -c wrappers are PROHIBITED: use direct commands only (no bash -lc, sh -c, etc.)")
     validate_trusted_prefixes([command["trust_prefix"]])
     if argv[:len(command["trust_prefix"])] != command["trust_prefix"]:
         raise BrainError("trusted prefix does not match remote command")
@@ -775,6 +811,25 @@ def parse_file_call(call: dict[str, Any]) -> dict[str, Any]:
                for key in ("old_text", "new_text"))):
         raise BrainError("invalid file edit operation, path, or text (256 KiB limit)")
     return arguments
+
+
+def parse_file_inspect_call(call: dict[str, Any]) -> dict[str, Any]:
+    name = call.get("function", {}).get("name")
+    allowed = {
+        "find_files": ({"glob"}, {"path", "max_results"}),
+        "search_text": ({"pattern"}, {"path", "file_glob", "case_sensitive", "max_results"}),
+        "read_file": ({"path"}, {"start_line", "max_lines"}),
+    }
+    if name not in allowed:
+        raise BrainError("unknown file inspection tool")
+    try:
+        arguments = json.loads(call["function"]["arguments"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise BrainError("invalid file inspection arguments") from error
+    required, optional = allowed[name]
+    if not isinstance(arguments, dict) or not required <= arguments.keys() or not arguments.keys() <= required | optional:
+        raise BrainError("invalid file inspection arguments")
+    return {"action": name, **arguments}
 
 
 def file_request_id(session_id: str, call_id: str) -> str:
@@ -935,8 +990,8 @@ def validate_approval(approval: Any, call: dict[str, Any]) -> None:
     ):
         raise BrainError("invalid command approval")
     prefix = approval["prefix"]
-    if approval["decision"] == "automatic" and call.get("function", {}).get("name") != "edit_file":
-        raise BrainError("automatic approval is only valid for edit_file")
+    if approval["decision"] == "automatic" and call.get("function", {}).get("name") not in {"edit_file", *FILE_INSPECT_NAMES}:
+        raise BrainError("automatic approval is only valid for file tools")
     if approval["decision"] not in {"trusted", "trusted_now"}:
         if prefix != []:
             raise BrainError("only trusted approvals may include a prefix")
@@ -1316,8 +1371,9 @@ class LLMClient:
             payload["verbose"] = True
         tools = []
         if include_tools:
-            tools.extend(COMMAND_TOOLS)
+            tools.extend(FILE_INSPECT_TOOLS)
             tools.extend(FILE_TOOLS)
+            tools.extend(COMMAND_TOOLS)
         if include_memory_tools:
             tools.extend(MEMORY_TOOLS)
         if include_web_tools:
@@ -4196,7 +4252,7 @@ class BrainService:
             "last_seen_at": runner["last_seen_at"],
             "last_error": runner["last_error"],
             "status": (
-                "upgrade_required" if runner_version != RUNNER_VERSION
+                "upgrade_required" if runner_version is None or not MIN_RUNNER_VERSION <= runner_version <= RUNNER_VERSION
                 else self.runner_status(runner)
             ),
             "runner_version": runner_version,
@@ -4549,8 +4605,9 @@ class BrainService:
             runner = self.store.get_runner(runner_id)
         except KeyError as error:
             raise FileToolError("Target runner unavailable. Install or repair it to review this file.", 409) from error
-        if runner["runner_version"] is None or runner["runner_version"] < RUNNER_VERSION:
-            raise FileToolError("Update selected runner to enable file editing.", 409)
+        required_version = RUNNER_VERSION if payload.get("action") in FILE_INSPECT_NAMES else MIN_RUNNER_VERSION
+        if runner["runner_version"] is None or runner["runner_version"] < required_version:
+            raise FileToolError("Update selected runner to enable this file tool.", 409)
         with self._runner_guard:
             self._active_runner_requests[runner_id] = self._active_runner_requests.get(runner_id, 0) + 1
         try:
@@ -4603,6 +4660,21 @@ class BrainService:
                     "content": f"File edit failed: {error}",
                     "ui": {"file_edit_error": str(error),
                            "approval": {"decision": "invalid", "prefix": []}}}
+
+    def execute_file_inspect_tool(self, session: dict[str, Any], call: dict[str, Any]) -> dict[str, Any]:
+        try:
+            arguments = parse_file_inspect_call(call)
+            result = self.runner_file_request(session["runner_id"], {
+                **arguments,
+                "cwd": session["cwd"] or self.store.get_runner(session["runner_id"])["home"],
+            })
+            return {"role": "tool", "tool_call_id": call["id"],
+                    "content": json.dumps(result, ensure_ascii=False),
+                    "ui": {"file_inspect": True, "approval": {"decision": "automatic", "prefix": []}}}
+        except (BrainError, KeyError) as error:
+            return {"role": "tool", "tool_call_id": call["id"],
+                    "content": json.dumps({"ok": False, "error": str(error)}),
+                    "ui": {"file_inspect": True, "approval": {"decision": "invalid", "prefix": []}}}
 
     def file_edit_action(self, session_id: str, call_id: str, body: dict[str, Any]) -> dict[str, Any]:
         lock = self.locks.acquire(session_id)
@@ -4687,6 +4759,13 @@ class BrainService:
                         internal_results.append({"role": "tool", "tool_call_id": call["id"],
                             "content": "File edit cancelled: maximum tool rounds exceeded.",
                             "ui": {"approval": {"decision": "cancelled", "prefix": []}}})
+                elif name in FILE_INSPECT_NAMES and session.get("runner_id"):
+                    if execute_memory:
+                        internal_results.append(self.execute_file_inspect_tool(session, call))
+                    else:
+                        internal_results.append({"role": "tool", "tool_call_id": call["id"],
+                            "content": "File inspection cancelled: maximum tool rounds exceeded.",
+                            "ui": {"file_inspect": True, "approval": {"decision": "cancelled", "prefix": []}}})
                 elif name in WEB_TOOL_NAMES:
                     if execute_memory:
                         last_saved = 0.0
@@ -5022,7 +5101,7 @@ class BrainService:
         if not runner_id:
             raise BrainError("conversation has no runner")
         runner = self.store.get_runner(runner_id)
-        if runner["runner_version"] != RUNNER_VERSION:
+        if runner["runner_version"] not in {MIN_RUNNER_VERSION, RUNNER_VERSION}:
             raise BrainError("Runner needs Install / repair before running commands.")
         command = parse_command_call(call)
         assistant_message_id = assistant.get("ui", {}).get("command_message_id")
@@ -5835,7 +5914,7 @@ class BrainService:
                     remote_mode = bool(session["runner_id"])
                     if remote_mode:
                         selected_runner = self.store.get_runner(session["runner_id"])
-                        remote_mode = selected_runner["runner_version"] == RUNNER_VERSION
+                        remote_mode = selected_runner["runner_version"] in {MIN_RUNNER_VERSION, RUNNER_VERSION}
                     include_tools = remote_mode
                     if session["archived"]:
                         raise BrainError("archived conversation must be restored first")

@@ -1716,6 +1716,51 @@ function fileToolArguments(call) {
   } catch (_error) { return null; }
 }
 
+function fileInspectArguments(call) {
+  if (!["find_files", "search_text", "read_file"].includes(call.function?.name)) return null;
+  try {
+    const args = JSON.parse(call.function.arguments);
+    return args && typeof args === "object" ? args : {};
+  } catch (_error) { return {}; }
+}
+
+function renderFileInspect(call, result, key) {
+  const args = fileInspectArguments(call) || {};
+  const names = {find_files: "Find files", search_text: "Search text", read_file: "Read file"};
+  const target = args.path || ".";
+  const query = args.glob || args.pattern;
+  const title = `${names[call.function.name]} · ${query ? `${query} in ` : ""}${target}`;
+  const card = disclosure("tool-card", key, false);
+  const summary = element("summary", "tool-summary");
+  let value = null;
+  if (result?.content) {
+    try { value = JSON.parse(result.content); } catch (_error) {}
+  }
+  summary.append(
+    element("code", "command-line", title),
+    element("span", `command-badge ${value?.ok === false ? "failed" : result ? "success" : "pending"}`,
+      value?.ok === false ? "Failed" : result ? "Completed" : "Working"),
+  );
+  card.append(summary);
+  const body = element("div", "tool-details");
+  if (result) {
+    let output = result.content || "";
+    if (value?.ok === false) output = value.error || output;
+    else if (typeof value?.content === "string") {
+      output = `Lines ${value.start_line}–${value.end_line} of ${value.total_lines}${value.truncated ? " · more available" : ""}\n${value.content}`;
+    } else if (Array.isArray(value?.matches)) {
+      output = value.matches.length
+        ? value.matches.map(item => typeof item === "string"
+          ? item : `${item.path}:${item.line}: ${item.text}`).join("\n")
+        : "No matches.";
+      if (value.truncated) output += "\nMore results available.";
+    }
+    body.append(element("pre", "tool-body", output), copyButton(output, "Copy result"));
+  }
+  card.append(body);
+  return card;
+}
+
 function fileEditPath(sessionId, callId) {
   return `/v1/conversations/${encodeURIComponent(sessionId)}/file-edits/${encodeURIComponent(callId)}`;
 }
@@ -1871,6 +1916,7 @@ async function stopCommandJob(jobId) {
 }
 
 function renderTool(call, result, key) {
+  if (fileInspectArguments(call)) return renderFileInspect(call, result, key);
   if (fileToolArguments(call)) return renderFileTool(call, result, key);
   if (webToolArguments(call)) return renderWebTool(call, result, key);
   if (memoryToolArguments(call)) return renderMemoryTool(call, result, key);
@@ -2109,7 +2155,7 @@ function renderMessage(message, index, results = [], options = {}) {
     const commandGroup = element("div", message.tool_calls.length > 1 ? "command-group" : "");
     if (message.tool_calls.length > 1) {
       const ids = new Set(message.tool_calls.map(call => call.id));
-      const hasMemoryCalls = message.tool_calls.some(call => memoryToolArguments(call) || webToolArguments(call));
+      const hasMemoryCalls = message.tool_calls.some(call => memoryToolArguments(call) || webToolArguments(call) || fileInspectArguments(call) || fileToolArguments(call));
       const reviewCount = currentDetail?.pending_tool_calls?.filter(
         call => ids.has(call.id) && call.ui?.remote
       ).length || 0;

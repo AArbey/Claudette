@@ -1,4 +1,3 @@
-1. Instead of having to copy the command to update the runner, make it a simple "update runner" button that runs the update command by itself, and add a "Fix install" button to actually copy the command if the automatic update didn't work. Make sure the automatic update command runs even though it is started by the llm itself
 2. Allow user to send messages even while AI is generating, currenlty only way is when ai is asking permission to run command.
 3. Maybe tell the ai to use memories when it needs to search for information ?
 4. Right now it struggles a lot to find files or understand how something works in the system, can we find a way to make it work better ? maybe a better prompt of such ?

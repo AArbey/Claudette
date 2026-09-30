@@ -219,6 +219,10 @@ execute_file_edit "$local_args" local_call
 [[ $(<"$local_path") == created ]]
 [[ $(jq -r '.operation' <<<"$TOOL_FILE_EDIT") == create ]]
 [[ $(jq -r '.decision' <<<"$TOOL_APPROVAL") == automatic ]]
+inspect_args=$(jq -cn --arg path "$local_path" '{path:$path,start_line:1,max_lines:1}')
+execute_file_inspect read_file "$inspect_args"
+jq -e '.ok == true and .content == "created\n"' <<<"$TOOL_RESULT" >/dev/null
+[[ $(jq -r '.decision' <<<"$TOOL_APPROVAL") == automatic ]]
 
 # Large edit arguments and diff must not exceed shell argv limits during submission.
 large_args=$(jq -cn --arg path "$test_dir/large.txt" \

@@ -533,6 +533,37 @@ execute_file_edit() {
     print_status "$TOOL_RESULT"
 }
 
+execute_file_inspect() {
+    local name="$1" arguments_json="$2" payload helper_file response
+    payload=$(jq -cn --slurpfile args <(printf '%s' "$arguments_json") \
+        --arg action "$name" --arg cwd "$PWD" \
+        '$args[0] + {action:$action,cwd:$cwd}') || {
+        TOOL_RESULT="File inspection failed: invalid arguments"; return;
+    }
+    helper_file=$(mktemp)
+    if ! curl --fail --silent --show-error --connect-timeout "$BRAIN_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$BRAIN_REQUEST_TIMEOUT_SECONDS" "$BRAIN_URL/file-tool.py" -o "$helper_file"; then
+        rm -f -- "$helper_file"
+        TOOL_RESULT="File inspection failed: could not download helper"
+        return
+    fi
+    if [[ "$(head -n 1 "$helper_file")" != '#!/usr/bin/env python3' ]]; then
+        rm -f -- "$helper_file"
+        TOOL_RESULT="File inspection failed: invalid helper download"
+        return
+    fi
+    response=$(python3 "$helper_file" --state-dir "${FILE_TOOL_STATE_DIR:-$HOME/.local/state/ai-helper/file-edits}" \
+        <<<"$payload") || response='{"ok":false,"error":"inspection failed"}'
+    rm -f -- "$helper_file"
+    if ! jq -e '.ok == true' <<<"$response" >/dev/null 2>&1; then
+        TOOL_RESULT="File inspection failed: $(jq -r '.error // "invalid helper response"' <<<"$response" 2>/dev/null)"
+        return
+    fi
+    TOOL_APPROVAL='{"decision":"automatic","prefix":[]}'
+    TOOL_RESULT="$response"
+    print_status "File inspection complete."
+}
+
 execute_tool_call() {
     local call="$1" name arguments_text arguments_json
     TOOL_APPROVAL='{"decision":"invalid","prefix":[]}'
@@ -549,6 +580,7 @@ execute_tool_call() {
     case "$name" in
         run_command) execute_approved_command "$arguments_json" "$(jq -r '.id' <<<"$call")" "$(jq -r '.ui.command_job_id // empty' <<<"$call")" ;;
         edit_file) execute_file_edit "$arguments_json" "$(jq -r '.id' <<<"$call")" ;;
+        find_files|search_text|read_file) execute_file_inspect "$name" "$arguments_json" ;;
         *) printf -v TOOL_RESULT 'Tool error: unknown tool %q.' "$name" ;;
     esac
 }

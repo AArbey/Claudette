@@ -6,7 +6,7 @@ readonly MAX_HEADER_BYTES=16384
 readonly MAX_BODY_BYTES=2097152
 readonly READ_TIMEOUT_SECONDS=10
 readonly RUNNER_PROTOCOL_VERSION=2
-readonly RUNNER_VERSION=4
+readonly RUNNER_VERSION=5
 
 respond_json() {
     local status="$1" reason="$2" payload="$3" length

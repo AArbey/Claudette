@@ -32,7 +32,7 @@ body_from_response() { printf '%s' "${1#*$'\r\n\r\n'}"; }
 
 health=$(request GET /healthz)
 [[ "$health" == HTTP/1.1\ 200* ]]
-jq -e '.status == "ready" and .protocol_version == 2 and .runner_version == 4' \
+jq -e '.status == "ready" and .protocol_version == 2 and .runner_version == 5' \
     <<<"$(body_from_response "$health")" >/dev/null
 
 bad_source=$(REMOTE_ADDR_OVERRIDE=192.0.2.99 request GET /healthz)
@@ -90,6 +90,16 @@ file_response=$(request POST /v1/file "$file_payload")
 jq -e '.ok == true and .edit.operation == "create" and (.edit.diff | contains("+hello"))' \
     <<<"$(body_from_response "$file_response")" >/dev/null
 [[ $(<"$RUNNER_STATE_DIR/target.txt") == hello ]]
+inspect_payload=$(jq -cn --arg cwd "$RUNNER_STATE_DIR" \
+    '{action:"read_file",cwd:$cwd,path:"target.txt"}')
+inspected=$(request POST /v1/file "$inspect_payload")
+jq -e '.ok == true and .content == "hello\n" and .total_lines == 1' \
+    <<<"$(body_from_response "$inspected")" >/dev/null
+search_payload=$(jq -cn --arg cwd "$RUNNER_STATE_DIR" \
+    '{action:"search_text",cwd:$cwd,pattern:"hello",file_glob:"*.txt"}')
+searched=$(request POST /v1/file "$search_payload")
+jq -e '.ok == true and (.matches | length) == 1 and .matches[0].line == 1' \
+    <<<"$(body_from_response "$searched")" >/dev/null
 restore_payload=$(jq -cn --arg hash "$(jq -r '.edit.after_hash' <<<"$(body_from_response "$file_response")")" \
     '{action:"restore",edit_id:("f" * 32),request_id:("g" * 32),expected_hash:$hash}')
 restored=$(request POST /v1/file "$restore_payload")
