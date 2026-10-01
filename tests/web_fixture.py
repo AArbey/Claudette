@@ -25,6 +25,14 @@ class PreviewLLM:
         if last.get("role") == "user" and last.get("content") == "request two commands" and include_tools:
             calls = [tool_call(f"fresh_call_{index}") for index in (1, 2)]
             return {"role": "assistant", "content": None, "tool_calls": calls}, calls
+        if last.get("role") == "user" and last.get("content") == "request cross-runner commands" and include_tools:
+            other = "s" * 32
+            service.store.record_runner_probe(other, success=True, runner_version=brain.RUNNER_VERSION)
+            calls = [tool_call("routing_default"), tool_call("routing_beta")]
+            args = json.loads(calls[1]["function"]["arguments"])
+            args["runner_id"] = other
+            calls[1]["function"]["arguments"] = json.dumps(args)
+            return {"role": "assistant", "content": None, "tool_calls": calls}, calls
         content = "## Check complete\n\nEverything looks healthy.\n\n- Configuration loaded\n- Services responding\n\n```bash\ndocker ps\n```"
         emit("reasoning", {"delta": "Checking the current request."})
         for _ in range(20):

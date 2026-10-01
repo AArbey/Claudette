@@ -123,6 +123,20 @@ Choose **System**, **Light**, or **Dark** from the sidebar. System follows devic
 appearance; explicit choices persist in this browser. On narrower screens,
 open navigation with the menu button; Escape or the backdrop closes it.
 
+### Runner routing
+
+Command, file, and runner-update tools accept optional `runner_id`. Brain provides
+current registered runner IDs and host metadata to the model. In Web, omitted ID
+uses selected runner; in CLI, omitted ID keeps command/file execution local.
+Runner updates default to selected runner. Explicit IDs route through Brain.
+Other runners start in their own home directory; use absolute paths or command
+arguments for project directories. Routing never changes conversation selection.
+
+Command approval and trust apply to actual target server IP. Cards and terminal
+prompts show execution host. Pending calls and retries retain original targets;
+file review and restore remain on original runner. Chat-only Web conversations
+cannot execute commands, files, or runner updates.
+
 ### Durable memory
 
 Open **Memories** in the sidebar to inspect durable memory. Memories can be global

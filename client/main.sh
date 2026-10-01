@@ -571,10 +571,21 @@ execute_tool_call() {
     TOOL_JOB_ID=''
     name=$(jq -r '.function.name // empty' <<<"$call")
     printf '%sAI requested function: %q%s\n' "$COLOR_STATUS" "${name:-unknown}" "$COLOR_RESET"
+    if jq -e '.ui.remote == true or .ui.target.executor == "runner"' >/dev/null <<<"$call"; then
+        TOOL_RESULT="Tool error: remote calls must execute through Brain, never locally."
+        return
+    fi
+    if jq -e '.ui.target.client_name' >/dev/null <<<"$call"; then
+        print_status "Target: $(jq -r '.ui.target | .client_name + " at " + .server_ip' <<<"$call")"
+    fi
     arguments_text=$(jq -r '.function.arguments // "{}"' <<<"$call")
     if ! arguments_json=$(jq -ce 'if type == "object" then . else error("not object") end' \
         <<<"$arguments_text" 2>/dev/null); then
         TOOL_RESULT="Tool error: model supplied invalid JSON arguments."
+        return
+    fi
+    if jq -e 'has("runner_id")' >/dev/null <<<"$arguments_json"; then
+        TOOL_RESULT="Tool error: explicit runner_id cannot execute locally."
         return
     fi
     case "$name" in
@@ -813,6 +824,7 @@ parse_brain_stream() {
 
 stream_turn() {
     local payload="$1" event_name='' event_data delta error_message=''
+    local request_path="${2:-/v1/sessions/${SESSION_ID}/turns}"
     local http_status='' terminal_event='' curl_pid curl_status=0
     local reasoning_started=false response_started=false
 
@@ -823,7 +835,7 @@ stream_turn() {
             --connect-timeout "$BRAIN_CONNECT_TIMEOUT_SECONDS" \
             --header 'Content-Type: application/json' --data-binary @- \
             --write-out $'\n__BRAIN_HTTP_STATUS__:%{http_code}\n' \
-            "${BRAIN_URL}/v1/sessions/${SESSION_ID}/turns" <<<"$payload" |
+            "${BRAIN_URL}${request_path}" <<<"$payload" |
             parse_brain_stream
     )
     curl_pid=$!
@@ -940,8 +952,49 @@ stream_turn_with_recovery() {
     recover_interrupted_chat
 }
 
+resolve_cli_remote_command() {
+    local call="$1" reply decision payload call_id target command reason
+    call_id=$(jq -r '.id' <<<"$call")
+    target=$(jq -r '.ui.target | (.client_name // .runner_id // "Unknown runner") + " at " + (.server_ip // "unknown IP")' <<<"$call")
+    command=$(jq -r '.function.arguments | fromjson | .command // ([.program] + .arguments | @sh)' <<<"$call")
+    reason=$(jq -r '.function.arguments | fromjson | .reason // ""' <<<"$call")
+    print_status "Target: $target"
+    print_status "Command: $command"
+    [[ -z "$reason" ]] || print_status "$reason"
+    if [[ "$(jq -r '.ui.state' <<<"$call")" == failed ]]; then
+        print_error "$(jq -r '.ui.error // "Runner unavailable"' <<<"$call")"
+        read -r -p "Retry [r] / Cancel [C]? " reply || return 1
+        case "$reply" in [Rr]) decision=retry ;; *) decision=cancel ;; esac
+    else
+        read -r -p "Allow once [a] / Trust [t] / Deny [D] / Instructions [i]? " reply || return 1
+        case "$reply" in
+            [Aa]) decision=allow_once ;;
+            [Tt]) decision=trust ;;
+            [Ii])
+                read_conversation_input "New instructions: " PENDING_USER_INSTRUCTION || return 1
+                [[ -n "$PENDING_USER_INSTRUCTION" ]] || return 1
+                payload=$(jq -cn --arg instruction "$PENDING_USER_INSTRUCTION" --arg cwd "$PWD"                     '{type:"tool_results",results:[],instruction:$instruction,cwd:$cwd}')
+                PENDING_USER_INSTRUCTION=''
+                stream_turn_with_recovery "$payload"
+                return
+                ;;
+            *) decision=deny ;;
+        esac
+    fi
+    payload=$(jq -cn --arg client_id "$CLIENT_ID" --arg decision "$decision"         '{client_id:$client_id,decision:$decision}')
+    stream_turn "$payload" "/v1/sessions/${SESSION_ID}/commands/$(jq -rn --arg id "$call_id" '$id|@uri')" || return
+    refresh_session_state
+}
+
 submit_tool_results() {
     local calls="$1" results='[]' call id payload index count
+    local remote_call
+    remote_call=$(jq -c '[.[] | select(.ui.remote == true)][0] // null' <<<"$calls")
+    calls=$(jq -c '[.[] | select(.ui.remote != true)]' <<<"$calls")
+    if [[ "$calls" == '[]' && "$remote_call" != null ]]; then
+        resolve_cli_remote_command "$remote_call"
+        return
+    fi
     count=$(jq 'length' <<<"$calls")
     for (( index = 0; index < count; index++ )); do
         call=$(jq -c ".[$index]" <<<"$calls")

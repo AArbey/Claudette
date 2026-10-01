@@ -1716,12 +1716,29 @@ function fileInspectArguments(call) {
   } catch (_error) { return {}; }
 }
 
+function toolTarget(call, result, pending, job) {
+  const target = result?.ui?.target || pending?.ui?.target || call?.ui?.target;
+  if (target) return target;
+  const runnerId = result?.ui?.file_edit?.runner_id || job?.runner_id
+    || commandArguments(call)?.runner_id || fileToolArguments(call)?.runner_id
+    || fileInspectArguments(call)?.runner_id;
+  const runner = runners.find(item => item.runner_id === runnerId);
+  if (runner) return runner;
+  if (runnerId) return {runner_id: runnerId, client_name: runnerId};
+  return currentDetail?.runner || currentDetail?.client || {};
+}
+
+function targetLabel(target) {
+  const name = target.client_name || target.name || target.runner_id || "Client terminal";
+  return `${name}${target.server_ip ? ` at ${target.server_ip}` : ""}`;
+}
+
 function renderFileInspect(call, result, key) {
   const args = fileInspectArguments(call) || {};
   const names = {find_files: "Find files", search_text: "Search text", read_file: "Read file"};
   const target = args.path || ".";
   const query = args.glob || args.pattern;
-  const title = `${names[call.function.name]} · ${query ? `${query} in ` : ""}${target}`;
+  const title = `${targetLabel(toolTarget(call, result))} · ${names[call.function.name]} · ${query ? `${query} in ` : ""}${target}`;
   const card = disclosure("tool-card", key, false);
   const summary = element("summary", "tool-summary");
   let value = null;
@@ -1847,6 +1864,7 @@ function renderFileTool(call, result, key, options = {}) {
       edit ? action : result ? "Failed" : "Awaiting client"));
   card.append(summary);
   const body = element("div", "tool-details file-edit-details");
+  body.append(element("p", "command-note", `Target: ${targetLabel(toolTarget(call, result))}`));
   body.append(element("p", "file-edit-path", path));
   if (args.reason && !options.grouped) body.append(element("p", "command-reason", args.reason));
   if (edit) {
@@ -1947,6 +1965,7 @@ function renderTool(call, result, key) {
     : args ? formatCommand([args.program, ...args.arguments]) : "Command unavailable";
   const pending = currentDetail?.pending_tool_calls?.find((item) => item.id === call.id);
   const job = commandJobFor(call, result, pending);
+  const target = toolTarget(call, result, pending, job);
   const jobActive = job && ["starting", "running", "unreachable"].includes(job.state);
   const remotePending = currentDetail?.pending_tool_calls?.filter(item => item.ui?.remote) || [];
   const pendingIndex = remotePending.findIndex(item => item.id === call.id);
@@ -1986,6 +2005,7 @@ function renderTool(call, result, key) {
     if (job.stop_requested && jobActive) label = "Stopping";
   }
   const badges = element("span", "command-badges");
+  badges.append(element("span", "command-badge", targetLabel(target)));
   if (result || job) badges.append(approvalBadge(result?.ui?.approval || job?.approval));
   if (!result && pending?.ui?.remote && remotePending.length > 1) {
     badges.append(element("span", "command-badge queue-position",
@@ -1997,6 +2017,7 @@ function renderTool(call, result, key) {
 
   const body = element("div", "tool-details");
   card.dataset.callId = call.id;
+  body.append(element("p", "command-note", `Target: ${targetLabel(target)}`));
   body.append(copyButton(command, "Copy command"), element("pre", "command-full", command));
   if (typeof args?.reason === "string" && args.reason) {
     body.append(element("p", "command-reason", args.reason));
@@ -2011,7 +2032,7 @@ function renderTool(call, result, key) {
     );
     body.append(prefixRow);
     if (!result && pending?.ui?.remote) body.append(element("p", "command-note",
-      `Trust saves this exact prefix for ${currentDetail.runner?.server_ip || currentDetail.client?.server_ip || "the selected server"}. Matching commands can run without asking.`));
+      `Trust saves this exact prefix for ${target.server_ip || "target server"}. Matching commands can run without asking.`));
   }
   if (job) {
     const elapsed = Math.max(0, Math.floor((Date.now() - Date.parse(job.started_at)) / 1000));
@@ -2035,10 +2056,6 @@ function renderTool(call, result, key) {
     body.append(element("pre", "tool-body", output), copyButton(output, "Copy output"));
   } else if (pending?.ui?.remote) {
     if (pending.ui.error) body.append(element("p", "command-note error", pending.ui.error));
-    body.append(element(
-      "p", "command-note",
-      `Target: ${currentDetail.runner?.client_name || currentDetail.client?.name || currentDetail.client?.server_ip || "selected server"}`,
-    ));
     const controls = element("div", "command-actions");
     controls.classList.toggle("approval-actions", pending.ui.state !== "failed");
     const actions = pending.ui.state === "failed"
@@ -3165,10 +3182,14 @@ function renderFileEditsPanel(detail, groups, messages) {
   const fragment = document.createDocumentFragment();
   for (const history of files.values()) {
     const first = history[0];
-    const latest = history.at(-1);
+    const newest = history.at(-1);
+    const latest = [...history].reverse().find(item =>
+      item.result?.ui?.file_edit?.status !== "restored") || newest;
     const edit = latest.result?.ui?.file_edit;
     const grouped = history.length > 1;
-    const total = grouped ? fileTotalFor(detail, first, latest) : null;
+    const total = grouped && edit.status !== "restored"
+      ? fileTotalFor(detail, first, latest)
+      : grouped ? { state: { operation: edit.operation, diff: "", added: 0, removed: 0 } } : null;
     const row = element("div", "file-edit-item");
     const card = renderFileTool(latest.call, latest.result, first.key, {
       grouped, total: total?.state, externalEdit: Boolean(edit),

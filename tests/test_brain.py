@@ -848,19 +848,19 @@ class StoreAndServiceTests(unittest.TestCase):
             self.assertEqual(loaded["cwd"], "/srv/project")
             self.assertEqual(
                 loaded["messages"][-1]["content"],
-                "The commands you run will run on the host host at IP 192.0.2.20. Durable memory is scoped to this runner; do not use memories from other runners.",
+                "The commands you run will run on the host host at IP 192.0.2.20 by default. Use runner_id to target another registered runner.",
             )
             created = store.create(client_id)
             self.assertEqual(
                 created["messages"][-1]["content"],
-                "The commands you run will run on the host host at IP 192.0.2.20. Durable memory is scoped to this runner; do not use memories from other runners.",
+                "The commands you run will run on the host host at IP 192.0.2.20 by default. Use runner_id to target another registered runner.",
             )
             bound = store.create()
             store.bind_client(bound["session_id"], client_id, "/srv/other")
             bound = store.get(bound["session_id"])
             self.assertEqual(
                 bound["messages"][-1]["content"],
-                "The commands you run will run on the host host at IP 192.0.2.20. Durable memory is scoped to this runner; do not use memories from other runners.",
+                "The commands you run will run on the host host at IP 192.0.2.20 by default. Use runner_id to target another registered runner.",
             )
             with self.assertRaises(KeyError):
                 store.complete_runner_enrollment(
