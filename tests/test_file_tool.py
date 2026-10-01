@@ -69,6 +69,35 @@ class FileToolTests(unittest.TestCase):
             self.assertEqual(path.read_text(), "before\n")
             self.assertEqual(path.stat().st_mode & 0o777, 0o640)
 
+    def test_compare_reports_net_change_and_stale_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            path = root / "app.py"
+            path.write_text("value = 1\n", encoding="utf-8")
+            first = file_tool.perform(state, request("a" * 32, root, path.name,
+                "replace", "value = 1", "value = 2"))
+            second = file_tool.perform(state, request("b" * 32, root, path.name,
+                "replace", "value = 2", "value = 3"))
+            total = file_tool.perform(state, {"action": "compare", "edit_id": "a" * 32,
+                "expected_hash": second["edit"]["after_hash"]})
+            self.assertFalse(total["stale"])
+            self.assertEqual((total["added"], total["removed"]), (1, 1))
+            self.assertIn("-value = 1", total["diff"])
+            self.assertIn("+value = 3", total["diff"])
+            self.assertNotIn("value = 2", total["diff"])
+            third = file_tool.perform(state, request("c" * 32, root, path.name,
+                "replace", "value = 3", "value = 1"))
+            unchanged = file_tool.perform(state, {"action": "compare", "edit_id": "a" * 32,
+                "expected_hash": third["edit"]["after_hash"]})
+            self.assertEqual((unchanged["diff"], unchanged["added"], unchanged["removed"]),
+                ("", 0, 0))
+            path.write_text("external\n", encoding="utf-8")
+            stale = file_tool.perform(state, {"action": "compare", "edit_id": "a" * 32,
+                "expected_hash": third["edit"]["after_hash"]})
+            self.assertTrue(stale["stale"])
+            self.assertNotIn("diff", stale)
+
     def test_conflicts_and_non_text_are_left_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -266,6 +295,66 @@ class BrainFileEditTests(unittest.TestCase):
                     service.file_edit_action(session["session_id"], call["id"], {
                         "action": "save", "expected_hash": restored["edit"]["after_hash"],
                         "content": "value = 4\n"})
+
+    def test_total_diff_checks_branch_order_runner_and_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = brain.BrainService(config(root), "system")
+            runner_id = "r" * 32
+            service.store.register_client(runner_id, "user@host", "192.0.2.20")
+            enrollment = service.store.create_runner_enrollment(runner_id)
+            service.store.complete_runner_enrollment(enrollment["token"], "192.0.2.20",
+                runner_id, 8766, "192.0.2.10", str(root))
+            service.store.record_runner_probe(runner_id, success=True, runner_version=6)
+            session = service.store.create(runner_id)
+            target = root / "app.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            messages = session["messages"] + [{"role": "user", "content": "Edit app twice"}]
+            for number, call_id in ((2, "first"), (3, "latest")):
+                call = {"id": call_id, "type": "function", "function": {
+                    "name": "edit_file", "arguments": json.dumps({"path": str(target),
+                        "operation": "replace", "old_text": f"value = {number - 1}",
+                        "new_text": f"value = {number}", "reason": "test"})}}
+                result = file_tool.perform(root / "state", request(
+                    brain.file_request_id(session["session_id"], call_id), root,
+                    target.name, "replace", f"value = {number - 1}", f"value = {number}"))
+                edit = {**result["edit"], "runner_id": runner_id}
+                messages.extend([
+                    {"role": "assistant", "content": None, "tool_calls": [call]},
+                    {"role": "tool", "tool_call_id": call_id,
+                     "content": brain.file_edit_summary(edit), "ui": {"file_edit": edit}},
+                ])
+            messages.append({"role": "assistant", "content": "Done."})
+            service.store.save(session["session_id"], messages, "ready", [], 0)
+            first_edit = next(item["ui"]["file_edit"] for item in messages
+                              if item.get("tool_call_id") == "first")
+            latest_edit = next(item["ui"]["file_edit"] for item in messages
+                               if item.get("tool_call_id") == "latest")
+            with self.assertRaisesRegex(brain.FileToolError, "Update selected runner"):
+                service.runner_file_request(runner_id, {"action": "compare",
+                    "edit_id": first_edit["id"], "expected_hash": latest_edit["after_hash"]})
+            service.store.record_runner_probe(runner_id, success=True,
+                                              runner_version=brain.RUNNER_VERSION)
+            def runner_file_request(_runner_id, payload):
+                try:
+                    return file_tool.perform(root / "state", payload)
+                except file_tool.FileError as error:
+                    raise brain.FileToolError(str(error), error.status) from error
+            with patch.object(service, "runner_file_request", side_effect=runner_file_request):
+                total = service.file_edit_total(session["session_id"], "first", "latest")
+                self.assertIn("+value = 3", total["diff"])
+                self.assertNotIn("value = 2", total["diff"])
+                with self.assertRaisesRegex(brain.FileToolError, "history not found"):
+                    service.file_edit_total(session["session_id"], "latest", "first")
+                with self.assertRaisesRegex(brain.FileToolError, "history not found"):
+                    service.file_edit_total(session["session_id"], "first", "missing")
+                other_session = service.store.create(runner_id)
+                with self.assertRaisesRegex(brain.FileToolError, "history not found"):
+                    service.file_edit_total(other_session["session_id"], "first", "latest")
+                latest_edit["runner_id"] = "s" * 32
+                service.store.save(session["session_id"], messages, "ready", [], 0)
+                with self.assertRaisesRegex(brain.FileToolError, "different runners"):
+                    service.file_edit_total(session["session_id"], "first", "latest")
 
     def test_terminal_file_result_is_saved_for_web_review(self):
         with tempfile.TemporaryDirectory() as directory:

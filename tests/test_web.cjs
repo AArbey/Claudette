@@ -20,6 +20,9 @@ async function openChat(page, fixture, name) {
   await waitText(page, '#connection-text', 'Connected');
   await page.waitForFunction(id => currentDetail?.session_id === id, fixture.sessions[name]);
 }
+async function expandFileCard(card) {
+  if (await card.getAttribute('open') === null) await card.locator('summary').click();
+}
 async function noOverflow(page) {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'page overflow');
   for (const selector of ['.topbar', '#message-form', '#servers', 'dialog[open]']) {
@@ -52,6 +55,19 @@ async function noOverflow(page) {
     page.setDefaultTimeout(10000);
     await openChat(page, fixture, 'main');
     await waitText(page, '#ai-model-value', 'test-model');
+    assert.equal(await page.locator('#file-edits-panel').isVisible(), false);
+    assert.equal(await page.locator('#file-edits-toggle').isVisible(), false);
+    const initialThinking = page.locator('.response-activity').first();
+    assert.equal(await initialThinking.getAttribute('open'), null);
+    const thinkingSummary = initialThinking.locator('.response-activity-summary');
+    const thinkingPreview = await thinkingSummary.innerText();
+    assert.match(thinkingPreview, /Thinking/);
+    assert.match(thinkingPreview, /Checked service availability and recent status/);
+    assert.equal(await initialThinking.locator('.activity-thinking pre').isVisible(), false);
+    await thinkingSummary.click();
+    assert.equal(await initialThinking.locator('.activity-thinking pre').first().textContent(),
+      'Checked service availability and recent status. '.repeat(12));
+    await thinkingSummary.click();
     await page.getByRole('button', { name: 'Configure AI' }).click();
     await waitText(page, '#ai-server-list', 'Main model');
     await page.waitForFunction(() => !aiConfigBusy);
@@ -119,26 +135,26 @@ async function noOverflow(page) {
     await noOverflow(page);
     await page.screenshot({ path: path.join(artifacts, 'research-desktop.png') });
     await page.locator('#research-dialog-close').click();
-    await page.locator('#research-progress').click();
-    await page.locator('#research-dialog[open]').waitFor();
-    await page.locator('#research-dialog-close').click();
+    assert.equal(await page.locator('#research-progress').count(), 0);
     await openChat(page, fixture, 'research_live');
+    assert.equal(await page.locator('#research-dialog[open]').count(), 0);
+    await page.locator('.research-activity-button').click();
     await page.locator('#research-dialog[open]').waitFor();
     await page.locator('#research-stop').waitFor();
     await page.locator('#research-dialog-close').click();
     assert.equal(await page.locator('#research-dialog[open]').count(), 0);
-    await page.locator('#research-progress').click();
+    await page.locator('.research-activity-button').click();
     await page.locator('#research-dialog[open]').waitFor();
     await page.locator('#research-dialog-close').click();
     await openChat(page, fixture, 'research_pending');
-    assert.equal(await page.locator('#research-progress:visible').count(), 0);
+    assert.equal(await page.locator('.research-activity-button').count(), 0);
     await page.evaluate(() => fetch('/fixture/research-start'));
-    await page.locator('#research-dialog[open]').waitFor();
-    await page.locator('#research-dialog-close').click();
-    await page.evaluate(() => fetch('/fixture/research-update'));
-    await waitText(page, '#research-progress-meta', '3 steps');
+    await page.locator('.research-activity-button').waitFor();
     assert.equal(await page.locator('#research-dialog[open]').count(), 0);
-    await page.locator('#research-progress').click();
+    await page.evaluate(() => fetch('/fixture/research-update'));
+    await waitText(page, '.research-activity-button', '3 steps');
+    assert.equal(await page.locator('#research-dialog[open]').count(), 0);
+    await page.locator('.research-activity-button').click();
     await waitText(page, '#research-dialog', 'change log');
     await page.locator('.research-full-chat summary').click();
     const scroll = await page.locator('#research-dialog').evaluate(dialog => {
@@ -339,6 +355,23 @@ async function noOverflow(page) {
       && !currentDetail.active && !sessionState().commandBusy);
     await openChat(page, fixture, 'pending');
     await page.locator('#approval-banner').waitFor();
+    // New reasoning after a tool call must not append to its earlier Thinking block.
+    await page.evaluate(() => {
+      currentDetail.live = {
+        reasoning: '', content: '', transient_messages: [],
+        activity: { phase: 'thinking', tools: [] }, started_at: new Date().toISOString(),
+      };
+      renderDetail(currentDetail);
+      conversationStream.dispatchEvent(new MessageEvent('reasoning', {
+        data: JSON.stringify({ delta: 'Inspect action result.' }),
+      }));
+    });
+    const thinkingBlocks = page.locator('.response-group:last-child .activity-thinking pre');
+    await page.waitForFunction(() => document.querySelectorAll('.response-group:last-child .activity-thinking pre').length === 2);
+    assert.deepEqual(await thinkingBlocks.allTextContents(), [
+      'Inspect current state before changing anything.', 'Inspect action result.',
+    ]);
+    await page.evaluate(() => { currentDetail.live = null; renderDetail(currentDetail); });
     await page.waitForTimeout(3200); // Banner must survive dashboard polling.
     assert.equal(await page.locator('#approval-banner').isVisible(), true);
     await page.locator('#approval-banner').click();
@@ -396,7 +429,7 @@ async function noOverflow(page) {
 
     await page.goto(`${fixture.base}/#servers/127.0.0.1`);
     await page.locator('#server-name').waitFor();
-    await waitText(page, '.runner-version', 'v6 · Latest');
+    await waitText(page, '.runner-version', 'v7 · Latest');
     await page.locator('#server-name').fill('Production renamed');
     await page.getByRole('button', { name: 'Save name', exact: true }).click();
     await waitText(page, '#conversation-title', 'Production renamed');
@@ -407,7 +440,7 @@ async function noOverflow(page) {
     await page.getByRole('button', { name: 'Check now', exact: true }).click();
     await waitText(page, '#servers', 'Check passed');
     await page.getByRole('button', { name: 'Update runner', exact: true }).click();
-    await waitText(page, '#servers', 'Runner updated to v6');
+    await waitText(page, '#servers', 'Runner updated to v7');
     await page.getByRole('button', { name: 'Fix install', exact: true }).click();
     await page.locator('.setup-command').waitFor();
     const fixCommand = await page.locator('.setup-command').innerText();
@@ -467,24 +500,53 @@ async function noOverflow(page) {
     console.log('New conversation, target errors/retry, target changes passed');
 
     await openChat(page, fixture, 'files');
-    const fileCard = page.locator('.file-edit-list .file-edit-card');
+    const filePanel = page.locator('#file-edits-panel');
+    await filePanel.waitFor({ state: 'visible' });
+    const transcriptBounds = await page.locator('#transcript').boundingBox();
+    const panelBounds = await filePanel.boundingBox();
+    assert.ok(panelBounds.x >= transcriptBounds.x + transcriptBounds.width - 1, 'file edits panel sits right of chat');
+    const fileCard = page.locator('#file-edits-list .file-edit-card');
     await fileCard.waitFor();
+    assert.match(await fileCard.locator('summary').innerText(), /sample\.py/);
+    await expandFileCard(fileCard);
     assert.equal(await fileCard.locator('.file-diff .add').count() > 0, true);
-    await fileCard.getByRole('button', { name: 'Edit file' }).click();
+    await filePanel.getByRole('button', { name: 'Edit file' }).click();
     await page.locator('#file-editor-dialog[open]').waitFor();
     assert.equal(await page.locator('#file-editor-content').inputValue(), 'value = 2\n');
     await page.locator('#file-editor-content').fill('value = 3\n');
     await page.locator('#file-editor-save').click();
     await page.locator('#file-editor-dialog').waitFor({ state: 'hidden' });
     await waitText(page, '.file-edit-card', 'Edited by you');
+    await expandFileCard(fileCard);
     assert.equal(await fileCard.locator('.file-diff').innerText().then(text => text.includes('+value = 3')), true);
     await fileCard.getByRole('button', { name: 'Restore original' }).click();
     await page.locator('#confirm-submit').click();
     await page.locator('#confirm-dialog').waitFor({ state: 'hidden' });
     await waitText(page, '.file-edit-card', 'Restored');
     assert.equal(await fileCard.getByRole('button', { name: 'Restore original' }).isDisabled(), true);
+    await openChat(page, fixture, 'multiple_file_edits');
+    const multiRow = page.locator('#file-edits-list .file-edit-item');
+    assert.equal(await multiRow.count(), 1);
+    await waitText(page, '#file-edits-summary', '1 file edited');
+    const multiCard = multiRow.locator('.file-edit-card');
+    await page.waitForFunction(() => document.querySelector('#file-edits-list .file-diff')?.textContent.includes('+value = 3'));
+    const totalDiff = await multiCard.locator('.file-diff').innerText();
+    assert.match(totalDiff, /-value = 1/);
+    assert.match(totalDiff, /\+value = 3/);
+    assert.doesNotMatch(totalDiff, /value = 2/);
+    assert.equal(await multiCard.locator('.file-diff-counts').textContent(), '+1  −1');
+    await multiCard.locator('summary').click();
+    assert.equal(await multiCard.getAttribute('open'), null);
+    const quickEdit = multiRow.getByRole('button', { name: 'Edit file' });
+    assert.equal(await quickEdit.isVisible(), true);
+    await quickEdit.click();
+    await page.locator('#file-editor-dialog[open]').waitFor();
+    assert.equal(await page.locator('#file-editor-content').inputValue(), 'value = 3\n');
+    await page.locator('#file-editor-cancel').click();
+    assert.equal(await multiCard.locator('.file-edit-actions button').textContent(), 'Undo latest edit');
     await openChat(page, fixture, 'created_file');
-    const createdCard = page.locator('.file-edit-list .file-edit-card');
+    const createdCard = page.locator('#file-edits-list .file-edit-card');
+    await expandFileCard(createdCard);
     assert.equal(await createdCard.getByRole('button', { name: 'Restore original' }).count(), 0);
     await createdCard.getByRole('button', { name: 'Delete file' }).click();
     assert.equal(await page.locator('#confirm-title').textContent(), 'Delete file?');
@@ -496,10 +558,19 @@ async function noOverflow(page) {
     for (const width of [320, 390]) {
       await page.setViewportSize({ width, height: 844 });
       await noOverflow(page);
-      await fileCard.getByRole('button', { name: 'Edit file' }).click();
+      await filePanel.waitFor({ state: 'hidden' });
+      const fileToggle = page.getByRole('button', { name: 'File edits', exact: true });
+      assert.equal(await fileToggle.isVisible(), true);
+      await fileToggle.click();
+      await filePanel.waitFor({ state: 'visible' });
+      await noOverflow(page);
+      await expandFileCard(fileCard);
+      await filePanel.getByRole('button', { name: 'Edit file' }).click();
       await page.locator('#file-editor-dialog[open]').waitFor();
       await noOverflow(page);
       await page.locator('#file-editor-cancel').click();
+      await filePanel.getByRole('button', { name: 'Close file edits' }).click();
+      await filePanel.waitFor({ state: 'hidden' });
     }
     console.log('File diff, inline edit, restore, mobile layout passed');
 

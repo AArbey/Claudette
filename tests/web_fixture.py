@@ -167,6 +167,31 @@ with tempfile.TemporaryDirectory(prefix="brain-web-fixture-") as directory:
     ]
     service.store.save(file_session["session_id"], file_messages, "ready", [], 0)
     service.store.set_metadata(file_session["session_id"], {"title": "File edit review"})
+    multi_path = Path(directory) / "multi.py"
+    multi_path.write_text("value = 1\n", encoding="utf-8")
+    multi_session = service.store.create(runner_id)
+    sessions["multiple_file_edits"] = multi_session["session_id"]
+    multi_messages = multi_session["messages"] + [{"role": "user", "content": "Update multi.py twice"}]
+    for number in (2, 3):
+        call = {"id": f"multi_call_{number}", "type": "function", "function": {
+            "name": "edit_file", "arguments": json.dumps({"path": str(multi_path),
+                "operation": "replace", "old_text": f"value = {number - 1}",
+                "new_text": f"value = {number}", "reason": f"Set value to {number}"})}}
+        result = file_tool.perform(file_state, {"action": "apply",
+            "request_id": brain.file_request_id(multi_session["session_id"], call["id"]),
+            "cwd": str(Path(directory)), "path": str(multi_path), "operation": "replace",
+            "old_text": f"value = {number - 1}", "new_text": f"value = {number}",
+            "reason": f"Set value to {number}"})
+        edit = {**result["edit"], "runner_id": runner_id}
+        multi_messages.extend([
+            {"role": "assistant", "content": None, "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": call["id"],
+             "content": brain.file_edit_summary(edit),
+             "ui": {"file_edit": edit, "approval": {"decision": "automatic", "prefix": []}}},
+        ])
+    multi_messages.append({"role": "assistant", "content": "Updated multi.py."})
+    service.store.save(multi_session["session_id"], multi_messages, "ready", [], 0)
+    service.store.set_metadata(multi_session["session_id"], {"title": "Repeated file edits"})
     created_path = Path(directory) / "created.py"
     created_session = service.store.create(runner_id)
     sessions["created_file"] = created_session["session_id"]

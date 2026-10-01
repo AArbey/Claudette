@@ -406,6 +406,18 @@ def perform(root: Path, request):
                 current = read_file(path)
                 return {"ok": True, "edit": record["edit"], "content": current["content"],
                         "hash": digest(current["content"])}
+            if action == "compare":
+                current = read_file(path)
+                current_hash = digest(current["content"])
+                if current_hash != request.get("expected_hash"):
+                    return {"ok": True, "stale": True, "hash": current_hash}
+                before = record["before"]["content"]
+                after = current["content"]
+                return {"ok": True, "stale": False,
+                        "operation": "create" if before is None and after is not None
+                                     else "delete" if before is not None and after is None
+                                     else "replace",
+                        **changes(before, after, record["path"])}
             if action not in {"save", "restore"}:
                 raise FileError("Unsupported file action")
             request_id = identifier(request.get("request_id"))

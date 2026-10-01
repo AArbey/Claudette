@@ -281,6 +281,9 @@ CONVERSATION_COMMAND_RE = re.compile(
 CONVERSATION_FILE_EDIT_RE = re.compile(
     r"^/v1/conversations/([A-Za-z0-9_-]{32})/file-edits/([^/]+)$"
 )
+CONVERSATION_FILE_TOTAL_RE = re.compile(
+    r"^/v1/conversations/([A-Za-z0-9_-]{32})/file-edits/([^/]+)/total/([^/]+)$"
+)
 RUNNER_CHECK_RE = re.compile(
     r"^/v1/runners/([A-Za-z0-9_-]{32})/check$"
 )
@@ -298,7 +301,7 @@ AI_SERVER_MODELS_RE = re.compile(
 )
 
 SCHEMA_VERSION = 12
-RUNNER_VERSION = 6
+RUNNER_VERSION = 7
 MIN_RUNNER_VERSION = 4
 FILE_INSPECT_VERSION = 5
 
@@ -4636,7 +4639,7 @@ class BrainService:
             runner = self.store.get_runner(runner_id)
         except KeyError as error:
             raise FileToolError("Target runner unavailable. Install or repair it to review this file.", 409) from error
-        required_version = FILE_INSPECT_VERSION if payload.get("action") in FILE_INSPECT_NAMES else MIN_RUNNER_VERSION
+        required_version = RUNNER_VERSION if payload.get("action") == "compare" else FILE_INSPECT_VERSION if payload.get("action") in FILE_INSPECT_NAMES else MIN_RUNNER_VERSION
         if runner["runner_version"] is None or runner["runner_version"] < required_version:
             raise FileToolError("Update selected runner to enable this file tool.", 409)
         with self._runner_guard:
@@ -4757,6 +4760,48 @@ class BrainService:
                             session["pending_tool_calls"], session["tool_round"])
             self.live_turns.changed(session_id)
             return {"edit": updated}
+        finally:
+            self.locks.release(session_id, lock)
+
+    def file_edit_total(self, session_id: str, first_call_id: str,
+                        latest_call_id: str) -> dict[str, Any]:
+        lock = self.locks.acquire(session_id)
+        if lock is None:
+            raise FileToolError("Conversation is busy", 409)
+        try:
+            session = self.store.get(session_id)
+            if session["status"] != "ready":
+                raise FileToolError("Conversation is busy", 409)
+            edits = {item.get("tool_call_id"): (index, item["ui"]["file_edit"])
+                     for index, item in enumerate(session["messages"])
+                     if item.get("role") == "tool" and item.get("tool_call_id")
+                     and isinstance(item.get("ui", {}).get("file_edit"), dict)}
+            first_entry = edits.get(first_call_id)
+            latest_entry = edits.get(latest_call_id)
+            if (not first_entry or not latest_entry or first_entry[0] >= latest_entry[0]
+                or first_entry[1]["path"] != latest_entry[1]["path"]):
+                raise FileToolError("File edit history not found in current branch", 404)
+            first = first_entry[1]
+            latest = latest_entry[1]
+            runner_id = first.get("runner_id") or (session.get("client") or {}).get("client_id")
+            latest_runner_id = latest.get("runner_id") or (session.get("client") or {}).get("client_id")
+            if not runner_id or runner_id != latest_runner_id:
+                raise FileToolError("File edits belong to different runners", 409)
+            result = self.runner_file_request(runner_id, {
+                "action": "compare", "edit_id": first["id"],
+                "expected_hash": latest["after_hash"],
+            })
+            if type(result.get("stale")) is not bool:
+                raise FileToolError("Invalid runner file comparison")
+            if result["stale"]:
+                return {"stale": True}
+            if (result.get("operation") not in {"create", "replace", "delete"}
+                or not isinstance(result.get("diff"), str)
+                or len(result["diff"].encode("utf-8")) > 2 * 1024 * 1024
+                or any(type(result.get(key)) is not int or result[key] < 0
+                       for key in ("added", "removed"))):
+                raise FileToolError("Invalid runner file comparison")
+            return {key: result[key] for key in ("operation", "diff", "added", "removed")}
         finally:
             self.locks.release(session_id, lock)
 
@@ -6623,6 +6668,7 @@ class BrainHandler(BaseHTTPRequestHandler):
             or CONVERSATION_PATH_RE.fullmatch(self.path) is not None
             or CONVERSATION_EVENTS_RE.fullmatch(self.path) is not None
             or CONVERSATION_FILE_EDIT_RE.fullmatch(self.path) is not None
+            or CONVERSATION_FILE_TOTAL_RE.fullmatch(self.path) is not None
         )
         if not health_route and not shared_runner_route and web_route != self.server.web:
             self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
@@ -6816,6 +6862,20 @@ class BrainHandler(BaseHTTPRequestHandler):
                 {"servers": servers, "active": active},
                 cache_control="no-store",
             )
+            return
+        file_total_match = CONVERSATION_FILE_TOTAL_RE.fullmatch(self.path)
+        if file_total_match:
+            try:
+                result = self.server.service.file_edit_total(
+                    file_total_match.group(1), unquote(file_total_match.group(2)),
+                    unquote(file_total_match.group(3)))
+            except KeyError:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "conversation not found")
+                return
+            except FileToolError as error:
+                self.send_error_json(HTTPStatus(error.status), str(error))
+                return
+            self.send_json(HTTPStatus.OK, result, cache_control="no-store")
             return
         file_edit_match = CONVERSATION_FILE_EDIT_RE.fullmatch(self.path)
         if file_edit_match:

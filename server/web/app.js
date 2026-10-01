@@ -6,6 +6,13 @@ const countElement = document.querySelector("#conversation-count");
 const connectionDot = document.querySelector("#connection-dot");
 const connectionText = document.querySelector("#connection-text");
 const transcript = document.querySelector("#transcript");
+const chatWorkspace = document.querySelector("#chat-workspace");
+const fileEditsPanel = document.querySelector("#file-edits-panel");
+const fileEditsList = document.querySelector("#file-edits-list");
+const fileEditsToggle = document.querySelector("#file-edits-toggle");
+const fileEditsClose = document.querySelector("#file-edits-close");
+const fileEditsCount = document.querySelector("#file-edits-count");
+const fileEditsTitle = document.querySelector("#file-edits-title");
 const titleElement = document.querySelector("#conversation-title");
 const metaElement = document.querySelector("#conversation-meta");
 const statusBadge = document.querySelector("#status-badge");
@@ -101,15 +108,10 @@ const fileEditorContent = document.querySelector("#file-editor-content");
 const fileEditorFeedback = document.querySelector("#file-editor-feedback");
 const fileEditorSave = document.querySelector("#file-editor-save");
 let fileEditorState = null;
+const fileTotalCache = new Map();
 const researchDialog = document.querySelector("#research-dialog");
 const researchDialogBody = document.querySelector("#research-dialog-body");
 const researchDialogQuestion = document.querySelector("#research-dialog-question");
-const researchProgress = document.querySelector("#research-progress");
-const researchProgressTitle = document.querySelector("#research-progress-title");
-const researchProgressMeta = document.querySelector("#research-progress-meta");
-let visibleResearch = null;
-const researchDismissed = new Set();
-const researchAutoOpened = new Set();
 let webToolsConfig = null;
 
 const confirmDialog = document.querySelector("#confirm-dialog");
@@ -258,7 +260,7 @@ function sessionState(id = selectedId) {
   if (!sessionStates.has(id)) sessionStates.set(id, {
     messageBusy: false, stopBusy: false, branchBusy: false, commandBusy: false, actionBusy: false, fileBusy: false,
     failure: "", feedback: "", notice: "", nextCommandId: "", editingMessageIndex: null,
-    editingMessageDraft: "", references: [], answersOnly: null, answersKey: "",
+    editingMessageDraft: "", references: [], answersOnly: null, answersKey: "", filePanelOpen: null,
   });
   return sessionStates.get(id);
 }
@@ -1338,7 +1340,6 @@ function renderView() {
   memoriesViewButton.setAttribute("aria-pressed", String(showMemories));
   showFeedback(showConversations ? sessionState().feedback : "");
   approvalBanner.classList.toggle("hidden", !showConversations || !currentDetail?.pending_tool_calls?.some(call => call.ui?.remote));
-  researchProgress.classList.toggle("hidden", !showConversations || !visibleResearch);
   if (!showConversations) {
     responseStatus.classList.add("hidden");
     responseStatus.textContent = "";
@@ -1358,7 +1359,9 @@ function renderView() {
   newConversationButton.classList.toggle("hidden", !showConversations);
   addServerButton.classList.toggle("hidden", !showServerPolicies);
   newMemoryButton.classList.toggle("hidden", !showMemories);
+  chatWorkspace.classList.toggle("hidden", !showConversations);
   transcript.classList.toggle("hidden", !showConversations);
+  fileEditsToggle.classList.toggle("hidden", !showConversations || !fileEditsList.childElementCount);
   messageForm.classList.toggle("hidden", !showConversations || !currentDetail);
   serversElement.classList.toggle("hidden", !showServerPolicies);
   memoriesElement.classList.toggle("hidden", !showMemories);
@@ -1540,7 +1543,8 @@ function renderWebTool(call, result, key) {
     if (data.text) body.append(element("pre", "tool-body", data.text));
     if (data.truncated) body.append(element("p", "command-note", "Text truncated at 100,000 characters."));
   } else if (name === "deep_research") {
-    const trace = result?.ui?.research;
+    const trace = result?.ui?.research
+      || (currentDetail?.live?.research?.call_id === call.id ? currentDetail.live.research : null);
     if (trace) {
       body.append(element("p", "command-note", `${trace.steps?.length || 0} steps · ${trace.sources?.length || 0} sources`));
       const button = element("button", "research-open-button", "Open research chat");
@@ -1639,21 +1643,9 @@ function syncResearchDialog(detail) {
     message.role === "tool" && message.ui?.research);
   const trace = live || saved?.ui.research;
   const callId = live?.call_id || saved?.tool_call_id;
-  visibleResearch = trace && callId ? {trace, callId, sessionId: detail.session_id} : null;
-  researchProgress.classList.toggle("hidden", !visibleResearch);
-  if (visibleResearch) {
-    researchProgressTitle.textContent = live ? "Deep research in progress" : "Deep research";
-    researchProgressMeta.textContent = `${trace.steps?.length || 0} steps · ${trace.sources?.length || 0} sources`;
-    researchProgress.classList.toggle("running", trace.status === "running");
-  }
   if (researchDialog.open && (researchDialog.dataset.sessionId !== detail.session_id ||
       researchDialog.dataset.callId !== callId)) researchDialog.close();
-  if (!visibleResearch) return;
-  const key = `${detail.session_id}:${callId}`;
-  if (live && !researchDialog.open && !researchDismissed.has(key) && !researchAutoOpened.has(key)) {
-    researchAutoOpened.add(key);
-    openResearchDialog(trace, callId, detail.session_id);
-  } else if (researchDialog.open) renderResearchDialog(trace);
+  if (trace && callId && researchDialog.open) renderResearchDialog(trace);
 }
 
 function approvalBadge(approval) {
@@ -1765,6 +1757,10 @@ function fileEditPath(sessionId, callId) {
   return `/v1/conversations/${encodeURIComponent(sessionId)}/file-edits/${encodeURIComponent(callId)}`;
 }
 
+function fileTotalPath(sessionId, firstCallId, latestCallId) {
+  return `${fileEditPath(sessionId, firstCallId)}/total/${encodeURIComponent(latestCallId)}`;
+}
+
 async function refreshFileConversation(sessionId) {
   const detail = await getJson(`/v1/conversations/${encodeURIComponent(sessionId)}`);
   if (currentDetail?.session_id === sessionId) {
@@ -1811,16 +1807,16 @@ async function applyFileAction(sessionId, callId, body) {
   }
 }
 
-function confirmFileRestore(callId, edit, returnFocus) {
+function confirmFileRestore(callId, edit, returnFocus, grouped = false) {
   const sessionId = currentDetail?.session_id;
   if (!sessionId) return;
   const created = edit.operation === "create";
   openConfirmation({
-    title: created ? "Delete file?" : "Restore original file?",
-    description: created
-      ? `Delete ${edit.path}, created by this edit?`
+    title: grouped ? "Undo latest edit?" : created ? "Delete file?" : "Restore original file?",
+    description: grouped ? `Restore ${edit.path} to its state before the latest edit?`
+      : created ? `Delete ${edit.path}, created by this edit?`
       : `Restore puts ${edit.path} back as it was before this edit.`,
-    confirmLabel: created ? "Delete file" : "Restore original",
+    confirmLabel: grouped ? "Undo latest edit" : created ? "Delete file" : "Restore original",
     returnFocus,
     run: () => applyFileAction(sessionId, callId, {
       action: "restore", expected_hash: edit.after_hash,
@@ -1828,50 +1824,75 @@ function confirmFileRestore(callId, edit, returnFocus) {
   });
 }
 
-function renderFileTool(call, result, key) {
+function renderFileTool(call, result, key, options = {}) {
   const args = fileToolArguments(call) || {};
   const edit = result?.ui?.file_edit;
+  const total = options.grouped ? options.total : edit;
   const path = edit?.path || args.path || "File unavailable";
+  const filename = path.split(/[/\\]/).filter(Boolean).at(-1) || path;
   const card = disclosure("tool-card file-edit-card", key, Boolean(edit));
   card.dataset.callId = call.id;
   const summary = element("summary", "tool-summary");
-  const action = edit?.status === "restored" ? (edit.operation === "create" ? "Deleted" : "Restored")
+  const action = options.grouped
+    ? !total || total.loading ? "Loading" : total.error || total.stale ? "Unavailable"
+      : !total.diff ? "No changes" : total.operation === "create" ? "Created"
+      : total.operation === "delete" ? "Deleted" : edit?.manually_edited ? "Edited by you" : "Edited"
+    : edit?.status === "restored" ? (edit.operation === "create" ? "Deleted" : "Restored")
     : edit?.manually_edited ? "Edited by you"
     : edit?.operation === "create" ? "Created" : edit?.operation === "delete" ? "Deleted" : "Edited";
-  summary.append(element("code", "command-line", path),
+  const pathLabel = element("code", "command-line", filename);
+  pathLabel.title = path;
+  summary.append(pathLabel,
     element("span", `command-badge ${edit ? "success" : result ? "failed" : "pending"}`,
       edit ? action : result ? "Failed" : "Awaiting client"));
   card.append(summary);
   const body = element("div", "tool-details file-edit-details");
-  if (args.reason) body.append(element("p", "command-reason", args.reason));
+  body.append(element("p", "file-edit-path", path));
+  if (args.reason && !options.grouped) body.append(element("p", "command-reason", args.reason));
   if (edit) {
-    const counts = element("p", "file-diff-counts", `+${edit.added}  −${edit.removed}`);
-    body.append(counts);
-    if (edit.diff) {
-      const diff = element("pre", "file-diff");
-      const lines = edit.diff.split("\n");
-      if (lines.length <= 5000) {
-        const fragment = document.createDocumentFragment();
-        lines.forEach((line, index) => {
-          const className = index < 2 ? "header" : line.startsWith("+") ? "add"
-            : line.startsWith("-") ? "remove" : line.startsWith("@@") ? "hunk" : "";
-          fragment.append(element("span", className, line + "\n"));
-        });
-        diff.append(fragment);
-      } else diff.textContent = edit.diff;
-      body.append(diff, copyButton(edit.diff, "Copy diff"));
-    } else body.append(element("p", "command-note", edit.operation === "create" && edit.status === "restored"
-      ? "File deleted." : "File matches original version."));
+    if (total && !total.loading && !total.error && !total.stale) {
+      body.append(element("p", "file-diff-counts", `+${total.added}  −${total.removed}`));
+      if (total.diff) {
+        const diff = element("pre", "file-diff");
+        const lines = total.diff.split("\n");
+        if (lines.length <= 5000) {
+          const fragment = document.createDocumentFragment();
+          lines.forEach((line, index) => {
+            const className = index < 2 ? "header" : line.startsWith("+") ? "add"
+              : line.startsWith("-") ? "remove" : line.startsWith("@@") ? "hunk" : "";
+            fragment.append(element("span", className, line + "\n"));
+          });
+          diff.append(fragment);
+        } else diff.textContent = total.diff;
+        body.append(diff, copyButton(total.diff, "Copy diff"));
+      } else body.append(element("p", "command-note", options.grouped
+        ? "No net change from first edit." : edit.operation === "create" && edit.status === "restored"
+          ? "File deleted." : "File matches original version."));
+    } else {
+      body.append(element("p", `command-note ${total?.error || total?.stale ? "error" : ""}`,
+        total?.stale ? "File changed outside tracked edits. Total change unavailable."
+          : total?.error || "Calculating total change…"));
+      if (total?.error || total?.stale) {
+        const retry = element("button", "", "Retry total change");
+        retry.type = "button";
+        retry.addEventListener("click", () => options.retry?.());
+        body.append(retry);
+      }
+    }
     const actions = element("div", "file-edit-actions");
-    const editButton = element("button", "", "Edit file");
-    editButton.type = "button";
-    editButton.disabled = Boolean(currentDetail?.active || currentDetail?.archived || sessionState().fileBusy);
-    editButton.addEventListener("click", () => void openFileEditor(call.id, edit));
-    const restoreButton = element("button", "danger", edit.operation === "create" ? "Delete file" : "Restore original");
+    if (!options.externalEdit) {
+      const editButton = element("button", "", "Edit file");
+      editButton.type = "button";
+      editButton.disabled = Boolean(currentDetail?.active || currentDetail?.archived || sessionState().fileBusy);
+      editButton.addEventListener("click", () => void openFileEditor(call.id, edit));
+      actions.append(editButton);
+    }
+    const restoreButton = element("button", "danger", options.grouped ? "Undo latest edit"
+      : edit.operation === "create" ? "Delete file" : "Restore original");
     restoreButton.type = "button";
     restoreButton.disabled = edit.status === "restored" || Boolean(currentDetail?.active || currentDetail?.archived || sessionState().fileBusy);
-    restoreButton.addEventListener("click", () => confirmFileRestore(call.id, edit, restoreButton));
-    actions.append(editButton, restoreButton);
+    restoreButton.addEventListener("click", () => confirmFileRestore(call.id, edit, restoreButton, options.grouped));
+    actions.append(restoreButton);
     body.append(actions);
   } else if (result) body.append(element("p", "command-note error", result.content || "File edit failed."));
   else body.append(element("p", "command-note", "File edit pending in terminal."));
@@ -2874,11 +2895,54 @@ function responseKey(detail, group, position) {
   return `${detail.session_id}:${detail.active_branch_id || "legacy"}:${id}`;
 }
 
-function appendReasoningBlock(container, text) {
+function appendReasoningBlock(container, text, live = false) {
   if (!text) return;
   const block = element("div", "activity-thinking");
+  if (live) block.dataset.liveReasoning = "true";
   block.append(element("strong", "", "Thinking"), element("pre", "", text));
   container.append(block);
+}
+
+function thinkingPreview(value) {
+  const plain = (value || "").replace(/\s+/g, " ").replace(/^[#>*\-\s]+/, "").trim();
+  if (!plain) return "";
+  const sentence = plain.match(/^.{1,140}?[.!?](?=\s|$)/)?.[0];
+  const excerpt = sentence || plain.slice(0, 145).trimEnd();
+  return excerpt.length < plain.length && !/[.!?]$/.test(excerpt) ? excerpt + "…" : excerpt;
+}
+
+function updateLiveProcessSummary() {
+  if (!currentDetail?.live) return;
+  const line = transcript.querySelector(".response-group:last-child .process-summary-text");
+  if (!line) return;
+  const preview = thinkingPreview(currentDetail.live.reasoning);
+  if (!preview && line.dataset.hasReasoning === "true") return;
+  line.textContent = [preview || activityLabel(currentDetail.live.activity, currentDetail.live.started_at),
+    line.dataset.facts].filter(Boolean).join(" · ");
+  if (preview) line.dataset.hasReasoning = "true";
+}
+
+function processFacts(calls) {
+  const labels = {
+    deep_research: ["deep research", "deep research runs"],
+    search_searxng: ["web search", "web searches"],
+    load_web_page: ["page read", "pages read"],
+    find_files: ["file search", "file searches"],
+    search_text: ["text search", "text searches"],
+    read_file: ["file read", "files read"],
+    edit_file: ["file edit", "file edits"],
+    save_memory: ["memory saved", "memories saved"],
+    recall_memory: ["memory lookup", "memory lookups"],
+    delete_memory: ["memory deleted", "memories deleted"],
+    command: ["command", "commands"],
+  };
+  const counts = new Map();
+  for (const call of calls) {
+    const name = call.function?.name || "command";
+    const label = labels[name] || labels.command;
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  return [...counts].map(([label, count]) => count + " " + label[count === 1 ? 0 : 1]);
 }
 
 function renderResponseGroup(detail, group, position, isLast) {
@@ -2897,7 +2961,8 @@ function renderResponseGroup(detail, group, position, isLast) {
   const results = group.entries.filter(entry => entry.message.role === "tool").map(entry => entry.message);
   const pendingIds = new Set((detail.pending_tool_calls || []).filter(call => call.ui?.remote).map(call => call.id));
   const activityBody = element("div", "response-activity-body");
-  const fileCards = element("div", "file-edit-list");
+  let fileEditCount = 0;
+  const processCalls = [];
   let activityCount = 0;
 
   for (const entry of assistants) {
@@ -2914,9 +2979,9 @@ function renderResponseGroup(detail, group, position, isLast) {
     }
     const completedCalls = (message.tool_calls || []).filter(call => !pendingIds.has(call.id));
     for (const [callIndex, call] of completedCalls.entries()) {
+      processCalls.push(call);
       if (call.function?.name === "edit_file") {
-        fileCards.append(renderFileTool(call, results.find(result => result.tool_call_id === call.id),
-          `${key}:file:${entry.index}:${callIndex}`));
+        fileEditCount += 1;
         continue;
       }
       activityBody.append(renderTool(
@@ -2930,7 +2995,7 @@ function renderResponseGroup(detail, group, position, isLast) {
 
   const live = isLast ? detail.live : null;
   if (live?.reasoning) {
-    appendReasoningBlock(activityBody, live.reasoning);
+    appendReasoningBlock(activityBody, live.reasoning, true);
     activityCount += 1;
   }
   if (live) {
@@ -2939,23 +3004,73 @@ function renderResponseGroup(detail, group, position, isLast) {
     activityCount += 1;
   }
 
+  if (live?.research?.call_id && !processCalls.some(call => call.id === live.research.call_id)) {
+    const callId = live.research.call_id;
+    const researchLink = element("button", "activity-file-link research-activity-button");
+    researchLink.type = "button";
+    researchLink.dataset.focus = `research:${callId}`;
+    researchLink.setAttribute("aria-haspopup", "dialog");
+    researchLink.setAttribute("aria-controls", "research-dialog");
+    researchLink.append(
+      element("span", "activity-file-icon", "⌕"),
+      element("span", "", "Deep research"),
+      element("span", "activity-file-count",
+        `${live.research.steps?.length || 0} steps · ${live.research.sources?.length || 0} sources`),
+      element("span", "activity-file-arrow", "›"),
+    );
+    researchLink.addEventListener("click", () => {
+      const trace = currentDetail?.live?.research;
+      if (trace?.call_id === callId)
+        openResearchDialog(trace, callId, currentDetail.session_id);
+    });
+    activityBody.append(researchLink);
+    activityCount += 1;
+  }
+
+  if (fileEditCount) {
+    const fileLink = element("button", "activity-file-link");
+    fileLink.type = "button";
+    fileLink.append(
+      element("span", "activity-file-icon", "⌘"),
+      element("span", "", fileEditCount === 1 ? "Edited file" : "Edited files"),
+      element("span", "activity-file-count", fileEditCount + (fileEditCount === 1 ? " edit" : " edits")),
+      element("span", "activity-file-arrow", "›"),
+    );
+    fileLink.addEventListener("click", () => setFilePanelOpen(true));
+    activityBody.append(fileLink);
+    activityCount += 1;
+  }
+
   if (activityCount) {
     const activeJob = detail.command_jobs?.some(job =>
       ["starting", "running", "unreachable"].includes(job.state)
       && assistants.some(entry => entry.message.tool_calls?.some(call => call.id === job.tool_call_id)));
     const activity = activityDisclosure(`${key}:activity`, Boolean(live || activeJob));
-    const count = activityBody.querySelectorAll(".tool-card").length;
+    const facts = processFacts(processCalls);
+    const reasoning = assistants.map(entry => entry.message.ui?.reasoning || "").filter(Boolean).join("\n")
+      + (live?.reasoning ? "\n" + live.reasoning : "");
+    const preview = thinkingPreview(reasoning);
+    const summaryText = preview ? [preview, ...facts].join(" · ")
+      : live ? [activityLabel(live.activity, live.started_at), ...facts].join(" · ")
+      : facts.join(" · ") || "Process details available";
+    const status = live || activeJob ? "Working" : stoppedEntry ? "Stopped"
+      : finalEntry ? "Completed" : pendingIds.size ? "Needs review" : "Finished";
     const summary = element("summary", "response-activity-summary");
+    const copy = element("span", "process-copy");
+    const summaryLine = element("span", "process-summary-text", summaryText);
+    summaryLine.dataset.facts = facts.join(" · ");
+    summaryLine.dataset.hasReasoning = String(Boolean(preview));
+    copy.append(element("strong", "process-title", "Thinking process"), summaryLine);
     summary.append(
-      element("span", "", live ? activityLabel(live.activity, live.started_at) : "Activity"),
-      element("span", "activity-count", count ? `${count} ${count === 1 ? "action" : "actions"}` : ""),
+      element("span", "process-icon", status === "Completed" ? "✓" : status === "Stopped" ? "■" : "⌁"),
+      copy,
+      element("span", "process-status " + status.toLowerCase().replace(" ", "-"), status),
+      element("span", "process-chevron", "⌄"),
     );
     activity.append(summary, activityBody);
     activity.classList.toggle("answers-only-hidden", answersOnlyEnabled(detail) && !activeJob);
     section.append(activity);
   }
-
-  if (fileCards.childNodes.length) section.append(fileCards);
 
   for (const entry of group.entries.filter(entry => entry.message.role === "system")) {
     section.append(renderMessage(entry.message, entry.index));
@@ -2982,6 +3097,119 @@ function renderResponseGroup(detail, group, position, isLast) {
   return fragment;
 }
 
+function syncFilePanel(open, hasEdits) {
+  const visible = Boolean(open && hasEdits && currentView === "conversations");
+  chatWorkspace.classList.toggle("panel-open", visible);
+  fileEditsPanel.classList.toggle("hidden", !visible);
+  fileEditsToggle.classList.toggle("hidden", !hasEdits || currentView !== "conversations");
+  fileEditsToggle.classList.toggle("selected", visible);
+  fileEditsToggle.setAttribute("aria-expanded", String(visible));
+}
+
+function setFilePanelOpen(open) {
+  if (!currentDetail || !fileEditsList.childElementCount) return;
+  sessionState(currentDetail.session_id).filePanelOpen = Boolean(open);
+  syncFilePanel(open, true);
+  (open ? fileEditsClose : fileEditsToggle).focus({ preventScroll: true });
+}
+
+function fileTotalFor(detail, first, latest) {
+  const firstEdit = first.result.ui.file_edit;
+  const latestEdit = latest.result.ui.file_edit;
+  const key = JSON.stringify([detail.session_id, first.call.id, latest.call.id,
+    firstEdit.before_hash, latestEdit.after_hash]);
+  let state = fileTotalCache.get(key);
+  if (!state && detail.status === "ready") {
+    state = { loading: true };
+    fileTotalCache.set(key, state);
+    if (fileTotalCache.size > 100) fileTotalCache.delete(fileTotalCache.keys().next().value);
+    void getJson(fileTotalPath(detail.session_id, first.call.id, latest.call.id))
+      .then(total => fileTotalCache.set(key, total))
+      .catch(error => fileTotalCache.set(key, { error: error.message || "Total change unavailable." }))
+      .finally(() => {
+        if (currentDetail?.session_id === detail.session_id) renderDetail(currentDetail);
+      });
+  }
+  return { key, state: state || { loading: true } };
+}
+
+function renderFileEditsPanel(detail, groups, messages) {
+  rememberDisclosures(fileEditsList);
+  const oldScroll = fileEditsList.scrollTop;
+  const focused = fileEditsList.contains(document.activeElement) ? document.activeElement : null;
+  const focusedKey = focused?.closest(".file-edit-item[data-key]")?.dataset.key;
+  const focusedName = focused?.getAttribute("aria-label") || focused?.textContent?.trim();
+  const results = new Map(messages.filter(message => message.role === "tool" && message.tool_call_id)
+    .map(message => [message.tool_call_id, message]));
+  const edits = [];
+  groups.forEach((group, position) => {
+    const key = responseKey(detail, group, position);
+    for (const entry of group.entries) {
+      for (const [callIndex, call] of (entry.message.tool_calls || []).entries()) {
+        if (call.function?.name !== "edit_file") continue;
+        edits.push({
+          call,
+          result: results.get(call.id),
+          key: key + ":file:" + entry.index + ":" + callIndex,
+        });
+      }
+    }
+  });
+  const files = new Map();
+  for (const item of edits) {
+    const edit = item.result?.ui?.file_edit;
+    const key = edit ? JSON.stringify([edit.runner_id || "", edit.path]) : `pending:${item.call.id}`;
+    if (!files.has(key)) files.set(key, []);
+    files.get(key).push(item);
+  }
+  const fragment = document.createDocumentFragment();
+  for (const history of files.values()) {
+    const first = history[0];
+    const latest = history.at(-1);
+    const edit = latest.result?.ui?.file_edit;
+    const grouped = history.length > 1;
+    const total = grouped ? fileTotalFor(detail, first, latest) : null;
+    const row = element("div", "file-edit-item");
+    const card = renderFileTool(latest.call, latest.result, first.key, {
+      grouped, total: total?.state, externalEdit: Boolean(edit),
+      retry: () => {
+        fileTotalCache.delete(total.key);
+        if (currentDetail?.session_id === detail.session_id) renderDetail(currentDetail);
+      },
+    });
+    row.dataset.key = card.dataset.key;
+    row.append(card);
+    if (edit) {
+      const editButton = element("button", "file-edit-quick-action", "Edit file");
+      editButton.type = "button";
+      editButton.disabled = Boolean(detail.active || detail.archived || sessionState(detail.session_id).fileBusy);
+      editButton.addEventListener("click", () => void openFileEditor(latest.call.id, edit));
+      row.append(editButton);
+    }
+    fragment.append(row);
+  }
+  fileEditsList.replaceChildren(fragment);
+  fileEditsList.scrollTop = oldScroll;
+  if (focusedKey) {
+    const row = [...fileEditsList.querySelectorAll(".file-edit-item[data-key]")]
+      .find(node => node.dataset.key === focusedKey);
+    const target = focused?.tagName === "SUMMARY" ? row?.querySelector("summary")
+      : [...(row?.querySelectorAll("button") || [])].find(button =>
+        (button.getAttribute("aria-label") || button.textContent.trim()) === focusedName);
+    target?.focus({ preventScroll: true });
+  }
+  const count = files.size;
+  const allApplied = [...files.values()].every(history => history.at(-1).result?.ui?.file_edit);
+  fileEditsCount.textContent = String(count);
+  fileEditsTitle.textContent = detail.title || "Current conversation";
+  document.querySelector("#file-edits-summary").textContent = count
+    + (allApplied ? count === 1 ? " file edited" : " files edited"
+      : count === 1 ? " file edit" : " file edits");
+  const state = sessionState(detail.session_id);
+  const open = state.filePanelOpen ?? window.matchMedia("(min-width: 1200px)").matches;
+  syncFilePanel(open, count > 0);
+}
+
 function renderDetail(detail) {
   const state = sessionState(detail.session_id);
   rememberDisclosures(transcript);
@@ -3006,6 +3234,7 @@ function renderDetail(detail) {
     fragment.append(emptyState("Start here", "Send a message below. Choose a target above to enable approved commands."));
   }
   transcript.replaceChildren(fragment);
+  renderFileEditsPanel(detail, groups, messages);
   if (focusedKey) {
     const restored = [...document.querySelectorAll("details[data-key]")]
       .find((details) => details.dataset.key === focusedKey);
@@ -3315,6 +3544,8 @@ async function refreshList() {
       actionsElement.classList.add("hidden");
       messageForm.classList.add("hidden");
       transcript.replaceChildren(emptyState("Your next conversation starts here", "Ask a question, or connect a server to work with approved commands.", true));
+      fileEditsList.replaceChildren();
+      syncFilePanel(false, false);
     }
     renderView();
   } catch (_error) {
@@ -3334,8 +3565,6 @@ function closeConversationStream() {
   conversationStream = null;
   streamedSessionId = null;
   if (researchDialog.open) researchDialog.close();
-  researchProgress.classList.add("hidden");
-  visibleResearch = null;
   currentDetail = null;
 }
 
@@ -3350,6 +3579,7 @@ function refreshDetail() {
   metaElement.textContent = "Connecting to conversation…";
   statusBadge.classList.add("hidden");
   transcript.replaceChildren(emptyState("Loading conversation", "Connecting to live updates…"));
+  syncFilePanel(false, false);
   streamedSessionId = selectedId;
   const stream = new EventSource(`/v1/conversations/${encodeURIComponent(selectedId)}/events`);
   conversationStream = stream;
@@ -3378,7 +3608,7 @@ function refreshDetail() {
           streamDeltas[type] = "";
           if (!chunk) continue;
           const target = type === "reasoning"
-            ? transcript.querySelector(".response-group:last-child .activity-thinking:last-of-type pre")
+            ? transcript.querySelector('.response-group:last-child .activity-thinking[data-live-reasoning="true"] pre')
             : transcript.querySelector('[data-live="true"] .message-content');
           if (target) target.append(document.createTextNode(chunk));
           else needsRender = true;
@@ -3388,6 +3618,7 @@ function refreshDetail() {
           if (follow) transcript.scrollTop = transcript.scrollHeight;
           updateJump();
         }
+        updateLiveProcessSummary();
       });
     });
   }
@@ -3399,13 +3630,12 @@ function refreshDetail() {
     responseStatus.classList.remove("hidden");
     const liveState = transcript.querySelector(".live-activity-state");
     if (liveState) liveState.textContent = label;
-    const summary = transcript.querySelector(".response-group:last-child .response-activity-summary span");
-    if (summary) summary.textContent = label;
+    updateLiveProcessSummary();
   });
   stream.addEventListener("research", event => {
     if (conversationStream !== stream || !currentDetail?.live) return;
     currentDetail.live.research = JSON.parse(event.data);
-    syncResearchDialog(currentDetail);
+    renderDetail(currentDetail);
   });
   stream.addEventListener("command", event => {
     if (conversationStream !== stream || !currentDetail) return;
@@ -3591,6 +3821,8 @@ headerNewConversationButton.addEventListener("click", () => {
   else if (currentView === "memories") openMemoryDialog();
   else void openNewConversation();
 });
+fileEditsToggle.addEventListener("click", () => setFilePanelOpen(fileEditsPanel.classList.contains("hidden")));
+fileEditsClose.addEventListener("click", () => setFilePanelOpen(false));
 addServerButton.addEventListener("click", () => void openAddServer());
 newMemoryButton.addEventListener("click", () => openMemoryDialog());
 function selectSettingsTab(name, focus = false) {
@@ -3676,17 +3908,8 @@ aiServerForm.addEventListener("submit", async event => {
     aiServerSave.disabled = false;
   }
 });
-researchProgress.addEventListener("click", () => {
-  if (visibleResearch && currentDetail?.session_id === visibleResearch.sessionId)
-    openResearchDialog(visibleResearch.trace, visibleResearch.callId, visibleResearch.sessionId);
-});
 document.querySelector("#research-dialog-close").addEventListener("click", () => researchDialog.close());
 document.querySelector("#research-stop").addEventListener("click", () => messageStop.click());
-researchDialog.addEventListener("close", () => {
-  if (researchDialog.dataset.callId && researchDialog.dataset.sessionId) {
-    researchDismissed.add(`${researchDialog.dataset.sessionId}:${researchDialog.dataset.callId}`);
-  }
-});
 webToolsForm.addEventListener("submit", async event => {
   event.preventDefault();
   if (webToolsSave.disabled) return;
@@ -4072,6 +4295,11 @@ document.addEventListener("keydown", event => {
   }
 });
 window.addEventListener("resize", positionModelPicker);
+matchMedia("(min-width: 1200px)").addEventListener("change", event => {
+  if (!currentDetail || currentView !== "conversations") return;
+  if (sessionState(currentDetail.session_id).filePanelOpen === null)
+    syncFilePanel(event.matches, fileEditsList.childElementCount > 0);
+});
 aiConfigDialog.addEventListener("scroll", positionModelPicker, { passive: true });
 matchMedia("(max-width: 899px)").addEventListener("change", () => setSidebar(false, false));
 setInterval(() => {
@@ -4080,8 +4308,7 @@ setInterval(() => {
   responseStatus.textContent = label;
   const liveState = transcript.querySelector(".live-activity-state");
   if (liveState) liveState.textContent = label;
-  const summary = transcript.querySelector(".response-activity[open] > .response-activity-summary span");
-  if (summary) summary.textContent = label;
+  updateLiveProcessSummary();
 }, 1000);
 setSidebar(false, false);
 renderView();

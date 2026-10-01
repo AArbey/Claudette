@@ -69,6 +69,10 @@
           <p id="conversation-meta">Select conversation to inspect it.</p>
         </div>
         <button id="header-new-conversation" class="header-new-conversation" type="button" aria-label="New conversation" title="New conversation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>New chat</span></button>
+        <button id="file-edits-toggle" class="file-edits-toggle hidden" type="button" aria-label="File edits" aria-controls="file-edits-panel" aria-expanded="false" title="File edits">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10Z"/><path d="M13 3v7h7M8 15h8M8 18h5"/></svg>
+          <span>File edits</span><span id="file-edits-count" class="file-edits-toggle-count">0</span>
+        </button>
         </div>
         <div class="topbar-context">
         <button id="ai-config-button" class="ai-config-button" type="button" aria-label="Configure AI">
@@ -103,42 +107,50 @@
       <div id="page-feedback" class="feedback hidden" role="alert"></div>
       <button id="connection-retry" class="connection-retry hidden" type="button">Connection lost · Retry</button>
       <button id="approval-banner" class="approval-banner hidden" type="button"></button>
-      <button id="research-progress" class="research-progress hidden" type="button" aria-haspopup="dialog" aria-controls="research-dialog" aria-label="Open deep research progress">
-        <span class="research-progress-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5M8 10.5h5M10.5 8v5"/></svg></span>
-        <span class="research-progress-copy"><strong id="research-progress-title">Deep research</strong><small id="research-progress-meta"></small></span>
-        <span class="research-progress-action">View progress <span aria-hidden="true">→</span></span>
-      </button>
 
       <section id="servers" class="servers hidden" aria-label="Server command policies"></section>
       <section id="memories" class="memories hidden" aria-label="Runner memories"></section>
 
-      <section id="transcript" class="transcript" aria-label="Conversation transcript">
-        <div class="empty-state">
-          <div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-2 2v-9.5a7.5 7.5 0 0 1 7.5-7.5h2A7.5 7.5 0 0 1 20 11.5Z"/><path d="M8 10h8M8 14h5"/></svg></div>
-          <h3>Start a conversation</h3>
-          <p>Ask Brain a question, or choose a server for approved commands.</p>
-        </div>
-      </section>
+      <div id="chat-workspace" class="chat-workspace">
+        <div class="chat-column">
+          <section id="transcript" class="transcript" aria-label="Conversation transcript">
+            <div class="empty-state">
+              <div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-2 2v-9.5a7.5 7.5 0 0 1 7.5-7.5h2A7.5 7.5 0 0 1 20 11.5Z"/><path d="M8 10h8M8 14h5"/></svg></div>
+              <h3>Start a conversation</h3>
+              <p>Ask Brain a question, or choose a server for approved commands.</p>
+            </div>
+          </section>
 
-      <button id="jump-latest" class="jump-latest hidden" type="button">↓ Jump to latest</button>
-      <div id="response-status" class="response-status hidden" role="status" aria-live="polite"></div>
-      <form id="message-form" class="composer hidden">
-        <label class="sr-only" for="message-input">Continue conversation</label>
-        <button id="context-add" class="context-add" type="button" aria-label="Add context">+</button>
-        <textarea id="message-input" rows="1" maxlength="100000"
-          placeholder="Message"></textarea>
-        <button id="message-send" type="submit">Send</button>
-        <button id="message-stop" class="message-stop hidden" type="button"
-          aria-label="Stop generating" title="Stop generating">
-          <span aria-hidden="true"></span>
-        </button>
-        <div id="context-references" class="context-references hidden" aria-label="Attached context"></div>
-        <p id="message-hint" class="composer-hint" role="status"></p>
-        <div id="context-meter" class="context-meter" role="progressbar" aria-label="Estimated context usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
-          <span class="context-meter-track"><span id="context-meter-fill" class="context-meter-fill"></span></span>
-          <span id="context-meter-label" class="context-meter-label"></span>
+          <button id="jump-latest" class="jump-latest hidden" type="button">↓ Jump to latest</button>
+          <div id="response-status" class="response-status hidden" role="status" aria-live="polite"></div>
+          <form id="message-form" class="composer hidden">
+            <label class="sr-only" for="message-input">Continue conversation</label>
+            <button id="context-add" class="context-add" type="button" aria-label="Add context">+</button>
+            <textarea id="message-input" rows="1" maxlength="100000"
+              placeholder="Message"></textarea>
+            <button id="message-send" type="submit">Send</button>
+            <button id="message-stop" class="message-stop hidden" type="button"
+              aria-label="Stop generating" title="Stop generating">
+              <span aria-hidden="true"></span>
+            </button>
+            <div id="context-references" class="context-references hidden" aria-label="Attached context"></div>
+            <p id="message-hint" class="composer-hint" role="status"></p>
+            <div id="context-meter" class="context-meter" role="progressbar" aria-label="Estimated context usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+              <span class="context-meter-track"><span id="context-meter-fill" class="context-meter-fill"></span></span>
+              <span id="context-meter-label" class="context-meter-label"></span>
+            </div>
+          </form>
         </div>
-      </form>
+        <aside id="file-edits-panel" class="file-edits-panel hidden" aria-label="File edits">
+          <header class="file-panel-header">
+            <div><h3>Task details</h3><p id="file-edits-title"></p></div>
+            <button id="file-edits-close" class="file-edits-close" type="button" aria-label="Close file edits" title="Close file edits">×</button>
+          </header>
+          <div class="file-panel-tab"><span aria-hidden="true">⌘</span> File edits</div>
+          <p id="file-edits-summary" class="file-edits-summary"></p>
+          <div id="file-edits-list" class="file-edit-list"></div>
+        </aside>
+      </div>
     </main>
   </div>
   <div id="sidebar-shade" class="sidebar-shade"></div>

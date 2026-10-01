@@ -32,7 +32,7 @@ body_from_response() { printf '%s' "${1#*$'\r\n\r\n'}"; }
 
 health=$(request GET /healthz)
 [[ "$health" == HTTP/1.1\ 200* ]]
-jq -e '.status == "ready" and .protocol_version == 2 and .runner_version == 6' \
+jq -e '.status == "ready" and .protocol_version == 2 and .runner_version == 7' \
     <<<"$(body_from_response "$health")" >/dev/null
 
 invalid_update=$(request POST /v1/update '{"token":"bad"}')
